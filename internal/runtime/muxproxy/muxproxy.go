@@ -56,8 +56,37 @@ func (p *MuxProxy) DialContext(ctx context.Context, meta *M.Metadata) (net.Conn,
 	return stream, nil
 }
 
-func (p *MuxProxy) DialUDP(*M.Metadata) (net.PacketConn, error) {
-	return nil, fmt.Errorf("muxproxy: UDP not supported")
+func (p *MuxProxy) DialUDP(meta *M.Metadata) (net.PacketConn, error) {
+	if defaultMux == nil {
+		return nil, fmt.Errorf("muxproxy: mux not initialized")
+	}
+
+	addr := meta.DestinationAddress()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("muxproxy: udp split: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("muxproxy: udp parse port: %w", err)
+	}
+
+	if defaultV4 {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			return nil, fmt.Errorf("muxproxy: udp ipv6 rejected: %s", host)
+		}
+	}
+
+	stream, err := defaultMux.OpenStream(context.Background(), map[string]any{
+		"host": host,
+		"port": port,
+		"udp":  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("muxproxy: udp open stream: %w", err)
+	}
+
+	return newDatagramStream(stream, datagramAddr(addr)), nil
 }
 
 func Parse(_ *url.URL) (proxy.Proxy, error) {

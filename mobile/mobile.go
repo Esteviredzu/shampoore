@@ -1,3 +1,4 @@
+// FILE: mobile/mobile.go
 package mobile
 
 import (
@@ -115,7 +116,8 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 	}
 
 	cancel = cancelFn
-	done = make(chan struct{})
+	doneCh := make(chan struct{})
+	done = doneCh
 	go func() {
 		<-ctx.Done()
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), 5*time.Second)
@@ -128,18 +130,20 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 			case <-time.After(3 * time.Second):
 			}
 		}
-		close(done)
+		close(doneCh)
 	}()
 	return nil
 }
 
 func StopClient() {
 	mu.Lock()
+	defer mu.Unlock()
+
 	cancelFn := cancel
 	d := done
 	cancel = nil
 	done = nil
-	mu.Unlock()
+
 	if cancelFn == nil {
 		return
 	}

@@ -26,6 +26,8 @@ type Pipe struct {
 
 	started  bool
 	stopOnce sync.Once
+
+	transportResetFunc func()
 }
 
 func NewPipe(cfg *Config, boot *bootstrapResult, logger logging.ContextLogger) *Pipe {
@@ -44,6 +46,12 @@ func (p *Pipe) Start(ctx context.Context) error {
 	var pubOnce, subOnce sync.Once
 	p.sig.onPublishReady = func() { pubOnce.Do(func() { close(pubReady) }) }
 	p.sig.onSubscribe = func() { subOnce.Do(func() { close(subReady) }) }
+	p.sig.onSubscriberReconnect = func() {
+		p.logger.Info("telemost: signaling reconnect")
+		if p.transportResetFunc != nil {
+			p.transportResetFunc()
+		}
+	}
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- p.sig.Run(ctx) }()
@@ -77,6 +85,14 @@ func (p *Pipe) Start(ctx context.Context) error {
 		return errors.New("telemost: tunnel not created")
 	}
 	p.tunnel = tunnel
+
+	tunnel.SetReconnectCallback(func() {
+		p.logger.Info("telemost: tunnel reconnect detected")
+		if p.transportResetFunc != nil {
+			p.transportResetFunc()
+		}
+	})
+
 	p.started = true
 	return nil
 }
@@ -95,4 +111,8 @@ func (p *Pipe) Tunnel() *vp8.Tunnel {
 		return nil
 	}
 	return p.sig.Tunnel()
+}
+
+func (p *Pipe) SetTransportResetFunc(fn func()) {
+	p.transportResetFunc = fn
 }

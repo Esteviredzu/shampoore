@@ -51,7 +51,7 @@ func bootstrap(ctx context.Context, cfg *Config) (*bootstrapResult, error) {
 		return fakeBootstrap(cfg.LocalSignalingURL), nil
 	}
 
-	conferenceLink := strings.TrimSpace(cfg.ConferenceLink)
+	conferenceLink := strings.TrimSpace(cfg.EffectiveConferenceLink())
 	if conferenceLink == "" {
 		return nil, errors.New("telemost: empty conference link")
 	}
@@ -212,15 +212,21 @@ func fetchConnection(
 }
 
 func extractConferenceID(link string) string {
+	if link == "" {
+		return ""
+	}
 	u, err := url.Parse(link)
 	if err != nil {
-		return ""
+		return strings.TrimSpace(link)
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	for i := len(parts) - 1; i >= 0; i-- {
 		if parts[i] != "" {
 			return parts[i]
 		}
+	}
+	if u.Host == "" {
+		return strings.TrimSpace(link)
 	}
 	return ""
 }

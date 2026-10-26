@@ -1,3 +1,4 @@
+// FILE: internal/provider/telemost/signalling.go
 package telemost
 
 import (
@@ -33,6 +34,8 @@ type signaling struct {
 	pubPC *webrtc.PeerConnection
 	subPC *webrtc.PeerConnection
 
+	iceServers []ICEServer
+
 	sampleTrack  *webrtc.TrackLocalStaticSample
 	sharingTrack *webrtc.TrackLocalStaticSample
 
@@ -55,8 +58,9 @@ type signaling struct {
 	sharingOn bool
 	sharingMu sync.Mutex
 
-	onPublishReady func()
-	onSubscribe    func()
+	onPublishReady        func()
+	onSubscribe           func()
+	onSubscriberReconnect func()
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -140,10 +144,6 @@ func (s *signaling) Run(ctx context.Context) error {
 	}
 	defer s.closeWS()
 
-	// Close the WS when either ctx is cancelled or Close() is invoked,
-	// so the blocking ReadMessage below is unblocked. Without this the
-	// goroutine leaks on ctx cancellation that isn't immediately
-	// followed by Session.Stop -> signaling.Close.
 	runDone := make(chan struct{})
 	defer close(runDone)
 	go func() {
@@ -363,6 +363,10 @@ func (s *signaling) onServerHello(raw any) error {
 }
 
 func (s *signaling) initPeerConnections(ice []ICEServer) error {
+	s.iceServers = ice
+
+	api := newWebRTCAPI()
+
 	cfg := webrtc.Configuration{}
 	for _, srv := range ice {
 		entry := webrtc.ICEServer{URLs: srv.URLs}
@@ -373,45 +377,18 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 		cfg.ICEServers = append(cfg.ICEServers, entry)
 	}
 
-	api := newWebRTCAPI()
-
 	pubPC, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		return err
 	}
-	subPC, err := api.NewPeerConnection(cfg)
+	s.pubPC = pubPC
+
+	subPC, err := s.createSubPC()
 	if err != nil {
 		_ = pubPC.Close()
 		return err
 	}
-
-	s.pubPC = pubPC
 	s.subPC = subPC
-
-	// Аудио-трек отключён: для передачи данных он не нужен, а SFU
-	// Телемоста может отдавать приоритет видео-треку в комнате с аудио.
-	// Если понадобится вернуть — раскомментируйте блок ниже.
-	//
-	// audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-	// 	webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
-	// 	"audio", "shampoore-audio",
-	// )
-	// if err != nil {
-	// 	_ = pubPC.Close()
-	// 	_ = subPC.Close()
-	// 	return err
-	// }
-	// audioTr, err := pubPC.AddTransceiverFromTrack(
-	// 	audioTrack,
-	// 	webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
-	// )
-	// if err != nil {
-	// 	_ = pubPC.Close()
-	// 	_ = subPC.Close()
-	// 	return err
-	// }
-	// go drainSenderRTCP(audioTr.Sender())
-	// s.audioTrack = audioTrack
 
 	trackID := "video-" + s.boot.info.PeerID
 	streamID := "shampoore-" + s.boot.info.PeerID
@@ -464,25 +441,44 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 		}
 		s.sendICE(c, "PUBLISHER", s.pubSeq)
 	})
+	pubPC.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		s.logger.Info("telemost: pub ICE state = ", state.String())
+	})
+	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		s.logger.Info("telemost: pub PC state = ", state.String())
+		if state == webrtc.PeerConnectionStateConnected {
+			s.markPublishReady()
+		}
+	})
+
+	return s.startPublish()
+}
+
+func (s *signaling) createSubPC() (*webrtc.PeerConnection, error) {
+	cfg := webrtc.Configuration{}
+	for _, srv := range s.iceServers {
+		entry := webrtc.ICEServer{URLs: srv.URLs}
+		if srv.Username != "" {
+			entry.Username = srv.Username
+			entry.Credential = srv.Credential
+		}
+		cfg.ICEServers = append(cfg.ICEServers, entry)
+	}
+
+	api := newWebRTCAPI()
+	subPC, err := api.NewPeerConnection(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	subPC.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
 		s.sendICE(c, "SUBSCRIBER", s.subSeq)
 	})
-
-	pubPC.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		s.logger.Info("telemost: pub ICE state = ", state.String())
-	})
 	subPC.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		s.logger.Info("telemost: sub ICE state = ", state.String())
-	})
-
-	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		s.logger.Info("telemost: pub PC state = ", state.String())
-		if state == webrtc.PeerConnectionStateConnected {
-			s.markPublishReady()
-		}
 	})
 	subPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		s.logger.Info("telemost: sub PC state = ", state.String())
@@ -490,8 +486,7 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 			s.markSubscribeReady()
 		}
 	})
-
-	return s.startPublish()
+	return subPC, nil
 }
 
 func drainSenderRTCP(sender *webrtc.RTPSender) {
@@ -637,11 +632,6 @@ func (s *signaling) onPublisherAnswer(raw any) error {
 	return nil
 }
 
-// onUpsertDescription — SFU сообщает о появлении нового трека.
-// НЕ привязываем трек здесь: он может прийти раньше, чем Pion начнёт
-// отдавать RTP через OnTrack. Привязка идёт исключительно в OnTrack
-// (см. vp8.AttachTunnel). Иначе получаются два reader'а на один трек
-// и RTP-пакеты уходят по одному в каждый — картинка разрывается.
 func (s *signaling) onUpsertDescription(raw any) error {
 	m, _ := raw.(map[string]any)
 	if m == nil {
@@ -661,13 +651,63 @@ func (s *signaling) onSubscriberOffer(raw any) error {
 		s.subSeq = int(pcSeq)
 	}
 
+	isReconnect := s.subReadySent
+
+	if !isReconnect {
+		if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  sdp,
+		}); err != nil {
+			return err
+		}
+		return s.answerSubscriber()
+	}
+
+	if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  sdp,
+	}); err == nil {
+		s.logger.Info("telemost: subscriber renegotiated on existing PC")
+		if s.onSubscriberReconnect != nil {
+			s.onSubscriberReconnect()
+		}
+		return s.answerSubscriber()
+	}
+
+	s.logger.Info("telemost: reconnect detected, recreating subscriber PC")
+
+	if s.subPC != nil {
+		_ = s.subPC.Close()
+	}
+	if s.onSubscriberReconnect != nil {
+		s.onSubscriberReconnect()
+	}
+
+	s.remoteMu.Lock()
+	s.subRemoteSet = false
+	s.subPending = nil
+	s.remoteMu.Unlock()
+
+	newSubPC, err := s.createSubPC()
+	if err != nil {
+		return err
+	}
+	s.subPC = newSubPC
+
+	if s.tunnel != nil {
+		s.tunnel.AttachSubPC(newSubPC)
+	}
+
 	if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
 		SDP:  sdp,
 	}); err != nil {
 		return err
 	}
+	return s.answerSubscriber()
+}
 
+func (s *signaling) answerSubscriber() error {
 	s.remoteMu.Lock()
 	s.subRemoteSet = true
 	pending := s.subPending

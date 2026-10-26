@@ -1,19 +1,20 @@
 package telemost
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 type Config struct {
-	ConferenceLink string `json:"conference_link"`
-	DisplayName    string `json:"display_name,omitempty"`
-	AppVersion     string `json:"app_version,omitempty"`
-	SDKVersion     string `json:"sdk_version,omitempty"`
+	ConferenceID string `json:"conference_id,omitempty"`
+	ConferenceLink string `json:"conference_link,omitempty"`
 
-	// Role всегда SPEAKER: SFU Телемоста закрывает соединение с 1011
-	// при PARTICIPANT + sendVideo=true.
+	DisplayName string `json:"display_name,omitempty"`
+	AppVersion  string `json:"app_version,omitempty"`
+	SDKVersion  string `json:"sdk_version,omitempty"`
+
 	Role string `json:"role,omitempty"`
 
-	// UseSharing — публиковать видео как screen sharing вместо камеры.
-	// Ставится серверу, чтобы SFU форвардил его независимо от роли.
 	UseSharing bool `json:"use_sharing,omitempty"`
 
 	LocalSignalingURL string `json:"local_signaling_url,omitempty"`
@@ -28,9 +29,19 @@ func DefaultConfig() Config {
 	}
 }
 
+func (c *Config) EffectiveConferenceLink() string {
+	if c.ConferenceID != "" {
+		return "https://telemost.yandex.ru/j/" + c.ConferenceID
+	}
+	return c.ConferenceLink
+}
+
 func (c *Config) Validate() error {
-	if c.LocalSignalingURL == "" && c.ConferenceLink == "" {
-		return errors.New("telemost: conference_link or local_signaling_url is required")
+	if c.LocalSignalingURL == "" && c.ConferenceID == "" && c.ConferenceLink == "" {
+		return errors.New("telemost: conference_id or local_signaling_url is required")
+	}
+	if c.ConferenceID != "" && !isValidConferenceID(c.ConferenceID) {
+		return fmt.Errorf("telemost: invalid conference_id %q", c.ConferenceID)
 	}
 	if c.Role == "" {
 		c.Role = "SPEAKER"
@@ -46,4 +57,21 @@ func (c *Config) EffectiveDisplayName() string {
 		return "Гость"
 	}
 	return c.DisplayName
+}
+
+func isValidConferenceID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for _, ch := range id {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'a' && ch <= 'z':
+		case ch >= 'A' && ch <= 'Z':
+		case ch == '-' || ch == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

@@ -1,4 +1,3 @@
-// FILE: internal/transport/vp8/tunnel.go
 package vp8
 
 import (
@@ -26,13 +25,12 @@ const (
 	incomingBufferSize = 1024
 
 	pliInterval = 500 * time.Millisecond
+	reconnectGap = 3 * time.Second
 )
 
 type Tunnel struct {
 	pubTrack     *webrtc.TrackLocalStaticSample
 	sharingTrack *webrtc.TrackLocalStaticSample
-
-	subPC *webrtc.PeerConnection
 
 	remoteMu     sync.Mutex
 	remoteTracks map[webrtc.SSRC]bool
@@ -44,6 +42,9 @@ type Tunnel struct {
 	writeMu     sync.Mutex
 	lastWriteAt atomic.Int64
 
+	reconnectMu sync.RWMutex
+	onReconnect func()
+
 	closeOnce sync.Once
 }
 
@@ -53,34 +54,51 @@ func AttachTunnel(
 ) (*Tunnel, error) {
 	t := &Tunnel{
 		pubTrack:     track,
-		subPC:        subPC,
 		remoteTracks: make(map[webrtc.SSRC]bool),
 		incoming:     make(chan []byte, incomingBufferSize),
 		errors:       make(chan error, 1),
 		closed:       make(chan struct{}),
 	}
-
 	if subPC != nil {
-		subPC.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-			mime := remote.Codec().MimeType
-			ssrc := remote.SSRC()
-			log.Printf("[vp8] OnTrack: %s ssrc=%d", mime, ssrc)
-
-			if mime != webrtc.MimeTypeVP8 {
-				go drainTrack(remote)
-				return
-			}
-
-			if !t.bindRemoteTrack(remote) {
-				log.Printf("[vp8] OnTrack: ssrc=%d already bound, ignoring", ssrc)
-				return
-			}
-		})
+		t.AttachSubPC(subPC)
 	}
 	return t, nil
 }
 
-func (t *Tunnel) bindRemoteTrack(remote *webrtc.TrackRemote) bool {
+func (t *Tunnel) SetReconnectCallback(fn func()) {
+	t.reconnectMu.Lock()
+	t.onReconnect = fn
+	t.reconnectMu.Unlock()
+}
+
+func (t *Tunnel) fireReconnect() {
+	t.reconnectMu.RLock()
+	fn := t.onReconnect
+	t.reconnectMu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+func (t *Tunnel) AttachSubPC(subPC *webrtc.PeerConnection) {
+	subPC.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		mime := remote.Codec().MimeType
+		ssrc := remote.SSRC()
+		log.Printf("[vp8] OnTrack: %s ssrc=%d", mime, ssrc)
+
+		if mime != webrtc.MimeTypeVP8 {
+			go drainTrack(remote)
+			return
+		}
+
+		if !t.bindRemoteTrack(remote, subPC) {
+			log.Printf("[vp8] OnTrack: ssrc=%d already bound, ignoring", ssrc)
+			return
+		}
+	})
+}
+
+func (t *Tunnel) bindRemoteTrack(remote *webrtc.TrackRemote, pc *webrtc.PeerConnection) bool {
 	ssrc := remote.SSRC()
 	t.remoteMu.Lock()
 	if t.remoteTracks[ssrc] {
@@ -93,12 +111,12 @@ func (t *Tunnel) bindRemoteTrack(remote *webrtc.TrackRemote) bool {
 	log.Printf("[vp8] bindRemoteTrack: ssrc=%d stream=%s id=%s",
 		ssrc, remote.StreamID(), remote.ID())
 
-	go t.pliLoop(ssrc)
+	go t.pliLoop(ssrc, pc)
 	go t.readLoop(remote)
 	return true
 }
 
-func (t *Tunnel) pliLoop(ssrc webrtc.SSRC) {
+func (t *Tunnel) pliLoop(ssrc webrtc.SSRC, pc *webrtc.PeerConnection) {
 	ticker := time.NewTicker(pliInterval)
 	defer ticker.Stop()
 
@@ -109,13 +127,13 @@ func (t *Tunnel) pliLoop(ssrc webrtc.SSRC) {
 		case <-ticker.C:
 		}
 
-		if t.subPC == nil {
+		if pc == nil {
 			return
 		}
 		pli := &rtcp.PictureLossIndication{
 			MediaSSRC: uint32(ssrc),
 		}
-		if err := t.subPC.WriteRTCP([]rtcp.Packet{pli}); err != nil {
+		if err := pc.WriteRTCP([]rtcp.Packet{pli}); err != nil {
 			log.Printf("[vp8] PLI error: %v", err)
 			return
 		}
@@ -245,6 +263,8 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		frameHasGap bool
 	)
 
+	var lastFrameTime time.Time
+
 	for {
 		select {
 		case <-t.closed:
@@ -291,8 +311,18 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 			continue
 		}
 
+		isKey := isVP8Keyframe(frame)
+
+		if !lastFrameTime.IsZero() && isKey && time.Since(lastFrameTime) > reconnectGap {
+			log.Printf("[vp8] reconnect detected: %.2fs gap + keyframe",
+				time.Since(lastFrameTime).Seconds())
+			seenKeyframe = false
+			t.fireReconnect()
+		}
+		lastFrameTime = time.Now()
+
 		if !seenKeyframe {
-			if !isVP8Keyframe(frame) {
+			if !isKey {
 				droppedUntilKeyframe++
 				continue
 			}
@@ -308,7 +338,7 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		totalFrames++
 		if totalFrames <= 10 || totalFrames%100 == 0 {
 			log.Printf("[vp8] recv frame #%d size=%d keyframe=%v (rtp=%d gaps=%d/%d ch_drops=%d)",
-				totalFrames, len(frame), isVP8Keyframe(frame),
+				totalFrames, len(frame), isKey,
 				rtpCount, gapFrames, totalFrames, droppedFull)
 		}
 
@@ -326,11 +356,4 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 			}
 		}
 	}
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }

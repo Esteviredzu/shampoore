@@ -17,6 +17,8 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
+const resetCooldown = 2 * time.Second
+
 type Config struct {
 	Conv     uint32
 	MTU      int
@@ -26,7 +28,6 @@ type Config struct {
 	Resend   int
 	NC       bool
 
-	// FEC (Forward Error Correction)
 	FECEnabled      bool
 	FECDataShards   int
 	FECParityShards int
@@ -50,7 +51,8 @@ type Session struct {
 	conv uint32
 	kcp  *kcp.KCP
 
-	kcpMu sync.Mutex
+	kcpMu       sync.Mutex
+	lastResetAt time.Time
 
 	outCount int
 	outMu    sync.Mutex
@@ -87,7 +89,6 @@ func NewSession(
 		cfg.MTU = maxKCPMTU
 	}
 
-	// Оборачиваем pipe в FEC, если включено
 	if cfg.FECEnabled {
 		fecPipe, err := security.NewFECPipe(pipe, cfg.FECDataShards, cfg.FECParityShards)
 		if err != nil {
@@ -184,6 +185,30 @@ func (s *Session) Start(ctx context.Context) error {
 	s.wg.Add(2)
 	go s.recvLoop()
 	go s.updateLoop()
+	return nil
+}
+
+func (s *Session) Reset() error {
+	s.kcpMu.Lock()
+	defer s.kcpMu.Unlock()
+
+	now := time.Now()
+	if !s.lastResetAt.IsZero() && now.Sub(s.lastResetAt) < resetCooldown {
+		s.logger.Debug("kcp: reset throttled (last ", now.Sub(s.lastResetAt), ")")
+		return nil
+	}
+	s.lastResetAt = now
+
+	k := kcp.NewKCP(s.conv, s.output)
+	if k == nil {
+		return errors.New("kcp: reset failed to create KCP instance")
+	}
+	k.SetMtu(s.cfg.MTU)
+	k.WndSize(s.cfg.Window, s.cfg.Window)
+	k.NoDelay(s.cfg.NoDelay, s.cfg.Interval, s.cfg.Resend, boolToInt(s.cfg.NC))
+	s.kcp = k
+
+	s.logger.Info("kcp: session reset; conv=", s.conv)
 	return nil
 }
 

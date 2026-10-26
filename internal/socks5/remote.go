@@ -2,6 +2,8 @@ package socks5
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -124,6 +126,11 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		}
 	}
 
+	if isUDP, _ := meta["udp"].(bool); isUDP {
+		s.handleUDPStream(stream, host, port)
+		return
+	}
+
 	target := net.JoinHostPort(host, strconv.Itoa(port))
 	s.logger.Info("remote: ", streamID, " -> ", target)
 
@@ -154,51 +161,100 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 
 	done := make(chan struct{}, 2)
 
-	// upstream -> stream
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, s.chunkSize)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				s.logger.Debug("remote: ", streamID, " upstream->stream ",
-					n, " bytes")
 				if _, werr := stream.Write(buf[:n]); werr != nil {
-					s.logger.Warn("remote: ", streamID,
-						" stream.Write failed: ", werr)
 					return
 				}
 			}
 			if err != nil {
-				s.logger.Debug("remote: ", streamID,
-					" conn.Read ended: ", err)
 				return
 			}
 		}
 	}()
 
-	// stream -> upstream
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, s.chunkSize)
 		for {
 			n, err := stream.Read(buf)
 			if n > 0 {
-				s.logger.Debug("remote: ", streamID, " stream->upstream ",
-					n, " bytes")
 				if _, werr := conn.Write(buf[:n]); werr != nil {
-					s.logger.Warn("remote: ", streamID,
-						" conn.Write failed: ", werr)
 					return
 				}
 			}
 			if err != nil {
-				s.logger.Debug("remote: ", streamID,
-					" stream.Read ended: ", err)
 				return
 			}
 		}
 	}()
 
+	<-done
+}
+
+func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string, port int) {
+	streamID := stream.ID()
+	defer stream.Close()
+
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+
+	conn, err := net.Dial("udp", target)
+	if err != nil {
+		s.logger.Warn("remote udp: ", streamID, " dial ", target, ": ", err)
+		return
+	}
+	defer conn.Close()
+
+	s.logger.Debug("remote udp: ", streamID, " -> ", target)
+
+	done := make(chan struct{}, 2)
+
+	go func() {
+		defer func() { done <- struct{}{} }()
+		hdr := make([]byte, 2)
+		for {
+			if _, err := io.ReadFull(stream, hdr); err != nil {
+				return
+			}
+			n := int(binary.BigEndian.Uint16(hdr))
+			if n == 0 {
+				continue
+			}
+			buf := make([]byte, n)
+			if _, err := io.ReadFull(stream, buf); err != nil {
+				return
+			}
+			if _, err := conn.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 65535)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			out := make([]byte, 2+n)
+			binary.BigEndian.PutUint16(out[:2], uint16(n))
+			copy(out[2:], buf[:n])
+			if _, err := stream.Write(out); err != nil {
+				return
+			}
+		}
+	}()
+
+	<-done
+	conn.Close()
 	<-done
 }

@@ -107,7 +107,7 @@ func build(
 
 	conv := uint32(eff.Int("kcp_conv", 0))
 	if conv == 0 {
-		conv = crc32.ChecksumIEEE([]byte(cfg.ConferenceLink))
+		conv = crc32.ChecksumIEEE([]byte(cfg.EffectiveConferenceLink()))
 		if conv == 0 {
 			conv = 1
 		}
@@ -132,6 +132,16 @@ func build(
 		_ = pipe.Stop(ctx)
 		return nil, err
 	}
+
+	pipe.SetTransportResetFunc(func() {
+		logger.Info("yandex_telemost_raw: remote reconnect detected, resetting KCP session")
+		if resetter, ok := interface{}(inner).(interface{ Reset() error }); ok {
+			if err := resetter.Reset(); err != nil {
+				logger.Warn("yandex_telemost_raw: KCP reset failed: ", err)
+			}
+		}
+	})
+
 	if err := inner.Start(ctx); err != nil {
 		_ = rawPipe.Stop(ctx)
 		_ = pipe.Stop(ctx)

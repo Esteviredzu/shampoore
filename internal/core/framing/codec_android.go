@@ -77,7 +77,6 @@ const (
 	colorFormatPlanar     = 19
 	colorFormatFlexible   = 0x7F420888
 
-	// Values from <media/NdkMediaCodec.h> (stable ABI).
 	amcInfoTryAgainLater        = -1
 	amcInfoOutputFormatChanged  = -2
 	amcInfoOutputBuffersChanged = -3
@@ -88,7 +87,8 @@ var (
 	cKeyMime           = C.CString("mime")
 	cKeyWidth          = C.CString("width")
 	cKeyHeight         = C.CString("height")
-	cKeyBitRate        = C.CString("bit-rate")
+	cKeyBitRate        = C.CString("bitrate")
+	cKeyBitrateMode    = C.CString("bitrate-mode")
 	cKeyFrameRate      = C.CString("frame-rate")
 	cKeyIFrameInterval = C.CString("i-frame-interval")
 	cKeyColorFormat    = C.CString("color-format")
@@ -170,6 +170,9 @@ func NewEncoder(width, height, fps int, bitrate string) (VideoEncoder, error) {
 		fps = 30
 	}
 	br := parseBitrate(bitrate)
+	if br < 500_000 {
+		br = 500_000
+	}
 
 	format := C.AMediaFormat_new()
 	if format == nil {
@@ -184,9 +187,10 @@ func NewEncoder(width, height, fps int, bitrate string) (VideoEncoder, error) {
 	C.shampoore_fmt_set_int32(format, cKeyWidth, C.int32_t(width))
 	C.shampoore_fmt_set_int32(format, cKeyHeight, C.int32_t(height))
 	C.shampoore_fmt_set_int32(format, cKeyBitRate, C.int32_t(br))
+	C.shampoore_fmt_set_int32(format, cKeyBitrateMode, C.int32_t(2))
 	C.shampoore_fmt_set_int32(format, cKeyFrameRate, C.int32_t(fps))
 	C.shampoore_fmt_set_int32(format, cKeyIFrameInterval, C.int32_t(30))
-	C.shampoore_fmt_set_int32(format, cKeyColorFormat, C.int32_t(colorFormatSemiPlanar))
+	C.shampoore_fmt_set_int32(format, cKeyColorFormat, C.int32_t(colorFormatFlexible))
 
 	codec := C.AMediaCodec_createEncoderByType(mimeCStr)
 	if codec == nil {
