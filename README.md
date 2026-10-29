@@ -97,8 +97,6 @@ export ANDROID_NDK_HOME=/path/to/ndk
 1. Откройте [telemost.yandex.ru](https://telemost.yandex.ru) и создайте конференцию.
 2. Хэш будет в ссылке `https://telemost.yandex.ru/j/YOUR_HASH`.
 
-```
-
 Клиент и сервер должны находиться в **одном** звонке, каждый заходит отдельным участником.
 
 
