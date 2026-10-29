@@ -3,6 +3,7 @@ package logging
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -11,17 +12,30 @@ type Logger struct {
 	mu     sync.Mutex
 	prefix string
 	debug  bool
+	sinks  []io.Writer
 }
 
 func New(prefix string, debug bool) *Logger {
 	return &Logger{prefix: prefix, debug: debug}
 }
 
+func (l *Logger) AddSink(w io.Writer) {
+	if w == nil {
+		return
+	}
+	l.mu.Lock()
+	l.sinks = append(l.sinks, w)
+	l.mu.Unlock()
+}
+
 func (l *Logger) emit(level string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "[%s] %s: %s\n",
-		level, l.prefix, fmt.Sprint(args...))
+	line := fmt.Sprintf("[%s] %s: %s\n", level, l.prefix, fmt.Sprint(args...))
+	_, _ = os.Stderr.WriteString(line)
+	for _, s := range l.sinks {
+		_, _ = s.Write([]byte(line))
+	}
 }
 
 func (l *Logger) Trace(args ...any) {
@@ -51,7 +65,6 @@ func (l *Logger) Panic(args ...any) {
 	panic(s)
 }
 
-// Context-варианты: контекст игнорируем, но интерфейс требует.
 func (l *Logger) TraceContext(ctx context.Context, args ...any) { l.Trace(args...) }
 func (l *Logger) DebugContext(ctx context.Context, args ...any) { l.Debug(args...) }
 func (l *Logger) InfoContext(ctx context.Context, args ...any)  { l.Info(args...) }

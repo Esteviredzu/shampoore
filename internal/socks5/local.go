@@ -125,9 +125,6 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 	if err := s.sendReply(conn, repSuccess); err != nil {
 		return
 	}
-
-	// Контекст-разблокировка: при отмене ctx закрываем conn и stream,
-	// чтобы io.Copy не висел.
 	stopWatch := make(chan struct{})
 	go func() {
 		select {

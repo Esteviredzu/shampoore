@@ -1,4 +1,3 @@
-// FILE: internal/provider/telemost/signalling.go
 package telemost
 
 import (

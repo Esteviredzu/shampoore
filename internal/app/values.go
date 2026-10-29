@@ -53,7 +53,6 @@ func (v Values) Int(key string, def int) int {
 		}
 		return int(i)
 	case string:
-		// Приходит из URL-декода (всё строкой).
 		i, err := strconv.Atoi(strings.TrimSpace(n))
 		if err != nil {
 			return def

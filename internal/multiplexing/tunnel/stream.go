@@ -44,7 +44,6 @@ func (s *TunnelStream) Metadata() map[string]any { return s.metadata }
 func (s *TunnelStream) Closed() bool             { return s.closed.Load() }
 
 func (s *TunnelStream) Read(b []byte) (int, error) {
-	// Сначала опустошаем остаток предыдущего фрейма.
 	if len(s.readBuf) > 0 {
 		n := copy(b, s.readBuf)
 		s.readBuf = s.readBuf[n:]
@@ -64,7 +63,7 @@ func (s *TunnelStream) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 	data := s.recvQueue[0]
-	s.recvQueue[0] = nil // помочь GC
+	s.recvQueue[0] = nil
 	s.recvQueue = s.recvQueue[1:]
 	s.recvBytes -= len(data)
 	s.recvMu.Unlock()
@@ -101,13 +100,6 @@ func (s *TunnelStream) Close() error {
 	return nil
 }
 
-// deliverData вызывается из receiveLoop мультиплексора. Раньше был
-// select/default и молча дропал данные при заполненном канале. Теперь
-// кладём в unbounded-очередь и будим Read через condvar.
-// Если очередь превысила maxQueuedBytes — закрываем поток с явной
-// ошибкой, чтобы не уехать в OOM. Тогда получатель получит
-// осмысленную ошибку, а не повреждённый поток. Дополнительно удаляем
-// стрим из mux.streams, чтобы не оставлять «мёртвый» entry в map.
 func (s *TunnelStream) deliverData(data []byte) {
 	s.recvMu.Lock()
 	if s.recvClosed {

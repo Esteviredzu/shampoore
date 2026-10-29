@@ -69,10 +69,6 @@ type ReliableSession struct {
 	pendingPackets   map[int]*pendingPacket
 	nextSendSequence int
 
-	// wakeRetry is signalled (non-blocking) by Send so retryLoop
-	// transmits new packets immediately instead of waiting up to
-	// retryScanInterval (100 ms). Buffered size 1 — multiple Sends
-	// coalesce into a single scan.
 	wakeRetry chan struct{}
 
 	recvMu              sync.Mutex
@@ -239,9 +235,6 @@ func (s *ReliableSession) Send(ctx context.Context, data []byte) error {
 		retryDelay: initialRetryDelay,
 	}
 	s.sendMu.Unlock()
-
-	// Kick retryLoop so the new packet is transmitted right away
-	// instead of waiting for the next 100 ms tick.
 	select {
 	case s.wakeRetry <- struct{}{}:
 	default:
@@ -336,7 +329,6 @@ func (s *ReliableSession) retryLoop() {
 		case <-s.ctx.Done():
 			return
 		case <-s.wakeRetry:
-			// Send requested immediate scan; fall through.
 		case <-ticker.C:
 		}
 
@@ -635,7 +627,6 @@ func (s *ReliableSession) handlePipeReset() {
 		p.lastSentAt = time.Time{}
 	}
 	s.sendMu.Unlock()
-	// Wake retryLoop so all pending packets are immediately resent.
 	select {
 	case s.wakeRetry <- struct{}{}:
 	default:

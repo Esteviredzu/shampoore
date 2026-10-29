@@ -144,7 +144,6 @@ func nv12toPlanar(nv12 []byte, width, height int) []byte {
 	return out
 }
 
-// ---------- Encoder ----------
 
 type androidEncoder struct {
 	codec   *C.AMediaCodec
@@ -317,8 +316,6 @@ func (e *androidEncoder) Close() error {
 	})
 	return nil
 }
-
-// ---------- Decoder ----------
 
 type androidDecoder struct {
 	codec  *C.AMediaCodec

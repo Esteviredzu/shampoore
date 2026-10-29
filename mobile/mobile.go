@@ -1,4 +1,3 @@
-// FILE: mobile/mobile.go
 package mobile
 
 import (

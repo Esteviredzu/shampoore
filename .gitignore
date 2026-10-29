@@ -1,23 +1,15 @@
-/shampoore-client
-/shampoore-server
-*.exe
+bin/
 
-config_yandexboard.json
-config_yandex_telemost_squares.json
-config_yandex_telemost_raw.json
+configs/*
+configs/.state.json
 
-squares-visual
-bin
-speedtest.py
-video.mp4
-song.mp3
+shampoore.aar
+shampoore-sources.jar
+
 *.log
 
 .vscode/
 .idea/
 *.swp
 *~
-
-/vendor/
-shampoore.aar
-shampoore-sources.jar
+.DS_Store

@@ -67,9 +67,9 @@ func (d *ffmpegDecoder) start() error {
 	cmd := exec.Command("ffmpeg",
 		"-loglevel", "error",
 		"-f", "ivf", "-i", "-",
-		"-vf", "scale=in_range=pc:out_range=pc", // гарантируем полный диапазон на выходе
+		"-vf", "scale=in_range=pc:out_range=pc",
 		"-f", "rawvideo",
-		"-pix_fmt", "yuv420p", // современный формат
+		"-pix_fmt", "yuv420p",
 		"-",
 	)
 	cmd.Stderr = os.Stderr

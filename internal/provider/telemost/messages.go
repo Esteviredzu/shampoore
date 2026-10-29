@@ -111,8 +111,6 @@ func sdkCodecsInfoMessage() map[string]any {
 	}
 }
 
-// DisplayVideoTrack — дескриптор video-трека для publisherSdpOffer.
-// label="Screen" помечает его как screen sharing.
 func DisplayVideoTrack(mid, label string) map[string]any {
 	return map[string]any{
 		"mid":            mid,
@@ -126,7 +124,6 @@ func DisplayVideoTrack(mid, label string) map[string]any {
 	}
 }
 
-// UpdatePublisherSharingTrackMessage — SFU: мы начинаем публиковать screen sharing.
 func UpdatePublisherSharingTrackMessage(label string) map[string]any {
 	return map[string]any{
 		"uid": uuid.NewString(),
@@ -136,7 +133,6 @@ func UpdatePublisherSharingTrackMessage(label string) map[string]any {
 	}
 }
 
-// UpdateMeMessage — SFU: изменились наши возможности публикации.
 func UpdateMeMessage(name string, sendVideo, sendSharing bool) map[string]any {
 	return map[string]any{
 		"uid": uuid.NewString(),

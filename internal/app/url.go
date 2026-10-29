@@ -54,8 +54,6 @@ func ParseURL(raw string) (*Settings, error) {
 		s.Name = u.Fragment
 	}
 
-	// Юзерские overrides: a.<key>=<value>. Всё декодируется как string —
-	// Values.Int/Bool/StringSlice сами сожмут обратно.
 	for key, vals := range q {
 		if !strings.HasPrefix(key, advancedPrefix) || len(vals) == 0 {
 			continue

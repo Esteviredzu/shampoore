@@ -39,7 +39,6 @@ func setNBits(payload []byte, bitPos, bits int, val byte) {
 }
 
 func EncodeFrameYUV(yuv []byte, width, height, cols, rows, cellSize int, payload []byte) {
-	// Заливаем Y-плоскость фоном.
 	for i := 0; i < width*height; i++ {
 		yuv[i] = IdleBGY
 	}
