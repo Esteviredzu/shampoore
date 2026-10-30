@@ -36,10 +36,6 @@ type Credentials struct {
 	ParticipantName string
 }
 
-func BoardURLFromHash(hash string) string {
-	return boardOrigin + "/whiteboard/?hash=" + hash
-}
-
 func Bootstrap(ctx context.Context, hash string, name string) (*Credentials, error) {
 	if !isValidHash(hash) {
 		return nil, fmt.Errorf("invalid board hash: %q", hash)

@@ -20,7 +20,7 @@ var defaults = app.Values{
 
 	"kcp_conv":     0,
 	"kcp_mtu":      1200,
-	"kcp_window":   1024,
+	"kcp_window":   256,
 	"kcp_nodelay":  1,
 	"kcp_interval": 10,
 	"kcp_resend":   2,
@@ -116,7 +116,7 @@ func build(
 	kcpCfg := kcp.Config{
 		Conv:     conv,
 		MTU:      mtu,
-		Window:   eff.Int("kcp_window", 1024),
+		Window:   eff.Int("kcp_window", 256),
 		NoDelay:  eff.Int("kcp_nodelay", 1),
 		Interval: eff.Int("kcp_interval", 10),
 		Resend:   eff.Int("kcp_resend", 2),

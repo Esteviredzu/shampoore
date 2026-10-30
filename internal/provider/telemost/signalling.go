@@ -17,10 +17,7 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 )
 
-const (
-	wsPingPeriod     = 5 * time.Second
-	pcConnectTimeout = 20 * time.Second
-)
+const wsPingPeriod = 5 * time.Second
 
 type signaling struct {
 	cfg    *Config
@@ -35,11 +32,9 @@ type signaling struct {
 
 	iceServers []ICEServer
 
-	sampleTrack  *webrtc.TrackLocalStaticSample
 	sharingTrack *webrtc.TrackLocalStaticSample
 
-	audioTrack *webrtc.TrackLocalStaticRTP
-	tunnel     *vp8.Tunnel
+	tunnel *vp8.Tunnel
 
 	pubRemoteSet bool
 	subRemoteSet bool
@@ -53,9 +48,6 @@ type signaling struct {
 	pubReadySent bool
 	subReadySent bool
 	readyMu      sync.Mutex
-
-	sharingOn bool
-	sharingMu sync.Mutex
 
 	onPublishReady        func()
 	onSubscribe           func()
@@ -417,8 +409,6 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 
 	if s.cfg.UseSharing {
 		s.sharingTrack = videoTrack
-	} else {
-		s.sampleTrack = videoTrack
 	}
 
 	tunnel, err := vp8.AttachTunnel(pubPC, subPC, videoTrack)

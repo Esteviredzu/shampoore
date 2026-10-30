@@ -38,6 +38,7 @@ type TunnelMultiplexer struct {
 
 	incoming chan multiplexing.Stream
 
+	flushMu        sync.Mutex
 	outboundMu     sync.Mutex
 	outboundBuf    []byte
 	outboundNotify chan struct{}
@@ -58,6 +59,9 @@ func New(
 	}
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = 20 * time.Millisecond
+	}
+	if max := t.MaxMessageSize(); max > 0 && cfg.FlushThreshold > max {
+		cfg.FlushThreshold = max
 	}
 	return &TunnelMultiplexer{
 		transport:      t,
@@ -226,6 +230,9 @@ func (m *TunnelMultiplexer) enqueueFrame(ctx context.Context, f *TunnelFrame) er
 }
 
 func (m *TunnelMultiplexer) flushOutbound(ctx context.Context) {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
 	m.outboundMu.Lock()
 	if len(m.outboundBuf) == 0 {
 		m.outboundMu.Unlock()
@@ -235,8 +242,46 @@ func (m *TunnelMultiplexer) flushOutbound(ctx context.Context) {
 	m.outboundBuf = nil
 	m.outboundMu.Unlock()
 
-	if err := m.transport.Send(ctx, buf); err != nil {
-		m.logger.Warn("tunnel: flush error (", len(buf), " bytes): ", err)
+	maxSize := m.transport.MaxMessageSize()
+	if maxSize <= 0 {
+		maxSize = len(buf)
+	}
+
+	for len(buf) > 0 {
+		chunk := buf
+		if len(chunk) > maxSize {
+			chunk = buf[:maxSize]
+		}
+
+		var err error
+		ok := false
+		for attempt := 0; attempt < 10; attempt++ {
+			err = m.transport.Send(ctx, chunk)
+			if err == nil {
+				ok = true
+				break
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		if !ok {
+			m.outboundMu.Lock()
+			remaining := make([]byte, 0, len(buf)+len(m.outboundBuf))
+			remaining = append(remaining, buf...)
+			remaining = append(remaining, m.outboundBuf...)
+			m.outboundBuf = remaining
+			m.outboundMu.Unlock()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				m.logger.Warn("tunnel: flush error after retries (", len(chunk), " bytes): ", err)
+			}
+			return
+		}
+		buf = buf[len(chunk):]
 	}
 }
 

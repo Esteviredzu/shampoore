@@ -15,15 +15,6 @@ type WorkerConfig struct {
 	BatchPause   time.Duration
 }
 
-func DefaultWorkerConfig() WorkerConfig {
-	return WorkerConfig{
-		Threshold:    30 * time.Second,
-		ScanInterval: 5 * time.Second,
-		BatchSize:    200,
-		BatchPause:   50 * time.Millisecond,
-	}
-}
-
 type CleanupWorker struct {
 	creds  *Credentials
 	logger logging.ContextLogger

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -56,6 +57,9 @@ type Session struct {
 
 	outCount int
 	outMu    sync.Mutex
+
+	bytesDelivered atomic.Int64
+	bytesSent      atomic.Int64
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -125,6 +129,25 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+func (s *Session) MaxMessageSize() int {
+	return s.pipe.MaxMessageSize()
+}
+
+func (s *Session) BytesDelivered() int64 {
+	return s.bytesDelivered.Load()
+}
+
+func (s *Session) BytesAcked() int64 {
+	s.kcpMu.Lock()
+	wait := s.kcp.WaitSnd()
+	s.kcpMu.Unlock()
+	acked := s.bytesSent.Load() - int64(wait*s.cfg.MTU)
+	if acked < 0 {
+		return 0
+	}
+	return acked
+}
+
 func (s *Session) output(buf []byte, size int) {
 	maxChunk := s.pipe.MaxMessageSize()
 
@@ -155,7 +178,7 @@ func (s *Session) output(buf []byte, size int) {
 		s.outCount++
 		n := s.outCount
 		s.outMu.Unlock()
-		if n <= 20 || n%100 == 0 {
+		if n <= 5 || n%1000 == 0 {
 			log.Printf("[kcp] output #%d size=%d", n, end-start)
 		}
 
@@ -232,7 +255,7 @@ func (s *Session) recvLoop() {
 		}
 
 		inCount++
-		if inCount <= 20 || inCount%100 == 0 {
+		if inCount <= 5 || inCount%1000 == 0 {
 			log.Printf("[kcp] input #%d size=%d", inCount, len(data))
 		}
 
@@ -275,6 +298,7 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 	if ret < 0 {
 		return errors.New("kcp: send failed")
 	}
+	s.bytesSent.Add(int64(len(data)))
 	return nil
 }
 
@@ -324,6 +348,7 @@ func (s *Session) Receive(ctx context.Context) ([]byte, error) {
 
 		out := make([]byte, n)
 		copy(out, buf[:n])
+		s.bytesDelivered.Add(int64(n))
 		return out, nil
 	}
 }

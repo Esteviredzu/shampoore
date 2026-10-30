@@ -17,14 +17,8 @@ func init() {
 		"mux_flush_ms":        20,
 		"mux_flush_threshold": 12000,
 
-		"reliable_window": 64,
+		"reliable_window": 16,
 		"reliable_chunk":  0,
-
-		"padding_enabled": true,
-		"padding_target":  14000,
-
-		"jitter_min_ms": 0,
-		"jitter_max_ms": 0,
 	}
 
 	err := app.RegisterDescriptor(app.Descriptor{
@@ -87,16 +81,6 @@ func buildTransport(
 
 	var pipe transport.Pipe = NewYandexPipe(client, logger, pipeCfg)
 
-	if eff.Bool("padding_enabled", true) {
-		target := eff.Int("padding_target", 14000)
-		pp, err := security.NewPaddingPipe(pipe, target)
-		if err != nil {
-			return nil, err
-		}
-		pipe = pp
-		logger.Info("yandex: padding enabled; target=", target)
-	}
-
 	if s.EncryptionPassword != "" {
 		sp, err := security.NewSecurePipe(pipe, s.EncryptionPassword, logger)
 		if err != nil {
@@ -106,15 +90,8 @@ func buildTransport(
 		logger.Info("yandex: encryption enabled")
 	}
 
-	if eff.Int("jitter_max_ms", 0) > 0 {
-		minD := eff.Duration("jitter_min_ms", 0)
-		maxD := eff.Duration("jitter_max_ms", 0)
-		pipe = security.NewJitterPipe(pipe, minD, maxD)
-		logger.Info("yandex: jitter enabled")
-	}
-
 	session, err := reliability.NewReliableSession(pipe, logger, reliability.Config{
-		Window:    eff.Int("reliable_window", 64),
+		Window:    eff.Int("reliable_window", 16),
 		ChunkSize: eff.Int("reliable_chunk", 0),
 	})
 	if err != nil {

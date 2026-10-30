@@ -15,8 +15,6 @@ import (
 )
 
 const (
-	StreamID = "shampoore-vp8"
-	TrackID  = "video"
 	frameDur = 33 * time.Millisecond
 
 	writeSampleTimeout = 5 * time.Second
@@ -24,7 +22,7 @@ const (
 
 	incomingBufferSize = 1024
 
-	pliInterval = 500 * time.Millisecond
+	pliInterval  = 500 * time.Millisecond
 	reconnectGap = 3 * time.Second
 )
 
@@ -336,7 +334,7 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		}
 
 		totalFrames++
-		if totalFrames <= 10 || totalFrames%100 == 0 {
+		if totalFrames <= 5 {
 			log.Printf("[vp8] recv frame #%d size=%d keyframe=%v (rtp=%d gaps=%d/%d ch_drops=%d)",
 				totalFrames, len(frame), isKey,
 				rtpCount, gapFrames, totalFrames, droppedFull)
@@ -351,8 +349,8 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 			return
 		default:
 			droppedFull++
-			if droppedFull == 1 || droppedFull%100 == 0 {
-				log.Printf("[vp8] WARNING: incoming channel full, dropped %d frame(s)", droppedFull)
+			if droppedFull == 1 {
+				log.Printf("[vp8] WARNING: incoming channel full, dropped first frame")
 			}
 		}
 	}

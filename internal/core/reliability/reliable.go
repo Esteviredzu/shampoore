@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,6 +86,9 @@ type ReliableSession struct {
 
 	receiveQueue chan any
 
+	bytesDelivered atomic.Int64
+	bytesAcked     atomic.Int64
+
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started bool
@@ -143,6 +147,18 @@ func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Conf
 }
 
 func (s *ReliableSession) OwnSessionID() string { return s.ownSessionID }
+
+func (s *ReliableSession) MaxMessageSize() int {
+	return s.pipe.MaxMessageSize()
+}
+
+func (s *ReliableSession) BytesDelivered() int64 {
+	return s.bytesDelivered.Load()
+}
+
+func (s *ReliableSession) BytesAcked() int64 {
+	return s.bytesAcked.Load()
+}
 
 func (s *ReliableSession) Start(ctx context.Context) error {
 	if s.started {
@@ -272,6 +288,7 @@ func (s *ReliableSession) Receive(ctx context.Context) ([]byte, error) {
 					}(v.sessionID, v.sequence)
 				}
 			}
+			s.bytesDelivered.Add(int64(len(v.data)))
 			return v.data, nil
 		default:
 			return nil, fmt.Errorf("unexpected queue item type %T", item)
@@ -503,6 +520,7 @@ func (s *ReliableSession) processACK(sequence int) {
 	for seq, pkt := range s.pendingPackets {
 		if seq <= sequence {
 			freed = append(freed, pkt.keys)
+			s.bytesAcked.Add(int64(len(pkt.data)))
 			delete(s.pendingPackets, seq)
 		}
 	}
@@ -669,3 +687,5 @@ push:
 	default:
 	}
 }
+
+var _ transport.Transport = (*ReliableSession)(nil)

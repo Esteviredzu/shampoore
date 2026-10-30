@@ -30,7 +30,6 @@ type ffmpegDecoder struct {
 	frameCh  chan []byte
 	errCh    chan error
 	closed   bool
-	dumped   bool
 	statsIn  int
 	statsOut int
 

@@ -225,10 +225,6 @@ func (s *LocalServer) sendReply(conn net.Conn, code byte) error {
 	return err
 }
 
-func isIP(s string) bool {
-	return net.ParseIP(s) != nil
-}
-
 func resolveIPv4(host string) (string, error) {
 	addrs, err := net.LookupIP(host)
 	if err != nil {

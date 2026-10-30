@@ -12,4 +12,8 @@ type Transport interface {
 	Stop(ctx context.Context) error
 	Send(ctx context.Context, data []byte) error
 	Receive(ctx context.Context) ([]byte, error)
+
+	MaxMessageSize() int
+	BytesDelivered() int64
+	BytesAcked() int64
 }

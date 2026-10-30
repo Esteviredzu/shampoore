@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type Values map[string]any
@@ -27,11 +26,6 @@ func (v Values) Merge(override Values) Values {
 		out[k] = val
 	}
 	return out
-}
-
-func (v Values) Has(key string) bool {
-	_, ok := v[key]
-	return ok
 }
 
 func (v Values) Int(key string, def int) int {
@@ -61,10 +55,6 @@ func (v Values) Int(key string, def int) int {
 	default:
 		return def
 	}
-}
-
-func (v Values) Int64(key string, def int64) int64 {
-	return int64(v.Int(key, int(def)))
 }
 
 func (v Values) Bool(key string, def bool) bool {
@@ -98,11 +88,6 @@ func (v Values) String(key string, def string) string {
 		return def
 	}
 	return s
-}
-
-func (v Values) Duration(key string, def time.Duration) time.Duration {
-	ms := v.Int(key, int(def/time.Millisecond))
-	return time.Duration(ms) * time.Millisecond
 }
 
 func (v Values) StringSlice(key string, def []string) []string {

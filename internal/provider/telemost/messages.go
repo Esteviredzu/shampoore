@@ -85,11 +85,6 @@ func startupSetSlotsMessage(i, key int) map[string]any {
 	return slotsMessageWithSizes(key, startupSlotSizes[i], rnd)
 }
 
-func setSlotsMessage(key int) map[string]any {
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return slotsMessageWithSizes(key, startupSlotSizes[len(startupSlotSizes)-1], rnd)
-}
-
 func setSlotsOffsetMessage(offset int) map[string]any {
 	return map[string]any{
 		"uid":            uuid.NewString(),
