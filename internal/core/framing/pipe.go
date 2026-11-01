@@ -127,6 +127,9 @@ func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
 		cfg.Copies = 1
 	}
 
+	// Увеличенный буфер recvCh предотвращает блокировку recvLoop,
+	// если потребитель (KCP) временно не успевает читать.
+	const recvBufferSize = 2048
 	return &Pipe{
 		ch:           ch,
 		cfg:          cfg,
@@ -137,7 +140,7 @@ func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
 		hdrCells:     HdrCells(),
 		frameDur:     time.Second / time.Duration(cfg.FPS),
 		sendCh:       make(chan []byte, sendQueueCap),
-		recvCh:       make(chan []byte, 512),
+		recvCh:       make(chan []byte, recvBufferSize),
 	}, nil
 }
 

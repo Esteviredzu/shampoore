@@ -17,8 +17,8 @@ func init() {
 		"mux_flush_ms":        20,
 		"mux_flush_threshold": 12000,
 
-		"reliable_window": 16,
-		"reliable_chunk":  0,
+		"reliable_window": 64,
+		"reliable_chunk":  4000,
 	}
 
 	err := app.RegisterDescriptor(app.Descriptor{
@@ -91,8 +91,8 @@ func buildTransport(
 	}
 
 	session, err := reliability.NewReliableSession(pipe, logger, reliability.Config{
-		Window:    eff.Int("reliable_window", 16),
-		ChunkSize: eff.Int("reliable_chunk", 0),
+		Window:    eff.Int("reliable_window", 64),
+		ChunkSize: eff.Int("reliable_chunk", 4000),
 	})
 	if err != nil {
 		return nil, err

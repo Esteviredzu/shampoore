@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
 )
 
 type subflowSpec struct {
@@ -25,7 +26,7 @@ type config struct {
 func init() {
 	err := app.RegisterDescriptor(app.Descriptor{
 		Kind:        "multi",
-		DisplayName: "MultiPipe (aggregation)",
+		DisplayName: "MultiPipe (bonding)",
 		DecodeURL:   decodeURL,
 		EncodeURL:   encodeURL,
 		Defaults: app.Values{
@@ -64,6 +65,14 @@ func (p *multiProvider) Stop(ctx context.Context) error {
 
 func (p *multiProvider) Tunnel() *vp8.Tunnel { return nil }
 
+// build constructs one independent transport per configured subflow and
+// returns them via BuildResult.Subflows. It does NOT aggregate them into
+// a single Transport — the consumer is expected to wrap them in
+// multiplexing/multi.MultiStreamMux, which pins each stream to one
+// subflow. That is what makes throughput additive without HOL blocking.
+//
+// Subflows are built in parallel so that N telemost conferences boot in
+// max(30s) instead of N*30s.
 func build(
 	ctx context.Context,
 	s *app.Settings,
@@ -71,6 +80,8 @@ func build(
 	logger logging.ContextLogger,
 	eff app.Values,
 ) (*app.BuildResult, error) {
+	_ = eff // per-subflow defaults are resolved inside each sub-Build
+
 	var cfg config
 	if data := s.TransportData(); len(data) > 0 {
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -81,64 +92,133 @@ func build(
 		return nil, fmt.Errorf("multi: at least one transport required")
 	}
 
-	var subs []Subflow
-	var bypass []string
-	var sides []app.SideService
-	var providers []app.Provider
-	var connected []func() []string
+	type outcome struct {
+		idx  int
+		res  *app.BuildResult
+		name string
+		err  error
+	}
+
+	done := make(chan outcome, len(cfg.Transports))
+	var wg sync.WaitGroup
 
 	for i, spec := range cfg.Transports {
-		if spec.Type == "" {
-			return nil, fmt.Errorf("multi: transport %d: type required", i)
-		}
-		d, ok := app.DescriptorFor(spec.Type)
-		if !ok {
-			return nil, fmt.Errorf("multi: unknown transport type %q", spec.Type)
-		}
-		sub := &app.Settings{
-			Type:      spec.Type,
-			Transport: spec.Transport,
-			Advanced:  spec.Advanced,
-			IPv4Only:  app.IPv4Only,
-		}
-		subEff := d.Defaults.Merge(sub.Advanced)
-		res, err := d.Build(ctx, sub, role, logger, subEff)
-		if err != nil {
-			return nil, fmt.Errorf("multi: transport %d (%s): %w", i, spec.Type, err)
-		}
-		weight := spec.Weight
-		if weight <= 0 {
-			weight = 1
-		}
-		name := fmt.Sprintf("%d-%s", i, spec.Type)
-		subs = append(subs, Subflow{Name: name, Transport: res.Transport, Weight: weight})
-		bypass = append(bypass, res.BypassHosts...)
-		sides = append(sides, res.Side...)
-		if res.Provider != nil {
-			providers = append(providers, res.Provider)
-		}
-		if res.ConnectedIPs != nil {
-			connected = append(connected, res.ConnectedIPs)
-		}
+		i, spec := i, spec
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			if spec.Type == "" {
+				done <- outcome{idx: i, err: fmt.Errorf("multi: transport %d: type required", i)}
+				return
+			}
+			d, ok := app.DescriptorFor(spec.Type)
+			if !ok {
+				done <- outcome{idx: i, err: fmt.Errorf("multi: unknown transport type %q", spec.Type)}
+				return
+			}
+			if d.Kind == "multi" {
+				done <- outcome{idx: i, err: fmt.Errorf("multi: nested multi is not supported")}
+				return
+			}
+
+			sub := &app.Settings{
+				Type:      spec.Type,
+				Transport: spec.Transport,
+				Advanced:  spec.Advanced,
+				IPv4Only:  app.IPv4Only,
+			}
+			subEff := d.Defaults.Merge(sub.Advanced)
+
+			res, err := d.Build(ctx, sub, role, logger, subEff)
+			if err != nil {
+				done <- outcome{idx: i, err: fmt.Errorf("multi: transport %d (%s): %w", i, spec.Type, err)}
+				return
+			}
+			if res.Transport == nil {
+				done <- outcome{idx: i, err: fmt.Errorf("multi: transport %d (%s): build returned no transport", i, spec.Type)}
+				return
+			}
+
+			w := spec.Weight
+			if w <= 0 {
+				w = 1
+			}
+			name := fmt.Sprintf("%d-%s", i, spec.Type)
+			done <- outcome{idx: i, res: res, name: name}
+		}()
+	}
+	wg.Wait()
+	close(done)
+
+	outcomes := make([]outcome, len(cfg.Transports))
+	for o := range done {
+		outcomes[o.idx] = o
 	}
 
-	mp, err := New(subs, logger)
-	if err != nil {
-		return nil, err
+	// If anything failed, shut down whatever succeeded to avoid leaks.
+	var firstErr error
+	for _, o := range outcomes {
+		if o.err != nil && firstErr == nil {
+			firstErr = o.err
+		}
+	}
+	if firstErr != nil {
+		for _, o := range outcomes {
+			if o.err != nil || o.res == nil {
+				continue
+			}
+			if o.res.Provider != nil {
+				_ = o.res.Provider.Stop(context.Background())
+			}
+			if o.res.Transport != nil {
+				_ = o.res.Transport.Stop(context.Background())
+			}
+		}
+		return nil, firstErr
 	}
 
-	var finalTransport transport.Transport = mp
-	if s.EncryptionPassword != "" {
-		st, err := newSecureTransport(mp, s.EncryptionPassword, logger)
-		if err != nil {
-			return nil, err
+	var (
+		subflows  []multiplexing.SubflowTransport
+		bypass    []string
+		sides     []app.SideService
+		providers []app.Provider
+		connected []func() []string
+	)
+
+	for _, o := range outcomes {
+		tr := o.res.Transport
+		if s.EncryptionPassword != "" {
+			st, err := newSecureTransport(tr, s.EncryptionPassword, logger)
+			if err != nil {
+				return nil, fmt.Errorf("multi: encrypt %s: %w", o.name, err)
+			}
+			tr = st
 		}
-		finalTransport = st
-		logger.Info("multi: encryption enabled (outer)")
+
+		w := cfg.Transports[o.idx].Weight
+		if w <= 0 {
+			w = 1
+		}
+
+		subflows = append(subflows, multiplexing.SubflowTransport{
+			Name:      o.name,
+			Transport: tr,
+			Weight:    w,
+		})
+
+		bypass = append(bypass, o.res.BypassHosts...)
+		sides = append(sides, o.res.Side...)
+		if o.res.Provider != nil {
+			providers = append(providers, o.res.Provider)
+		}
+		if o.res.ConnectedIPs != nil {
+			connected = append(connected, o.res.ConnectedIPs)
+		}
 	}
 
 	result := &app.BuildResult{
-		Transport:   finalTransport,
+		Subflows:    subflows,
 		BypassHosts: bypass,
 		Side:        sides,
 	}

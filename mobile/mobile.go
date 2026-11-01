@@ -8,14 +8,16 @@ import (
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	multimux "github.com/Esteviredzu/shampoore-core/internal/multiplexing/multi"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/runtime"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
 
+	_ "github.com/Esteviredzu/shampoore-core/internal/transport/multi"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/multi"
 )
 
 var (
@@ -76,7 +78,19 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		FlushThreshold: rt.MuxConfig.FlushThreshold,
 		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
 	}
-	mux := tunnel.New(rt.Transport, lg, muxCfg)
+
+	var mux multiplexing.StreamMultiplexer
+	if rt.HasSubflows() {
+		mm, err := multimux.New(rt.Subflows, lg, muxCfg)
+		if err != nil {
+			cancelFn()
+			return err
+		}
+		mux = mm
+		lg.Info("mobile: multi-mux with ", len(rt.Subflows), " subflows")
+	} else {
+		mux = tunnel.New(rt.Transport, lg, muxCfg)
+	}
 
 	if err := mux.Start(ctx); err != nil {
 		cancelFn()

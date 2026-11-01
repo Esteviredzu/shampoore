@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
@@ -13,6 +14,7 @@ type SideService interface {
 
 type Runtime struct {
 	Transport    transport.Transport
+	Subflows     []multiplexing.SubflowTransport
 	Provider     Provider
 	BypassHosts  []string
 	ConnectedIPs func() []string
@@ -34,6 +36,9 @@ func NewRuntime(
 		sideServices: side,
 	}
 }
+
+// HasSubflows reports whether this runtime uses the multi (bonding) path.
+func (r *Runtime) HasSubflows() bool { return len(r.Subflows) > 0 }
 
 func (r *Runtime) Start(ctx context.Context) error {
 	if r.started {

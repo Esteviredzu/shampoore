@@ -260,14 +260,18 @@ func (s *Session) recvLoop() {
 		}
 
 		s.kcpMu.Lock()
-		s.kcp.Input(data, kcp.IKCP_PACKET_REGULAR, false)
+		ret := s.kcp.Input(data, kcp.IKCP_PACKET_REGULAR, false)
 		s.kcpMu.Unlock()
+		if ret < 0 {
+			s.logger.Warn("kcp: Input failed with code ", ret, " for ", len(data), " bytes")
+		}
 	}
 }
 
 func (s *Session) updateLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(10 * time.Millisecond)
+	// Уменьшен интервал обновления для снижения задержек.
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {

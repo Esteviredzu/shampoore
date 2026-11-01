@@ -20,9 +20,9 @@ var defaults = app.Values{
 
 	"kcp_conv":     0,
 	"kcp_mtu":      1200,
-	"kcp_window":   256,
+	"kcp_window":   128,
 	"kcp_nodelay":  1,
-	"kcp_interval": 10,
+	"kcp_interval": 5,
 	"kcp_resend":   2,
 	"kcp_nc":       true,
 
@@ -30,9 +30,9 @@ var defaults = app.Values{
 	"fec_data_shards":   10,
 	"fec_parity_shards": 3,
 
-	"raw_frame_size": 12000,
+	"raw_frame_size": 9000,
 	"raw_fps":        60,
-	"raw_copies":     1,
+	"raw_copies":     2,
 	"raw_gop":        30,
 }
 
@@ -83,9 +83,9 @@ func build(
 	}
 
 	rawCfg := raw.Config{
-		FrameSize: eff.Int("raw_frame_size", 12000),
+		FrameSize: eff.Int("raw_frame_size", 9000),
 		FPS:       eff.Int("raw_fps", 60),
-		Copies:    eff.Int("raw_copies", 1),
+		Copies:    eff.Int("raw_copies", 2),
 		GOP:       eff.Int("raw_gop", 30),
 	}
 	rawPipe := raw.New(tunnel, rawCfg, logger)
@@ -116,9 +116,9 @@ func build(
 	kcpCfg := kcp.Config{
 		Conv:     conv,
 		MTU:      mtu,
-		Window:   eff.Int("kcp_window", 256),
+		Window:   eff.Int("kcp_window", 128),
 		NoDelay:  eff.Int("kcp_nodelay", 1),
-		Interval: eff.Int("kcp_interval", 10),
+		Interval: eff.Int("kcp_interval", 5),
 		Resend:   eff.Int("kcp_resend", 2),
 		NC:       eff.Bool("kcp_nc", true),
 
@@ -148,7 +148,9 @@ func build(
 		return nil, err
 	}
 
-	logger.Info("yandex_telemost_raw: ready (mtu=", mtu, " conv=", conv, ")")
+	logger.Info("yandex_telemost_raw: ready (mtu=", mtu, " conv=", conv,
+		" window=", kcpCfg.Window, " copies=", rawCfg.Copies,
+		" frame_size=", rawCfg.FrameSize, ")")
 
 	return &app.BuildResult{
 		Transport:    inner,

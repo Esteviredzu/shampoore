@@ -20,9 +20,11 @@ const (
 	writeSampleTimeout = 5 * time.Second
 	vp8MaxPayload      = (1 << 19) - 1 - 7
 
-	incomingBufferSize = 1024
+	// Увеличен буфер, чтобы избежать потери фреймов при кратковременных всплесках нагрузки.
+	incomingBufferSize = 4096
 
-	pliInterval  = 500 * time.Millisecond
+	// Более частые PLI-запросы помогают быстрее восстановить декодирование после потери пакетов.
+	pliInterval  = 100 * time.Millisecond
 	reconnectGap = 3 * time.Second
 )
 
@@ -349,8 +351,9 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 			return
 		default:
 			droppedFull++
-			if droppedFull == 1 {
-				log.Printf("[vp8] WARNING: incoming channel full, dropped first frame")
+			if droppedFull == 1 || droppedFull%100 == 0 {
+				log.Printf("[vp8] WARNING: incoming channel full (buffer=%d), dropped frame #%d",
+					incomingBufferSize, droppedFull)
 			}
 		}
 	}
