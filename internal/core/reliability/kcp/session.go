@@ -32,6 +32,8 @@ type Config struct {
 	FECEnabled      bool
 	FECDataShards   int
 	FECParityShards int
+
+	EncryptionPassword string
 }
 
 func DefaultConfig() Config {
@@ -81,16 +83,14 @@ func NewSession(
 	if cfg.Conv == 0 {
 		cfg.Conv = 1
 	}
-	if cfg.MTU <= 0 {
-		max := pipe.MaxMessageSize()
-		cfg.MTU = max - 24
-		if cfg.MTU < 64 {
-			return nil, errors.New("kcp: MTU too small")
+
+	if cfg.EncryptionPassword != "" {
+		wrapped, err := security.WrapPipe(pipe, cfg.EncryptionPassword, logger)
+		if err != nil {
+			return nil, err
 		}
-	}
-	const maxKCPMTU = 1200
-	if cfg.MTU > maxKCPMTU {
-		cfg.MTU = maxKCPMTU
+		pipe = wrapped
+		logger.Info("kcp: encryption enabled")
 	}
 
 	if cfg.FECEnabled {
@@ -101,6 +101,22 @@ func NewSession(
 		pipe = fecPipe
 		logger.Info("kcp: FEC enabled; data_shards=", cfg.FECDataShards,
 			" parity_shards=", cfg.FECParityShards)
+	}
+
+	mtuCeiling := pipe.MaxMessageSize() - 24
+	if mtuCeiling < 64 {
+		return nil, errors.New("kcp: MTU too small")
+	}
+	if cfg.MTU <= 0 {
+		cfg.MTU = mtuCeiling
+	}
+	if cfg.MTU > mtuCeiling {
+		logger.Info("kcp: MTU clamped ", cfg.MTU, " -> ", mtuCeiling)
+		cfg.MTU = mtuCeiling
+	}
+	const maxKCPMTU = 1200
+	if cfg.MTU > maxKCPMTU {
+		cfg.MTU = maxKCPMTU
 	}
 
 	s := &Session{
@@ -270,7 +286,6 @@ func (s *Session) recvLoop() {
 
 func (s *Session) updateLoop() {
 	defer s.wg.Done()
-	// Уменьшен интервал обновления для снижения задержек.
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 

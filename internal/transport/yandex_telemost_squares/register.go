@@ -19,7 +19,7 @@ var defaults = app.Values{
 
 	"kcp_conv":     0,
 	"kcp_mtu":      390,
-	"kcp_window":   256, // Увеличено со 128 до 256
+	"kcp_window":   256,
 	"kcp_nodelay":  1,
 	"kcp_interval": 5,
 	"kcp_resend":   2,
@@ -79,13 +79,13 @@ func build(
 		return nil, err
 	}
 
-	pipe := telemost.NewPipe(&cfg, boot, logger)
-	if err := pipe.Start(ctx); err != nil {
+	providerPipe := telemost.NewPipe(&cfg, boot, logger)
+	if err := providerPipe.Start(ctx); err != nil {
 		return nil, fmt.Errorf("yandex_telemost_squares: signaling start: %w", err)
 	}
-	tunnel := pipe.Tunnel()
+	tunnel := providerPipe.Tunnel()
 	if tunnel == nil {
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, fmt.Errorf("yandex_telemost_squares: tunnel is nil")
 	}
 
@@ -97,20 +97,10 @@ func build(
 	copies := eff.Int("squares_copies", 1)
 
 	grid := framing.Grid{CellSize: cellSize, Cols: cols, Rows: rows}
-	w, h, _, _, maxMsg, err := grid.DeriveLayout()
+	w, h, _, _, _, err := grid.DeriveLayout()
 	if err != nil {
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, err
-	}
-
-	mtu := eff.Int("kcp_mtu", 390)
-	if mtu > maxMsg {
-		logger.Info("yandex_telemost_squares: kcp_mtu clamped ", mtu, " -> ", maxMsg)
-		mtu = maxMsg
-	}
-	if mtu < 64 {
-		_ = pipe.Stop(ctx)
-		return nil, fmt.Errorf("yandex_telemost_squares: kcp_mtu too small: %d", mtu)
 	}
 
 	sqCfg := framing.Config{
@@ -125,11 +115,11 @@ func build(
 	}
 	sqPipe, err := framing.NewPipe(tunnel, sqCfg)
 	if err != nil {
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, err
 	}
 	if err := sqPipe.Start(ctx); err != nil {
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, err
 	}
 
@@ -143,8 +133,8 @@ func build(
 
 	kcpCfg := kcp.Config{
 		Conv:     conv,
-		MTU:      mtu,
-		Window:   eff.Int("kcp_window", 256), // Значение по умолчанию 256
+		MTU:      eff.Int("kcp_mtu", 390),
+		Window:   eff.Int("kcp_window", 256),
 		NoDelay:  eff.Int("kcp_nodelay", 1),
 		Interval: eff.Int("kcp_interval", 5),
 		Resend:   eff.Int("kcp_resend", 2),
@@ -153,15 +143,17 @@ func build(
 		FECEnabled:      eff.Bool("fec_enabled", false),
 		FECDataShards:   eff.Int("fec_data_shards", 10),
 		FECParityShards: eff.Int("fec_parity_shards", 3),
+
+		EncryptionPassword: s.EncryptionPassword,
 	}
 	inner, err := kcp.NewSession(sqPipe, logger, kcpCfg)
 	if err != nil {
 		_ = sqPipe.Stop(ctx)
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, err
 	}
 
-	pipe.SetTransportResetFunc(func() {
+	providerPipe.SetTransportResetFunc(func() {
 		logger.Info("yandex_telemost_squares: remote reconnect detected, resetting KCP session")
 		if resetter, ok := interface{}(inner).(interface{ Reset() error }); ok {
 			if err := resetter.Reset(); err != nil {
@@ -172,16 +164,16 @@ func build(
 
 	if err := inner.Start(ctx); err != nil {
 		_ = sqPipe.Stop(ctx)
-		_ = pipe.Stop(ctx)
+		_ = providerPipe.Stop(ctx)
 		return nil, err
 	}
 
-	logger.Info("yandex_telemost_squares: ready (mtu=", mtu, " conv=", conv, ")")
+	logger.Info("yandex_telemost_squares: ready (mtu=", kcpCfg.MTU, " conv=", conv, ")")
 
 	return &app.BuildResult{
 		Transport:    inner,
-		Provider:     pipe,
-		BypassHosts:  pipe.BypassHosts(),
-		ConnectedIPs: pipe.ConnectedIPs,
+		Provider:     providerPipe,
+		BypassHosts:  providerPipe.BypassHosts(),
+		ConnectedIPs: providerPipe.ConnectedIPs,
 	}, nil
 }

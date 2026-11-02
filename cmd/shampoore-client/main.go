@@ -11,13 +11,11 @@ import (
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	multimux "github.com/Esteviredzu/shampoore-core/internal/multiplexing/multi"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/runtime"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
 
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/multi"
+	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
@@ -59,16 +57,7 @@ func main() {
 		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
 	}
 
-	var mux multiplexing.StreamMultiplexer
-	if rt.HasSubflows() {
-		mm, err := multimux.New(rt.Subflows, lg, muxCfg)
-		if err != nil {
-			log.Fatalf("multi-mux: %v", err)
-		}
-		mux = mm
-	} else {
-		mux = tunnel.New(rt.Transport, lg, muxCfg)
-	}
+	mux := tunnel.New(rt.Transport, lg, muxCfg)
 
 	if err := mux.Start(ctx); err != nil {
 		log.Fatalf("mux start: %v", err)
@@ -88,7 +77,6 @@ func main() {
 				log.Printf("socks5 stopped: %v", err)
 			}
 		}()
-		println("socks5 listening on", listen)
 
 	case app.ModeTUN:
 		go func() {

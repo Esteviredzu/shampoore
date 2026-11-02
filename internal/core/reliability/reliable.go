@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Esteviredzu/shampoore-core/internal/core/security"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
@@ -24,10 +25,11 @@ const (
 )
 
 type Config struct {
-	Window      int
-	ChunkSize   int
-	AckBatchMs  int
-	AckDisabled bool
+	Window             int
+	ChunkSize          int
+	AckBatchMs         int
+	AckDisabled        bool
+	EncryptionPassword string
 }
 
 func DefaultConfig() Config {
@@ -100,6 +102,15 @@ type ReliableSession struct {
 func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Config) (*ReliableSession, error) {
 	if cfg.Window <= 0 {
 		cfg.Window = defaultWindow
+	}
+
+	if cfg.EncryptionPassword != "" {
+		wrapped, err := security.WrapPipe(pipe, cfg.EncryptionPassword, log)
+		if err != nil {
+			return nil, err
+		}
+		pipe = wrapped
+		log.Info("reliable: encryption enabled")
 	}
 
 	var chunkSize int

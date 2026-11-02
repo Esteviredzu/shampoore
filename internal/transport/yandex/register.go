@@ -7,9 +7,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/core/reliability"
-	"github.com/Esteviredzu/shampoore-core/internal/core/security"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
 func init() {
@@ -79,20 +77,12 @@ func buildTransport(
 	pipeCfg.DeleteFlushMs = cfg.DeleteFlushMs
 	pipeCfg.StatsEnabled = !cfg.StatsDisabled
 
-	var pipe transport.Pipe = NewYandexPipe(client, logger, pipeCfg)
-
-	if s.EncryptionPassword != "" {
-		sp, err := security.NewSecurePipe(pipe, s.EncryptionPassword, logger)
-		if err != nil {
-			return nil, err
-		}
-		pipe = sp
-		logger.Info("yandex: encryption enabled")
-	}
+	pipe := NewYandexPipe(client, logger, pipeCfg)
 
 	session, err := reliability.NewReliableSession(pipe, logger, reliability.Config{
-		Window:    eff.Int("reliable_window", 64),
-		ChunkSize: eff.Int("reliable_chunk", 4000),
+		Window:             eff.Int("reliable_window", 64),
+		ChunkSize:          eff.Int("reliable_chunk", 4000),
+		EncryptionPassword: s.EncryptionPassword,
 	})
 	if err != nil {
 		return nil, err

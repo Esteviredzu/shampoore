@@ -15,7 +15,6 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	multimux "github.com/Esteviredzu/shampoore-core/internal/multiplexing/multi"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/server/logbuf"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
@@ -235,20 +234,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
 	}
 
-	var mux multiplexing.StreamMultiplexer
-	if rt.HasSubflows() {
-		mm, err := multimux.New(rt.Subflows, logger, muxCfg)
-		if err != nil {
-			cancel()
-			_ = rt.Stop(context.Background())
-			return fmt.Errorf("multi-mux: %w", err)
-		}
-		mux = mm
-		logger.Info("manager: ", me.Name, " using multi-mux with ",
-			len(rt.Subflows), " subflows")
-	} else {
-		mux = tunnel.New(rt.Transport, logger, muxCfg)
-	}
+	mux := tunnel.New(rt.Transport, logger, muxCfg)
 
 	if err := mux.Start(ctx); err != nil {
 		cancel()
@@ -500,7 +486,7 @@ func (m *Manager) Restart(name string) error {
 	}
 	m.stopEntry(me)
 
-	if me.FilePath != "" {
+		if me.FilePath != "" {
 		if data, err := os.ReadFile(me.FilePath); err == nil {
 			if settings, err := ParseConfigContent(string(data)); err == nil && settings != nil {
 				settings.ApplyDefaults()

@@ -13,10 +13,10 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 	"github.com/Esteviredzu/shampoore-core/panel"
 
+	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/multi"
 )
 
 func main() {
@@ -34,9 +34,9 @@ func main() {
 
 	sup := panel.NewSupervisor(*sockPath, *configsDir)
 	client := control.NewClient(*sockPath)
-	
+
 	api := panel.New(client, sup, logger, *token, *examplesDir, *configsDir)
-	
+
 	srv := &http.Server{Addr: *listen, Handler: api.Handler()}
 	go func() {
 		logger.Info("panel: listening on http://", *listen)
