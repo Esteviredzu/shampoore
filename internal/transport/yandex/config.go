@@ -7,8 +7,7 @@ import (
 )
 
 type Config struct {
-	Hash            string `json:"hash"`
-	ParticipantName string `json:"participant_name,omitempty"`
+	Hash string `json:"hash"`
 
 	PipeQueue         int   `json:"pipe_queue,omitempty"`
 	BoardQueue        int   `json:"board_queue,omitempty"`

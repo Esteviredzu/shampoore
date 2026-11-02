@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -14,15 +13,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Esteviredzu/shampoore-core/internal/names"
 )
 
 const (
-	boardOrigin   = "https://boards.yandex.ru"
-	httpTimeout   = 20 * time.Second
-	userAgent     = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
-	nameMinLength = 5
-	nameMaxLength = 10
-	nameAlphabet  = "abcdefghijklmnopqrstuvwxyz"
+	boardOrigin = "https://boards.yandex.ru"
+	httpTimeout = 20 * time.Second
+	userAgent   = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 )
 
 type Credentials struct {
@@ -36,15 +34,12 @@ type Credentials struct {
 	ParticipantName string
 }
 
-func Bootstrap(ctx context.Context, hash string, name string) (*Credentials, error) {
+func Bootstrap(ctx context.Context, hash string) (*Credentials, error) {
 	if !isValidHash(hash) {
 		return nil, fmt.Errorf("invalid board hash: %q", hash)
 	}
 
-	chosenName := name
-	if chosenName == "" {
-		chosenName = generateParticipantName()
-	}
+	chosenName := names.Random()
 
 	guestURL := boardOrigin + "/guest/?hash=" + hash
 
@@ -208,14 +203,4 @@ func decodeJWTPayload(token string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid JWT JSON: %w", err)
 	}
 	return payload, nil
-}
-
-func generateParticipantName() string {
-	length := nameMinLength + rand.IntN(nameMaxLength-nameMinLength+1)
-	var sb strings.Builder
-	sb.Grow(length)
-	for i := 0; i < length; i++ {
-		sb.WriteByte(nameAlphabet[rand.IntN(len(nameAlphabet))])
-	}
-	return sb.String()
 }

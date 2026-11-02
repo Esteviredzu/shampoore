@@ -3,29 +3,31 @@ package telemost
 import (
 	"errors"
 	"fmt"
+
+	"github.com/Esteviredzu/shampoore-core/internal/names"
 )
 
 type Config struct {
-	ConferenceID string `json:"conference_id,omitempty"`
+	ConferenceID   string `json:"conference_id,omitempty"`
 	ConferenceLink string `json:"conference_link,omitempty"`
 
-	DisplayName string `json:"display_name,omitempty"`
-	AppVersion  string `json:"app_version,omitempty"`
-	SDKVersion  string `json:"sdk_version,omitempty"`
+	AppVersion string `json:"app_version,omitempty"`
+	SDKVersion string `json:"sdk_version,omitempty"`
 
 	Role string `json:"role,omitempty"`
 
 	UseSharing bool `json:"use_sharing,omitempty"`
 
 	LocalSignalingURL string `json:"local_signaling_url,omitempty"`
+
+	displayName string
 }
 
 func DefaultConfig() Config {
 	return Config{
-		DisplayName: "Гость",
-		AppVersion:  "213.7.0",
-		SDKVersion:  "5.28.0",
-		Role:        "SPEAKER",
+		AppVersion: "213.7.0",
+		SDKVersion: "5.28.0",
+		Role:       "SPEAKER",
 	}
 }
 
@@ -49,14 +51,17 @@ func (c *Config) Validate() error {
 	if c.Role != "SPEAKER" {
 		return errors.New("telemost: only SPEAKER role is supported")
 	}
+	if c.displayName == "" {
+		c.displayName = names.Random()
+	}
 	return nil
 }
 
 func (c *Config) EffectiveDisplayName() string {
-	if c.DisplayName == "" {
+	if c.displayName == "" {
 		return "Гость"
 	}
-	return c.DisplayName
+	return c.displayName
 }
 
 func isValidConferenceID(id string) bool {

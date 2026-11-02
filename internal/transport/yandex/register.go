@@ -49,7 +49,7 @@ func buildTransport(
 		return nil, err
 	}
 
-	creds, err := Bootstrap(ctx, cfg.Hash, cfg.ParticipantName)
+	creds, err := Bootstrap(ctx, cfg.Hash)
 	if err != nil {
 		return nil, err
 	}
