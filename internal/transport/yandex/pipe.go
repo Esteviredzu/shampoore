@@ -125,6 +125,10 @@ func (p *YandexPipe) Stop(ctx context.Context) error {
 	}
 	p.deleteMu.Unlock()
 
+	if p.client != nil {
+		_ = p.client.Close()
+	}
+
 	return nil
 }
 

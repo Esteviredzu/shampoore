@@ -127,8 +127,6 @@ func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
 		cfg.Copies = 1
 	}
 
-	// Увеличенный буфер recvCh предотвращает блокировку recvLoop,
-	// если потребитель (KCP) временно не успевает читать.
 	const recvBufferSize = 2048
 	return &Pipe{
 		ch:           ch,

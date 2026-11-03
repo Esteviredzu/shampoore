@@ -255,7 +255,8 @@ func (m *TunnelMultiplexer) flushOutbound(ctx context.Context) {
 
 		var err error
 		ok := false
-		for attempt := 0; attempt < 10; attempt++ {
+
+		for attempt := 0; attempt < 3; attempt++ {
 			err = m.transport.Send(ctx, chunk)
 			if err == nil {
 				ok = true
@@ -266,7 +267,7 @@ func (m *TunnelMultiplexer) flushOutbound(ctx context.Context) {
 			}
 			select {
 			case <-ctx.Done():
-			case <-time.After(20 * time.Millisecond):
+			case <-time.After(5 * time.Millisecond):
 			}
 		}
 		if !ok {

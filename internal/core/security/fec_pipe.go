@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/klauspost/reedsolomon"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/klauspost/reedsolomon"
 )
 
 const (

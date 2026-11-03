@@ -119,10 +119,10 @@ func (c *BoardClient) subscribeDashboard(ctx context.Context) error {
 			"dashboard":    c.creds.Dashboard,
 			"presentation": c.creds.Presentation,
 			"properties": map[string]any{
-				"guest_mode":    true,
-				"guest_role":    1,
+				"guest_mode":     true,
+				"guest_role":     1,
 				"guest_password": nil,
-				"current_slide": c.creds.Dashboard,
+				"current_slide":  c.creds.Dashboard,
 			},
 			"participant":           c.creds.Participant,
 			"participant_team_role": -1,

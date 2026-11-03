@@ -19,4 +19,5 @@ type ContextLogger interface {
 	FatalContext(ctx context.Context, args ...any)
 	PanicContext(ctx context.Context, args ...any)
 }
+
 var _ ContextLogger = (*Logger)(nil)

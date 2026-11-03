@@ -66,7 +66,7 @@ func (s *Supervisor) Start() error {
 	bin := "shampoore-server"
 	exe, _ := os.Executable()
 	dir := filepath.Dir(exe)
-	
+
 	candidates := []string{
 		filepath.Join(dir, "shampoore-server"),
 		"./shampoore-server",

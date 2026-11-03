@@ -486,7 +486,7 @@ func (m *Manager) Restart(name string) error {
 	}
 	m.stopEntry(me)
 
-		if me.FilePath != "" {
+	if me.FilePath != "" {
 		if data, err := os.ReadFile(me.FilePath); err == nil {
 			if settings, err := ParseConfigContent(string(data)); err == nil && settings != nil {
 				settings.ApplyDefaults()

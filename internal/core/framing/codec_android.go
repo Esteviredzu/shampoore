@@ -2,59 +2,6 @@
 
 package framing
 
-/*
-#cgo LDFLAGS: -lmediandk -landroid
-#include <media/NdkMediaCodec.h>
-#include <media/NdkMediaFormat.h>
-#include <stdlib.h>
-
-typedef struct {
-	int32_t width;
-	int32_t height;
-	int32_t stride;
-	int32_t slice_height;
-	int32_t color_format;
-} shampoore_fmt_info;
-
-static void shampoore_fmt_set_int32(AMediaFormat *f, const char *k, int32_t v) {
-	(void)AMediaFormat_setInt32(f, k, v);
-}
-
-static void shampoore_fmt_set_string(AMediaFormat *f, const char *k, const char *v) {
-	(void)AMediaFormat_setString(f, k, v);
-}
-
-static shampoore_fmt_info shampoore_read_fmt(AMediaCodec *codec) {
-	shampoore_fmt_info info;
-	info.width = 0;
-	info.height = 0;
-	info.stride = 0;
-	info.slice_height = 0;
-	info.color_format = 0;
-	AMediaFormat *fmt = AMediaCodec_getOutputFormat(codec);
-	if (fmt) {
-		AMediaFormat_getInt32(fmt, "width", &info.width);
-		AMediaFormat_getInt32(fmt, "height", &info.height);
-		AMediaFormat_getInt32(fmt, "stride", &info.stride);
-		AMediaFormat_getInt32(fmt, "slice-height", &info.slice_height);
-		AMediaFormat_getInt32(fmt, "color-format", &info.color_format);
-		AMediaFormat_delete(fmt);
-	}
-	return info;
-}
-
-static media_status_t shampoore_configure_encode(AMediaCodec *c, AMediaFormat *f) {
-	return AMediaCodec_configure(c, f, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
-}
-
-static media_status_t shampoore_configure_decode(AMediaCodec *c, AMediaFormat *f) {
-	return AMediaCodec_configure(c, f, NULL, NULL, 0);
-}
-
-static void shampoore_release_output(AMediaCodec *c, size_t idx) {
-	(void)AMediaCodec_releaseOutputBuffer(c, idx, false);
-}
-*/
 import "C"
 
 import (
@@ -143,7 +90,6 @@ func nv12toPlanar(nv12 []byte, width, height int) []byte {
 	}
 	return out
 }
-
 
 type androidEncoder struct {
 	codec   *C.AMediaCodec

@@ -27,12 +27,12 @@ func newDatagramStream(stream multiplexing.Stream, remote net.Addr) *datagramStr
 	return &datagramStream{stream: stream, remote: remote}
 }
 
-func (d *datagramStream) LocalAddr() net.Addr                 { return datagramAddr("udp") }
-func (d *datagramStream) RemoteAddr() net.Addr                { return d.remote }
-func (d *datagramStream) SetDeadline(t time.Time) error       { return nil }
-func (d *datagramStream) SetReadDeadline(t time.Time) error   { return nil }
-func (d *datagramStream) SetWriteDeadline(t time.Time) error  { return nil }
-func (d *datagramStream) Close() error                        { return d.stream.Close() }
+func (d *datagramStream) LocalAddr() net.Addr                { return datagramAddr("udp") }
+func (d *datagramStream) RemoteAddr() net.Addr               { return d.remote }
+func (d *datagramStream) SetDeadline(t time.Time) error      { return nil }
+func (d *datagramStream) SetReadDeadline(t time.Time) error  { return nil }
+func (d *datagramStream) SetWriteDeadline(t time.Time) error { return nil }
+func (d *datagramStream) Close() error                       { return d.stream.Close() }
 
 func (d *datagramStream) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if len(p) > 65535 {

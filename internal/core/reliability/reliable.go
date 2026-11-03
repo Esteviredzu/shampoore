@@ -22,6 +22,9 @@ const (
 	retryScanInterval  = 100 * time.Millisecond
 	maxReorderDistance = 256
 	defaultWindow      = 64
+
+	sendWindowPollInterval = 5 * time.Millisecond
+	sendWindowTimeout      = 500 * time.Millisecond
 )
 
 type Config struct {
@@ -234,13 +237,27 @@ func (s *ReliableSession) Send(ctx context.Context, data []byte) error {
 	default:
 	}
 
+	deadline := time.Now().Add(sendWindowTimeout)
+
 	s.sendMu.Lock()
-	for len(s.pendingPackets) >= s.cfg.Window && !s.closed {
-		s.sendCond.Wait()
-	}
-	if s.closed {
+	for len(s.pendingPackets) >= s.cfg.Window {
+		if s.closed {
+			s.sendMu.Unlock()
+			return errors.New("reliable: session closed")
+		}
+		if time.Now().After(deadline) {
+			s.sendMu.Unlock()
+			return errors.New("reliable: send window timeout")
+		}
 		s.sendMu.Unlock()
-		return errors.New("reliable: session closed")
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sendWindowPollInterval):
+		}
+
+		s.sendMu.Lock()
 	}
 
 	seq := s.nextSendSequence

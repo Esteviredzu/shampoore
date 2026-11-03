@@ -20,10 +20,8 @@ const (
 	writeSampleTimeout = 5 * time.Second
 	vp8MaxPayload      = (1 << 19) - 1 - 7
 
-	// Увеличен буфер, чтобы избежать потери фреймов при кратковременных всплесках нагрузки.
 	incomingBufferSize = 4096
 
-	// Более частые PLI-запросы помогают быстрее восстановить декодирование после потери пакетов.
 	pliInterval  = 100 * time.Millisecond
 	reconnectGap = 3 * time.Second
 )
@@ -263,6 +261,11 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		frameHasGap bool
 	)
 
+	var (
+		lastTimestamp uint32
+		haveTimestamp bool
+	)
+
 	var lastFrameTime time.Time
 
 	for {
@@ -285,6 +288,15 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		}
 		lastSeq = pkt.SequenceNumber
 		haveLastSeq = true
+
+		if haveTimestamp && pkt.Timestamp != lastTimestamp && frameStarted {
+
+			frame = frameBuf[:0]
+			frameStarted = false
+			frameHasGap = false
+		}
+		lastTimestamp = pkt.Timestamp
+		haveTimestamp = true
 
 		payload, err := vp8.Unmarshal(pkt.Payload)
 		if err != nil {

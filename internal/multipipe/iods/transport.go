@@ -26,6 +26,11 @@ const (
 	defaultRTT       = 50 * time.Millisecond
 	incomingBuffer   = 4096
 	maxReorderBuffer = 8192
+
+	throughputSampleInterval = 500 * time.Millisecond
+	throughputEWMAAlpha      = 0.3
+
+	defaultThroughput = 50000
 )
 
 type Subflow struct {
@@ -44,6 +49,10 @@ type subflow struct {
 	rtt        time.Duration
 	estArrival time.Time
 	dead       bool
+
+	throughput   float64
+	lastAcked    int64
+	lastSampleAt time.Time
 }
 
 type Transport struct {
@@ -82,13 +91,16 @@ func New(cfg Config) (*Transport, error) {
 		allDead:   make(chan struct{}),
 		buf:       make(map[uint32][]byte),
 	}
+	now := time.Now()
 	for _, s := range cfg.Subflows {
 		if s.Transport == nil {
 			return nil, errors.New("iods: nil transport in subflow " + s.Name)
 		}
 		t.subflows = append(t.subflows, &subflow{
-			name:      s.Name,
-			transport: s.Transport,
+			name:         s.Name,
+			transport:    s.Transport,
+			lastAcked:    s.Transport.BytesAcked(),
+			lastSampleAt: now,
 		})
 	}
 	return t, nil
@@ -111,6 +123,9 @@ func (t *Transport) Start(ctx context.Context) error {
 
 	t.wg.Add(1)
 	go t.deliverLoop()
+
+	t.wg.Add(1)
+	go t.statsLoop()
 
 	for _, sf := range t.subflows {
 		t.wg.Add(1)
@@ -146,7 +161,7 @@ func (t *Transport) Send(ctx context.Context, data []byte) error {
 	now := time.Now()
 
 	t.mu.Lock()
-	sf := t.pickLocked(now)
+	sf := t.pickLocked(now, len(data))
 	if sf == nil {
 		t.mu.Unlock()
 		return errors.New("iods: all subflows dead")
@@ -162,6 +177,11 @@ func (t *Transport) Send(ctx context.Context, data []byte) error {
 	copy(frame[dataHdrSize:], data)
 
 	if err := sf.transport.Send(ctx, frame); err != nil {
+		t.mu.Lock()
+		if t.nextSeq == seq+1 {
+			t.nextSeq = seq
+		}
+		t.mu.Unlock()
 		return fmt.Errorf("iods: send on %s: %w", sf.name, err)
 	}
 	return nil
@@ -211,7 +231,7 @@ func (t *Transport) BytesAcked() int64 {
 	return total
 }
 
-func (t *Transport) pickLocked(now time.Time) *subflow {
+func (t *Transport) pickLocked(now time.Time, dataLen int) *subflow {
 	var (
 		chosen     *subflow
 		chosenTime time.Time
@@ -229,11 +249,18 @@ func (t *Transport) pickLocked(now time.Time) *subflow {
 			rtt = defaultRTT
 		}
 
+		tp := sf.throughput
+		if tp <= 0 {
+			tp = defaultThroughput
+		}
+
+		segmentTime := time.Duration(float64(dataLen) / tp * float64(time.Second))
+
 		base := sf.estArrival
 		if base.Before(now) {
 			base = now
 		}
-		arrival := base.Add(rtt)
+		arrival := base.Add(rtt/2 + segmentTime)
 
 		if arrival.Before(t.lastAssigned) {
 			if fallback == nil || arrival.After(fallbackT) {
@@ -311,7 +338,7 @@ func (t *Transport) handleData(raw []byte) {
 	if seq > t.nextExpect+maxReorderBuffer {
 		t.mu.Unlock()
 		t.logger.Warn("iods: reorder buffer overflow seq=", seq,
-			" expected=", t.nextExpect)
+			" expected=", t.nextExpect, "; resetting transport")
 		if t.cancel != nil {
 			t.cancel()
 		}
@@ -320,6 +347,7 @@ func (t *Transport) handleData(raw []byte) {
 	if _, exists := t.buf[seq]; !exists {
 		t.buf[seq] = payload
 	}
+
 	for {
 		data, ok := t.buf[t.nextExpect]
 		if !ok {
@@ -390,6 +418,56 @@ func (t *Transport) deliverLoop() {
 				return
 			}
 		}
+	}
+}
+
+func (t *Transport) statsLoop() {
+	defer t.wg.Done()
+
+	ticker := time.NewTicker(throughputSampleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			t.sampleThroughputs()
+		}
+	}
+}
+
+func (t *Transport) sampleThroughputs() {
+	now := time.Now()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, sf := range t.subflows {
+		if sf.dead {
+			continue
+		}
+
+		acked := sf.transport.BytesAcked()
+		delta := acked - sf.lastAcked
+		dt := now.Sub(sf.lastSampleAt).Seconds()
+
+		if dt <= 0 || delta <= 0 {
+			sf.lastAcked = acked
+			sf.lastSampleAt = now
+			continue
+		}
+
+		sample := float64(delta) / dt
+		if sf.throughput == 0 {
+			sf.throughput = sample
+		} else {
+			sf.throughput = throughputEWMAAlpha*sample +
+				(1-throughputEWMAAlpha)*sf.throughput
+		}
+
+		sf.lastAcked = acked
+		sf.lastSampleAt = now
 	}
 }
 

@@ -46,6 +46,11 @@ func DefaultConfig() Config {
 	}
 }
 
+type pendingChunk struct {
+	data []byte
+	key  string
+}
+
 type Session struct {
 	pipe   transport.Pipe
 	cfg    Config
@@ -59,6 +64,8 @@ type Session struct {
 
 	outCount int
 	outMu    sync.Mutex
+
+	pendingOutput []pendingChunk
 
 	bytesDelivered atomic.Int64
 	bytesSent      atomic.Int64
@@ -200,9 +207,33 @@ func (s *Session) output(buf []byte, size int) {
 
 		key := uuid.NewString()
 		if err := s.pipe.SendMessage(s.ctx, data, key); err != nil {
-			s.logger.Warn("kcp: output send error: ", err)
+
+			s.outMu.Lock()
+			s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
+			s.outMu.Unlock()
+			s.logger.Debug("kcp: output deferred: ", err)
 		}
 		start = end
+	}
+}
+
+func (s *Session) flushPendingOutput() {
+	s.outMu.Lock()
+	if len(s.pendingOutput) == 0 {
+		s.outMu.Unlock()
+		return
+	}
+	batch := s.pendingOutput
+	s.pendingOutput = nil
+	s.outMu.Unlock()
+
+	for i, p := range batch {
+		if err := s.pipe.SendMessage(s.ctx, p.data, p.key); err != nil {
+			s.outMu.Lock()
+			s.pendingOutput = append(batch[i:], s.pendingOutput...)
+			s.outMu.Unlock()
+			return
+		}
 	}
 }
 
@@ -294,6 +325,7 @@ func (s *Session) updateLoop() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			s.flushPendingOutput()
 			s.kcpMu.Lock()
 			s.kcp.Update()
 			s.kcpMu.Unlock()
