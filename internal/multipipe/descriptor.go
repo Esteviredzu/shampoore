@@ -10,12 +10,14 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 	"github.com/Esteviredzu/shampoore-core/internal/multipipe/iods"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
 type subflowSpec struct {
-	Type      string          `json:"type"`
-	Transport json.RawMessage `json:"transport,omitempty"`
-	Advanced  app.Values      `json:"advanced,omitempty"`
+	Type        string          `json:"type"`
+	Transport   json.RawMessage `json:"transport,omitempty"`
+	Advanced    app.Values      `json:"advanced,omitempty"`
+	RateLimitKB int             `json:"rate_limit_kb,omitempty"`
 }
 
 type config struct {
@@ -224,6 +226,12 @@ func buildOne(
 	}
 	if res.Transport == nil {
 		return outcome{idx: i, err: fmt.Errorf("multipipe: transport %d (%s): build returned no transport", i, spec.Type)}
+	}
+
+	if spec.RateLimitKB > 0 {
+		logger.Info("multipipe: subflow ", i, " (", spec.Type,
+			") rate-limited to ", spec.RateLimitKB, " KB/s")
+		res.Transport = transport.NewRateLimited(res.Transport, spec.RateLimitKB)
 	}
 
 	return outcome{
