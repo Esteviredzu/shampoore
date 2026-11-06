@@ -26,6 +26,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/gorilla/schema v1.4.1 // indirect
+	github.com/jech/gclient v0.0.0-20260919114614-be5480d98517 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/dtls/v3 v3.1.10 // indirect

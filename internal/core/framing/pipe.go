@@ -42,10 +42,11 @@ func DefaultConfig() Config {
 }
 
 type Pipe struct {
-	ch  channel.MediaChannel
-	cfg Config
-	enc VideoEncoder
-	dec VideoDecoder
+	ch      channel.MediaChannel
+	cfg     Config
+	palette *Palette
+	enc     VideoEncoder
+	dec     VideoDecoder
 
 	cells        int
 	payloadBytes int
@@ -77,12 +78,12 @@ type Pipe struct {
 	stFull   atomic.Int64
 }
 
-func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
+func NewPipe(ch channel.MediaChannel, cfg Config, palette *Palette) (*Pipe, error) {
 	if ch == nil {
 		return nil, errors.New("framing: nil media channel")
 	}
-	if err := requirePalette("NewPipe"); err != nil {
-		return nil, err
+	if palette == nil {
+		return nil, errors.New("framing: nil palette")
 	}
 	if cfg.CellSize <= 0 {
 		cfg.CellSize = 16
@@ -99,7 +100,7 @@ func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
 		Cols:     cfg.Cols,
 		Rows:     cfg.Rows,
 	}
-	autoW, autoH, payloadBytes, maxData, maxMessage, err := grid.DeriveLayout()
+	autoW, autoH, payloadBytes, maxData, maxMessage, err := grid.DeriveLayout(palette)
 	if err != nil {
 		return nil, err
 	}
@@ -131,11 +132,12 @@ func NewPipe(ch channel.MediaChannel, cfg Config) (*Pipe, error) {
 	return &Pipe{
 		ch:           ch,
 		cfg:          cfg,
+		palette:      palette,
 		cells:        cfg.Cols * cfg.Rows,
 		payloadBytes: payloadBytes,
 		maxMessage:   maxMessage,
 		maxData:      maxData,
-		hdrCells:     HdrCells(),
+		hdrCells:     palette.HdrCells(),
 		frameDur:     time.Second / time.Duration(cfg.FPS),
 		sendCh:       make(chan []byte, sendQueueCap),
 		recvCh:       make(chan []byte, recvBufferSize),
@@ -146,8 +148,6 @@ func (p *Pipe) Start(ctx context.Context) error {
 	if p.started {
 		return nil
 	}
-
-	freezePalette()
 
 	enc, err := NewEncoder(p.cfg.Width, p.cfg.Height, p.cfg.FPS, p.cfg.Bitrate)
 	if err != nil {
@@ -173,7 +173,7 @@ func (p *Pipe) Start(ctx context.Context) error {
 	go p.recvLoop()
 	go p.sendLoop()
 	log.Printf("[framing] started: %dx%d cells, %d bit/cell (%d shades), payload=%dB/frame, max_msg=%d",
-		p.cfg.Cols, p.cfg.Rows, BitsPerCell, len(PaletteY),
+		p.cfg.Cols, p.cfg.Rows, p.palette.BitsPerCell, p.palette.Shades(),
 		p.payloadBytes, p.maxMessage)
 	return nil
 }
@@ -316,8 +316,8 @@ func (p *Pipe) sendIdle() error {
 	p.idleSeq++
 	seq := int(p.idleSeq)
 	payload := make([]byte, p.payloadBytes)
-	shades := len(PaletteY)
-	bits := BitsPerCell
+	shades := p.palette.Shades()
+	bits := p.palette.BitsPerCell
 	for r := 0; r < p.cfg.Rows; r++ {
 		for c := 0; c < p.cfg.Cols; c++ {
 			idx := r*p.cfg.Cols + c
@@ -334,7 +334,7 @@ func (p *Pipe) sendIdle() error {
 func (p *Pipe) emit(payload []byte, label string) error {
 	yuv := p.yuvBuf
 	EncodeFrameYUV(yuv, p.cfg.Width, p.cfg.Height, p.cfg.Cols, p.cfg.Rows,
-		p.cfg.CellSize, payload)
+		p.cfg.CellSize, payload, p.palette)
 	frame, err := p.enc.Encode(yuv)
 	if err != nil {
 		return fmt.Errorf("framing: encode: %w", err)
@@ -409,7 +409,7 @@ func (p *Pipe) recvLoop() {
 			continue
 		}
 		payload := DecodeFrameYUV(yuv, p.cfg.Width,
-			p.cfg.Cols, p.cfg.Rows, p.cfg.CellSize, p.payloadBytes)
+			p.cfg.Cols, p.cfg.Rows, p.cfg.CellSize, p.payloadBytes, p.palette)
 		if payload == nil {
 			continue
 		}

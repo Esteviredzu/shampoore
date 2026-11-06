@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
+	"github.com/Esteviredzu/shampoore-core/internal/core/channel"
 	"github.com/Esteviredzu/shampoore-core/internal/core/framing"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
@@ -29,7 +29,7 @@ const (
 )
 
 var fakePFrameHeader = []byte{
-	0x01, 0x00, 0x00, 0x9d, 0x01, 0x2a,
+	0x11, 0x00, 0x00, 0x9d, 0x01, 0x2a,
 	0x80, 0x02,
 	0xe0, 0x01,
 }
@@ -42,7 +42,7 @@ type Config struct {
 }
 
 type Pipe struct {
-	tunnel *vp8.Tunnel
+	ch     channel.MediaChannel
 	logger logging.ContextLogger
 	cfg    Config
 
@@ -72,7 +72,7 @@ type Pipe struct {
 	stKeyframes  atomic.Int64
 }
 
-func New(t *vp8.Tunnel, cfg Config, logger logging.ContextLogger) *Pipe {
+func New(ch channel.MediaChannel, cfg Config, logger logging.ContextLogger) *Pipe {
 	if cfg.FrameSize <= 0 {
 		cfg.FrameSize = 12_000
 	}
@@ -93,7 +93,7 @@ func New(t *vp8.Tunnel, cfg Config, logger logging.ContextLogger) *Pipe {
 		maxData = 64
 	}
 	return &Pipe{
-		tunnel:   t,
+		ch:       ch,
 		logger:   logger,
 		cfg:      cfg,
 		frameDur: time.Second / time.Duration(cfg.FPS),
@@ -253,7 +253,7 @@ func (p *Pipe) takeBatch() [][]byte {
 }
 
 func (p *Pipe) emitKeyframe() error {
-	if err := p.tunnel.WriteRawVP8(p.keyframe); err != nil {
+	if err := p.ch.WriteRawVP8(p.keyframe); err != nil {
 		return err
 	}
 	n := p.stFrames.Add(1)
@@ -272,7 +272,7 @@ func (p *Pipe) sendIdle() error {
 	copy(frame, fakePFrameHeader)
 	copy(frame[fakeVP8Hdr:], payload)
 
-	if err := p.tunnel.WriteRawVP8(frame); err != nil {
+	if err := p.ch.WriteRawVP8(frame); err != nil {
 		return err
 	}
 	n := p.stFrames.Add(1)
@@ -299,7 +299,7 @@ func (p *Pipe) emitPFrame(batch [][]byte) error {
 	copy(frame, fakePFrameHeader)
 	copy(frame[fakeVP8Hdr:], payload)
 
-	if err := p.tunnel.WriteRawVP8(frame); err != nil {
+	if err := p.ch.WriteRawVP8(frame); err != nil {
 		return err
 	}
 	n := p.stFrames.Add(1)
@@ -320,7 +320,7 @@ func (p *Pipe) recvLoop() {
 		default:
 		}
 
-		raw, err := p.tunnel.Receive(p.ctx)
+		raw, err := p.ch.Receive(p.ctx)
 		if err != nil {
 			if p.ctx.Err() == nil {
 				p.logger.Warn("raw: recv exit: ", err)

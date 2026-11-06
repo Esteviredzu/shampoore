@@ -59,9 +59,9 @@ func build(
 	logger logging.ContextLogger,
 	eff app.Values,
 ) (*app.BuildResult, error) {
-	bitsPerCell := eff.Int("squares_bits_per_cell", 4)
-	if err := framing.InitPalette(bitsPerCell); err != nil {
-		return nil, fmt.Errorf("yandex_telemost_squares: bits_per_cell: %w", err)
+	palette, err := framing.NewPalette(eff.Int("squares_bits_per_cell", 0))
+	if err != nil {
+		return nil, fmt.Errorf("yandex_telemost_squares: palette: %w", err)
 	}
 
 	cfg := telemost.DefaultConfig()
@@ -89,15 +89,15 @@ func build(
 		return nil, fmt.Errorf("yandex_telemost_squares: tunnel is nil")
 	}
 
-	cellSize := eff.Int("squares_cell_size", 16)
-	cols := eff.Int("squares_cols", 120)
-	rows := eff.Int("squares_rows", 80)
-	fps := eff.Int("squares_fps", 45)
-	bitrate := eff.String("squares_bitrate", "4000K")
-	copies := eff.Int("squares_copies", 1)
+	cellSize := eff.Int("squares_cell_size", 0)
+	cols := eff.Int("squares_cols", 0)
+	rows := eff.Int("squares_rows", 0)
+	fps := eff.Int("squares_fps", 0)
+	bitrate := eff.String("squares_bitrate", "")
+	copies := eff.Int("squares_copies", 0)
 
 	grid := framing.Grid{CellSize: cellSize, Cols: cols, Rows: rows}
-	w, h, _, _, _, err := grid.DeriveLayout()
+	w, h, _, _, _, err := grid.DeriveLayout(palette)
 	if err != nil {
 		_ = providerPipe.Stop(ctx)
 		return nil, err
@@ -113,7 +113,7 @@ func build(
 		Bitrate:  bitrate,
 		Copies:   copies,
 	}
-	sqPipe, err := framing.NewPipe(tunnel, sqCfg)
+	sqPipe, err := framing.NewPipe(tunnel, sqCfg, palette)
 	if err != nil {
 		_ = providerPipe.Stop(ctx)
 		return nil, err
@@ -168,7 +168,10 @@ func build(
 		return nil, err
 	}
 
-	logger.Info("yandex_telemost_squares: ready (mtu=", kcpCfg.MTU, " conv=", conv, ")")
+	logger.Info("yandex_telemost_squares: ready (mtu=", kcpCfg.MTU, " conv=", conv,
+		" frame=", w, "x", h,
+		" bits=", palette.BitsPerCell,
+		" fps=", fps, ")")
 
 	return &app.BuildResult{
 		Transport:    inner,

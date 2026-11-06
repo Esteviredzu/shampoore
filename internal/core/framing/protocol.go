@@ -7,22 +7,18 @@ const (
 	RecHdr = 2
 )
 
-func HdrCells() int {
-	return (HdrLen*8 + BitsPerCell - 1) / BitsPerCell
-}
-
 type Grid struct {
 	CellSize int
 	Cols     int
 	Rows     int
 }
 
-func (g Grid) DeriveLayout() (
+func (g Grid) DeriveLayout(p *Palette) (
 	width, height, payloadBytes, maxData, maxMessage int,
 	err error,
 ) {
-	if err := requirePalette("Grid.DeriveLayout"); err != nil {
-		return 0, 0, 0, 0, 0, err
+	if p == nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("framing: nil palette")
 	}
 	if g.CellSize < 4 || g.CellSize > 32 {
 		return 0, 0, 0, 0, 0, fmt.Errorf(
@@ -34,7 +30,7 @@ func (g Grid) DeriveLayout() (
 	}
 
 	cells := g.Cols * g.Rows
-	payloadBytes = (cells*BitsPerCell + 7) / 8
+	payloadBytes = (cells*p.BitsPerCell + 7) / 8
 
 	maxData = payloadBytes - HdrLen
 	maxMessage = maxData - RecHdr

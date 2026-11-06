@@ -38,11 +38,16 @@ func setNBits(payload []byte, bitPos, bits int, val byte) {
 	}
 }
 
-func EncodeFrameYUV(yuv []byte, width, height, cols, rows, cellSize int, payload []byte) {
+func EncodeFrameYUV(
+	yuv []byte,
+	width, height, cols, rows, cellSize int,
+	payload []byte,
+	p *Palette,
+) {
 	for i := 0; i < width*height; i++ {
-		yuv[i] = IdleBGY
+		yuv[i] = p.IdleBGY
 	}
-	bits := BitsPerCell
+	bits := p.BitsPerCell
 	for r := 0; r < rows; r++ {
 		for c := 0; c < cols; c++ {
 			idx := r*cols + c
@@ -50,23 +55,27 @@ func EncodeFrameYUV(yuv []byte, width, height, cols, rows, cellSize int, payload
 				break
 			}
 			val := getNBits(payload, idx*bits, bits)
-			fillYRect(yuv, width, c*cellSize, r*cellSize, cellSize, cellSize, PaletteY[val])
+			fillYRect(yuv, width, c*cellSize, r*cellSize, cellSize, cellSize, p.Y[val])
 		}
 	}
 }
 
-func DecodeFrameYUV(yuv []byte, width, cols, rows, cellSize, payloadBytes int) []byte {
+func DecodeFrameYUV(
+	yuv []byte,
+	width, cols, rows, cellSize, payloadBytes int,
+	p *Palette,
+) []byte {
 	if len(yuv) < width*rows*cellSize {
 		return nil
 	}
-	bits := BitsPerCell
+	bits := p.BitsPerCell
 	payload := make([]byte, payloadBytes)
 	for r := 0; r < rows; r++ {
 		for c := 0; c < cols; c++ {
 			cx := c*cellSize + cellSize/2
 			cy := r*cellSize + cellSize/2
 			l := yuv[cy*width+cx]
-			idx := lumaToPalette[l]
+			idx := p.lumaToPalette[l]
 			cellIdx := r*cols + c
 			setNBits(payload, cellIdx*bits, bits, idx)
 		}
