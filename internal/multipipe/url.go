@@ -12,16 +12,6 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 )
 
-// decodeURL читает плоские query-параметры формата:
-//
-//	type=multi
-//	&t0.type=<kind>
-//	&t0.rl=<int>                  // rate_limit_kb, опционально
-//	&t0.a.<key>=<value>           // advanced-поле subflow
-//	&t0.<key>=<value>             // поле transport (уходит в DecodeURL транспорта)
-//	&t1.type=<kind>
-//	&t1.<key>=<value>
-//	...
 func decodeURL(q url.Values) (json.RawMessage, error) {
 	indices := collectIndices(q)
 	if len(indices) == 0 {
@@ -124,7 +114,6 @@ func parseSubflow(q url.Values) (subflowSpec, error) {
 	return spec, nil
 }
 
-// encodeURL пишет плоские параметры t<N>.* в q. Base64 больше не используется.
 func encodeURL(raw json.RawMessage, q url.Values) error {
 	if len(raw) == 0 {
 		return errors.New("multipipe: empty transport")

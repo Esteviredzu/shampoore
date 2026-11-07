@@ -8,13 +8,13 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/core/security"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
 	lk "github.com/Esteviredzu/shampoore-core/internal/provider/livekit"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
 var defaults = app.Values{
 	"mux_flush_ms":        5,
-	"mux_flush_threshold": 12000, // ≤ maxPacketSize
+	"mux_flush_threshold": 12000,
 }
 
 func init() {

@@ -6,14 +6,6 @@ import (
 	"net/url"
 )
 
-// DecodeURL читает плоские параметры:
-//
-//	signal=wss://...   (обязательно)
-//	key=...            (обязательно)
-//	secret=...         (обязательно)
-//	room=...           (обязательно)
-//	topic=...          (опционально, default "shampoore")
-//	identity=...       (опционально)
 func DecodeURL(q url.Values) (json.RawMessage, error) {
 	signal := q.Get("signal")
 	if signal == "" {
