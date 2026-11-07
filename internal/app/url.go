@@ -102,7 +102,7 @@ func EncodeURL(s *Settings) (string, error) {
 		if k == "" || v == nil {
 			continue
 		}
-		q.Set(advancedPrefix+k, encodeValue(v))
+		q.Set(advancedPrefix+k, EncodeValue(v))
 	}
 
 	out := URLScheme + "://?" + q.Encode()
@@ -112,7 +112,7 @@ func EncodeURL(s *Settings) (string, error) {
 	return out, nil
 }
 
-func encodeValue(v any) string {
+func EncodeValue(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
@@ -129,7 +129,7 @@ func encodeValue(v any) string {
 	case []any:
 		parts := make([]string, 0, len(x))
 		for _, item := range x {
-			parts = append(parts, encodeValue(item))
+			parts = append(parts, EncodeValue(item))
 		}
 		return strings.Join(parts, ",")
 	default:

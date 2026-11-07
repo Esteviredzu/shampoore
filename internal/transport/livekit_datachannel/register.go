@@ -3,15 +3,18 @@ package livekit_datachannel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
+	"github.com/Esteviredzu/shampoore-core/internal/core/security"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 	lk "github.com/Esteviredzu/shampoore-core/internal/provider/livekit"
 )
 
 var defaults = app.Values{
 	"mux_flush_ms":        5,
-	"mux_flush_threshold": 12000,
+	"mux_flush_threshold": 12000, // ≤ maxPacketSize
 }
 
 func init() {
@@ -19,6 +22,8 @@ func init() {
 		Kind:        "livekit_datachannel",
 		DisplayName: "LiveKit (Reliable DataChannel)",
 		Defaults:    defaults,
+		DecodeURL:   lk.DecodeURL,
+		EncodeURL:   lk.EncodeURL,
 		Build:       build,
 	})
 	if err != nil {
@@ -52,7 +57,18 @@ func build(
 		return nil, err
 	}
 
-	t := newDirectTransport(provider.Pipe())
+	var pipe transport.Pipe = provider.Pipe()
+	if s.EncryptionPassword != "" {
+		wrapped, err := security.WrapPipe(pipe, s.EncryptionPassword, logger)
+		if err != nil {
+			_ = provider.Stop(ctx)
+			return nil, fmt.Errorf("livekit_datachannel: wrap encryption: %w", err)
+		}
+		pipe = wrapped
+		logger.Info("livekit_datachannel: XChaCha20-Poly1305 encryption enabled")
+	}
+
+	t := newDirectTransport(pipe)
 
 	logger.Info("livekit_datachannel: ready (max_msg=", t.MaxMessageSize(),
 		" flush_ms=", eff.Int("mux_flush_ms", 5),
