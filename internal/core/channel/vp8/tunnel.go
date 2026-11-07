@@ -290,7 +290,6 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 		haveLastSeq = true
 
 		if haveTimestamp && pkt.Timestamp != lastTimestamp && frameStarted {
-
 			frame = frameBuf[:0]
 			frameStarted = false
 			frameHasGap = false
@@ -345,6 +344,11 @@ func (t *Tunnel) readLoop(remote *webrtc.TrackRemote) {
 
 		if frameHasGap {
 			gapFrames++
+			if gapFrames <= 5 || gapFrames%100 == 0 {
+				log.Printf("[vp8] DROP gapped frame #%d size=%d (total gaps=%d)",
+					totalFrames+1, len(frame), gapFrames)
+			}
+			continue
 		}
 
 		totalFrames++

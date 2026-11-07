@@ -16,8 +16,7 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
 
 	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/galene_raw"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/galene_squares"
+	_ "github.com/Esteviredzu/shampoore-core/internal/transport/livekit_datachannel"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"

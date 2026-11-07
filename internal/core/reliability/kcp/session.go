@@ -121,6 +121,7 @@ func NewSession(
 		logger.Info("kcp: MTU clamped ", cfg.MTU, " -> ", mtuCeiling)
 		cfg.MTU = mtuCeiling
 	}
+
 	const maxKCPMTU = 1200
 	if cfg.MTU > maxKCPMTU {
 		cfg.MTU = maxKCPMTU
@@ -207,7 +208,6 @@ func (s *Session) output(buf []byte, size int) {
 
 		key := uuid.NewString()
 		if err := s.pipe.SendMessage(s.ctx, data, key); err != nil {
-
 			s.outMu.Lock()
 			s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
 			s.outMu.Unlock()
