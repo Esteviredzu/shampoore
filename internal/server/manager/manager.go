@@ -18,6 +18,7 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/server/logbuf"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
 type Manager struct {
@@ -54,6 +55,10 @@ type ManagedEntry struct {
 	mux     multiplexing.StreamMultiplexer
 	handler *socks5.RemoteHandler
 	cancel  context.CancelFunc
+
+	statsMu    sync.Mutex
+	statsAgg   *transport.StatsAggregator
+	cachedStat EntryStats
 }
 
 func New(dir string, logger *logging.Logger) *Manager {
@@ -73,6 +78,7 @@ func (m *Manager) HasDir() bool { return m.dir != "" }
 
 func (m *Manager) Load(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
+	go m.statsLoop()
 	if m.dir == "" {
 		return nil
 	}
@@ -102,6 +108,7 @@ func (m *Manager) Load(ctx context.Context) error {
 
 func (m *Manager) LoadFiles(ctx context.Context, files []string) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
+	go m.statsLoop()
 	if m.dir != "" {
 		if err := os.MkdirAll(m.dir, 0o755); err != nil {
 			return err
@@ -269,6 +276,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	me.mux = mux
 	me.handler = handler
 	me.cancel = cancel
+	me.statsAgg = transport.NewStatsAggregator()
 	me.mu.Unlock()
 	return nil
 }
@@ -284,9 +292,14 @@ func (m *Manager) stopEntry(me *ManagedEntry) {
 	me.handler = nil
 	me.mux = nil
 	me.rt = nil
+	me.statsAgg = nil
 	me.status = StatusStopped
 	me.startedAt = time.Time{}
 	me.mu.Unlock()
+
+	me.statsMu.Lock()
+	me.cachedStat = EntryStats{Name: me.Name, Status: StatusStopped}
+	me.statsMu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -359,6 +372,142 @@ func (e *ManagedEntry) view(st *State, startAll bool) EntryView {
 		Settings: settings, Status: status, Error: errStr,
 		StartedAt: startedPtr, UpdatedAt: updated, FilePath: e.FilePath,
 	}
+}
+
+func (m *Manager) Stats() []EntryStats {
+	m.mu.Lock()
+	list := make([]*ManagedEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		list = append(list, e)
+	}
+	m.mu.Unlock()
+
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	out := make([]EntryStats, len(list))
+	for i, e := range list {
+		out[i] = e.Stats()
+	}
+	return out
+}
+
+func (me *ManagedEntry) Stats() EntryStats {
+	me.statsMu.Lock()
+	cached := me.cachedStat
+	me.statsMu.Unlock()
+	if cached.Name == "" {
+		return me.refreshStats()
+	}
+	return cached
+}
+
+func (me *ManagedEntry) refreshStats() EntryStats {
+	me.mu.Lock()
+	mux := me.mux
+	agg := me.statsAgg
+	status := me.status
+	me.mu.Unlock()
+
+	if mux == nil || agg == nil {
+		out := EntryStats{Name: me.Name, Status: status}
+		me.statsMu.Lock()
+		me.cachedStat = out
+		me.statsMu.Unlock()
+		return out
+	}
+
+	tel, ok := mux.(transport.Telemetry)
+	if !ok {
+		out := EntryStats{Name: me.Name, Status: status}
+		me.statsMu.Lock()
+		me.cachedStat = out
+		me.statsMu.Unlock()
+		return out
+	}
+
+	stats := agg.Update(tel.WalkLayers())
+	out := EntryStats{
+		Name:     me.Name,
+		Status:   status,
+		Overall:  stats.Overall,
+		Rates:    stats.Rates,
+		Subflows: stats.Subflows,
+	}
+	me.statsMu.Lock()
+	me.cachedStat = out
+	me.statsMu.Unlock()
+	return out
+}
+
+func (m *Manager) statsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.logStats()
+		}
+	}
+}
+
+func (m *Manager) logStats() {
+	m.mu.Lock()
+	list := make([]*ManagedEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		list = append(list, e)
+	}
+	m.mu.Unlock()
+
+	for _, e := range list {
+		st := e.refreshStats()
+		if st.Status != StatusRunning {
+			continue
+		}
+		m.logger.Info("[stats] ", st.Name,
+			" app_tx=", formatRate(st.Rates.UsefulSentBPS),
+			" app_rx=", formatRate(st.Rates.UsefulRecvBPS),
+			" wire_tx=", formatRate(st.Rates.WireSentBPS),
+			" wire_rx=", formatRate(st.Rates.WireRecvBPS),
+			" eff=", formatPct(st.Rates.Efficiency))
+		for _, sf := range st.Subflows {
+			m.logger.Info("[stats]   ", sf.Name,
+				" share=", formatPct(sf.Share),
+				" wire_tx=", formatRate(sf.Rates.WireSentBPS),
+				" useful_tx=", formatRate(sf.Rates.UsefulSentBPS),
+				" eff=", formatPct(sf.Efficiency))
+		}
+	}
+}
+
+func formatRate(bps float64) string {
+	if bps < 0 {
+		bps = 0
+	}
+	return formatSize(int64(bps)) + "/s"
+}
+
+func formatSize(n int64) string {
+	if n <= 0 {
+		return "0B"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatPct(f float64) string {
+	if f < 0 {
+		f = 0
+	}
+	return fmt.Sprintf("%.1f%%", f*100)
 }
 
 func (m *Manager) Add(name, template, content string) error {

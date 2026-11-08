@@ -2,6 +2,57 @@
 
 package framing
 
+/*
+#cgo LDFLAGS: -lmediandk
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+
+static media_status_t shampoore_configure_encode(AMediaCodec *codec, AMediaFormat *format) {
+    return AMediaCodec_configure(codec, format, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+}
+
+static media_status_t shampoore_configure_decode(AMediaCodec *codec, AMediaFormat *format) {
+    return AMediaCodec_configure(codec, format, NULL, NULL, 0);
+}
+
+static void shampoore_fmt_set_string(AMediaFormat *fmt, const char *key, const char *val) {
+    AMediaFormat_setString(fmt, key, val);
+}
+
+static void shampoore_fmt_set_int32(AMediaFormat *fmt, const char *key, int32_t val) {
+    AMediaFormat_setInt32(fmt, key, val);
+}
+
+typedef struct {
+    int32_t width;
+    int32_t height;
+    int32_t stride;
+    int32_t slice_height;
+    int32_t color_format;
+} shampoore_format_info;
+
+static shampoore_format_info shampoore_read_fmt(AMediaCodec *codec) {
+    shampoore_format_info info = {0};
+    AMediaFormat *fmt = AMediaCodec_getOutputFormat(codec);
+    if (fmt) {
+        AMediaFormat_getInt32(fmt, "width", &info.width);
+        AMediaFormat_getInt32(fmt, "height", &info.height);
+        AMediaFormat_getInt32(fmt, "stride", &info.stride);
+        AMediaFormat_getInt32(fmt, "slice-height", &info.slice_height);
+        AMediaFormat_getInt32(fmt, "color-format", &info.color_format);
+        AMediaFormat_delete(fmt);
+    }
+    return info;
+}
+
+static void shampoore_release_output(AMediaCodec *codec, size_t idx) {
+    AMediaCodec_releaseOutputBuffer(codec, idx, false);
+}
+*/
 import "C"
 
 import (
@@ -28,6 +79,13 @@ const (
 	amcInfoOutputFormatChanged  = -2
 	amcInfoOutputBuffersChanged = -3
 	amcBufferFlagCodecConfig    = 2
+
+	// Android MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_*
+	//   CQ = 0, VBR = 1, CBR = 2
+	// CBR forces constant bitrate even for static frames, which produces
+	// ~10 KB idle P-frames per tick and floods the tunnel. VBR lets the
+	// encoder produce tiny frames for unchanged content.
+	bitrateModeVBR = 1
 )
 
 var (
@@ -132,7 +190,7 @@ func NewEncoder(width, height, fps int, bitrate string) (VideoEncoder, error) {
 	C.shampoore_fmt_set_int32(format, cKeyWidth, C.int32_t(width))
 	C.shampoore_fmt_set_int32(format, cKeyHeight, C.int32_t(height))
 	C.shampoore_fmt_set_int32(format, cKeyBitRate, C.int32_t(br))
-	C.shampoore_fmt_set_int32(format, cKeyBitrateMode, C.int32_t(2))
+	C.shampoore_fmt_set_int32(format, cKeyBitrateMode, C.int32_t(bitrateModeVBR))
 	C.shampoore_fmt_set_int32(format, cKeyFrameRate, C.int32_t(fps))
 	C.shampoore_fmt_set_int32(format, cKeyIFrameInterval, C.int32_t(30))
 	C.shampoore_fmt_set_int32(format, cKeyColorFormat, C.int32_t(colorFormatFlexible))

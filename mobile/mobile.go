@@ -2,15 +2,18 @@ package mobile
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/runtime"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 
 	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
 	_ "github.com/Esteviredzu/shampoore-core/internal/transport/livekit_datachannel"
@@ -23,6 +26,12 @@ var (
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{}
+)
+
+var (
+	statsMu    sync.Mutex
+	currentMux multiplexing.StreamMultiplexer
+	statsAgg   *transport.StatsAggregator
 )
 
 func StartClient(source string) string {
@@ -117,6 +126,11 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		return fmt.Errorf("mobile: unknown run mode %d", mode)
 	}
 
+	statsMu.Lock()
+	currentMux = mux
+	statsAgg = transport.NewStatsAggregator()
+	statsMu.Unlock()
+
 	cancel = cancelFn
 	doneCh := make(chan struct{})
 	done = doneCh
@@ -146,6 +160,11 @@ func StopClient() {
 	cancel = nil
 	done = nil
 
+	statsMu.Lock()
+	currentMux = nil
+	statsAgg = nil
+	statsMu.Unlock()
+
 	if cancelFn == nil {
 		return
 	}
@@ -162,4 +181,43 @@ func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return cancel != nil
+}
+
+type StatsResult struct {
+	Running  bool                     `json:"running"`
+	Overall  transport.Snapshot       `json:"overall"`
+	Rates    transport.Rates          `json:"rates"`
+	Subflows []transport.SubflowStats `json:"subflows,omitempty"`
+}
+
+func GetStats() string {
+	statsMu.Lock()
+	mux := currentMux
+	agg := statsAgg
+	statsMu.Unlock()
+
+	if mux == nil || agg == nil {
+		data, _ := json.Marshal(StatsResult{Running: false})
+		return string(data)
+	}
+
+	tel, ok := mux.(transport.Telemetry)
+	if !ok {
+		data, _ := json.Marshal(StatsResult{Running: true})
+		return string(data)
+	}
+
+	stats := agg.Update(tel.WalkLayers())
+	out := StatsResult{
+		Running:  true,
+		Overall:  stats.Overall,
+		Rates:    stats.Rates,
+		Subflows: stats.Subflows,
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		empty, _ := json.Marshal(StatsResult{Running: true})
+		return string(empty)
+	}
+	return string(data)
 }

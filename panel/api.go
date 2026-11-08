@@ -50,6 +50,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/server/stop", a.serverStop)
 	mux.HandleFunc("GET /api/server/logs", a.serverLogs)
 
+	mux.HandleFunc("GET /api/stats", a.stats)
+	mux.HandleFunc("GET /api/stats/stream", a.statsStream)
+
 	mux.HandleFunc("GET /api/templates", a.templates)
 	mux.HandleFunc("GET /api/configs", a.list)
 	mux.HandleFunc("POST /api/configs", a.add)
@@ -183,6 +186,81 @@ func (a *API) serverLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	lines := a.sup.Logs(limit)
 	writeJSON(w, 200, map[string]any{"lines": lines})
+}
+
+func (a *API) stats(w http.ResponseWriter, _ *http.Request) {
+	if !a.sup.IsRunning() {
+		writeJSON(w, 200, map[string]any{
+			"running": false,
+			"entries": []any{},
+			"ts":      time.Now().UnixMilli(),
+		})
+		return
+	}
+	entries, err := a.client.Stats()
+	if err != nil {
+		writeControlErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"running": true,
+		"entries": entries,
+		"ts":      time.Now().UnixMilli(),
+	})
+}
+
+func (a *API) statsStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "sse unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	ctx := r.Context()
+
+	send := func() {
+		var payload any
+		if a.sup.IsRunning() {
+			entries, err := a.client.Stats()
+			if err == nil {
+				payload = map[string]any{
+					"running": true,
+					"entries": entries,
+					"ts":      time.Now().UnixMilli(),
+				}
+			} else {
+				payload = map[string]any{
+					"running": false,
+					"error":   err.Error(),
+					"ts":      time.Now().UnixMilli(),
+				}
+			}
+		} else {
+			payload = map[string]any{
+				"running": false,
+				"entries": []any{},
+				"ts":      time.Now().UnixMilli(),
+			}
+		}
+		data, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	send()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
 }
 
 func (a *API) templates(w http.ResponseWriter, _ *http.Request) {

@@ -18,6 +18,7 @@ const (
 )
 
 type Pipe struct {
+	localMu  sync.RWMutex
 	local    *lksdk.LocalParticipant
 	topic    string
 	remoteID atomic.Pointer[string]
@@ -32,6 +33,8 @@ type Pipe struct {
 
 	bytesSent atomic.Int64
 	bytesRecv atomic.Int64
+
+	ctr transport.Counters
 }
 
 func newPipe(
@@ -49,6 +52,12 @@ func newPipe(
 		p.SetRemoteID(remoteID)
 	}
 	return p
+}
+
+func (p *Pipe) UpdateLocal(l *lksdk.LocalParticipant) {
+	p.localMu.Lock()
+	p.local = l
+	p.localMu.Unlock()
 }
 
 func (p *Pipe) SetRemoteID(id string) { p.remoteID.Store(&id) }
@@ -75,7 +84,17 @@ func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 		return
 	}
 	select {
+	case <-p.closed:
+		return
+	default:
+	}
+	select {
 	case p.recvCh <- data:
+		n := int64(len(data))
+		p.ctr.UsefulRecv.Add(n)
+		p.ctr.NetworkRecv.Add(n)
+		p.ctr.MessagesRecv.Add(1)
+		p.ctr.FramesRecv.Add(1)
 	case <-p.closed:
 	}
 }
@@ -92,6 +111,13 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 	default:
 	}
 
+	p.localMu.RLock()
+	local := p.local
+	p.localMu.RUnlock()
+	if local == nil {
+		return errors.New("livekit: not connected")
+	}
+
 	opts := []lksdk.DataPublishOption{
 		lksdk.WithDataPublishReliable(true),
 		lksdk.WithDataPublishTopic(p.topic),
@@ -100,10 +126,15 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 		opts = append(opts, lksdk.WithDataPublishDestination([]string{rid}))
 	}
 
-	if err := p.local.PublishDataPacket(lksdk.UserData(data), opts...); err != nil {
+	if err := local.PublishDataPacket(lksdk.UserData(data), opts...); err != nil {
 		return err
 	}
-	p.bytesSent.Add(int64(len(data)))
+	n := int64(len(data))
+	p.bytesSent.Add(n)
+	p.ctr.UsefulSent.Add(n)
+	p.ctr.NetworkSent.Add(n)
+	p.ctr.MessagesSent.Add(1)
+	p.ctr.FramesSent.Add(1)
 	return nil
 }
 
@@ -113,10 +144,7 @@ func (p *Pipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 		return nil, ctx.Err()
 	case <-p.closed:
 		return nil, io.EOF
-	case data, ok := <-p.recvCh:
-		if !ok {
-			return nil, io.EOF
-		}
+	case data := <-p.recvCh:
 		p.bytesRecv.Add(int64(len(data)))
 		return data, nil
 	}
@@ -128,15 +156,19 @@ func (p *Pipe) MaxMessageSize() int                         { return maxPacketSi
 func (p *Pipe) BytesSent() int64                            { return p.bytesSent.Load() }
 func (p *Pipe) BytesRecv() int64                            { return p.bytesRecv.Load() }
 
+func (p *Pipe) WalkLayers() []transport.Layer {
+	return []transport.Layer{{Kind: "pipe", Type: "livekit", Snapshot: p.ctr.Snapshot()}}
+}
+
 func (p *Pipe) Stop(_ context.Context) error {
 	p.closeOnce.Do(func() {
 		if p.cancel != nil {
 			p.cancel()
 		}
 		close(p.closed)
-		close(p.recvCh)
 	})
 	return nil
 }
 
 var _ transport.Pipe = (*Pipe)(nil)
+var _ transport.Telemetry = (*Pipe)(nil)

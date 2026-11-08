@@ -13,6 +13,7 @@ type SecurePipe struct {
 	key          []byte
 	logger       logging.ContextLogger
 	maxPlaintext int
+	ctr          transport.Counters
 }
 
 func NewSecurePipe(inner transport.Pipe, password string, log logging.ContextLogger) (*SecurePipe, error) {
@@ -45,7 +46,14 @@ func (p *SecurePipe) SendMessage(ctx context.Context, data []byte, key string) e
 	if err != nil {
 		return err
 	}
-	return p.inner.SendMessage(ctx, blob, key)
+	if err := p.inner.SendMessage(ctx, blob, key); err != nil {
+		return err
+	}
+	p.ctr.UsefulSent.Add(int64(len(data)))
+	p.ctr.NetworkSent.Add(int64(len(blob)))
+	p.ctr.MessagesSent.Add(1)
+	p.ctr.FramesSent.Add(1)
+	return nil
 }
 
 func (p *SecurePipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
@@ -59,6 +67,10 @@ func (p *SecurePipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 			p.logger.Warn("secure-pipe: dropping undecryptable message: ", err)
 			continue
 		}
+		p.ctr.UsefulRecv.Add(int64(len(plain)))
+		p.ctr.NetworkRecv.Add(int64(len(blob)))
+		p.ctr.MessagesRecv.Add(1)
+		p.ctr.FramesRecv.Add(1)
 		return plain, nil
 	}
 }
@@ -66,3 +78,16 @@ func (p *SecurePipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 func (p *SecurePipe) DeleteMessage(ctx context.Context, key string) error {
 	return p.inner.DeleteMessage(ctx, key)
 }
+
+func (p *SecurePipe) WalkLayers() []transport.Layer {
+	out := []transport.Layer{{
+		Kind: "security", Type: "xchacha",
+		Snapshot: p.ctr.Snapshot(),
+	}}
+	if tw, ok := p.inner.(transport.Telemetry); ok {
+		out = append(out, tw.WalkLayers()...)
+	}
+	return out
+}
+
+var _ transport.Telemetry = (*SecurePipe)(nil)

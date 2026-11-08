@@ -17,13 +17,22 @@ import (
 
 type Provider struct {
 	cfg    Config
-	room   *lksdk.Room
-	pipe   *Pipe
 	logger logging.ContextLogger
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	pipeMu sync.Mutex
+	pipe   *Pipe
+
+	roomMu   sync.Mutex
+	room     *lksdk.Room
+	closing  bool
+	identity string
+
+	disconnected chan struct{}
+
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func NewProvider(
@@ -40,17 +49,30 @@ func NewProvider(
 		identity = uuid.NewString()
 	}
 
-	token, err := makeToken(cfg.APIKey, cfg.APISecret, cfg.Room, identity)
-	if err != nil {
-		return nil, fmt.Errorf("livekit: make token: %w", err)
-	}
-
 	p := &Provider{
-		cfg:    cfg,
-		logger: logger,
+		cfg:          cfg,
+		logger:       logger,
+		identity:     identity,
+		disconnected: make(chan struct{}, 1),
+	}
+	p.ctx, p.cancel = context.WithCancel(ctx)
+
+	if err := p.connect(); err != nil {
+		p.cancel()
+		return nil, err
 	}
 
-	participantCh := make(chan string, 1)
+	p.wg.Add(1)
+	go p.supervise()
+
+	return p, nil
+}
+
+func (p *Provider) connect() error {
+	token, err := makeToken(p.cfg.APIKey, p.cfg.APISecret, p.cfg.Room, p.identity)
+	if err != nil {
+		return fmt.Errorf("livekit: make token: %w", err)
+	}
 
 	cb := &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
@@ -63,84 +85,165 @@ func NewProvider(
 				}
 				switch pkt := data.(type) {
 				case *lksdk.UserDataPacket:
-					if pkt.Topic == cfg.DataTopic {
+					if pkt.Topic == p.cfg.DataTopic {
 						pipe.PushIncoming(pkt.Payload, params.SenderIdentity)
 					}
 				}
 			},
 		},
 		OnParticipantConnected: func(rp *lksdk.RemoteParticipant) {
+			p.logger.Info("livekit: remote participant joined: ", rp.Identity())
 			p.pipeMu.Lock()
 			pipe := p.pipe
 			p.pipeMu.Unlock()
 			if pipe != nil {
-
 				pipe.SetRemoteID(rp.Identity())
 			}
+		},
+		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
+			p.logger.Warn("livekit: remote participant left: ", rp.Identity())
+			p.pipeMu.Lock()
+			pipe := p.pipe
+			p.pipeMu.Unlock()
+			if pipe != nil && pipe.GetRemoteID() == rp.Identity() {
+				pipe.SetRemoteID("")
+			}
+		},
+		OnDisconnected: func() {
+			p.roomMu.Lock()
+			closing := p.closing
+			p.roomMu.Unlock()
+			if closing {
+				return
+			}
+			p.logger.Warn("livekit: room disconnected unexpectedly")
 			select {
-			case participantCh <- rp.Identity():
+			case p.disconnected <- struct{}{}:
 			default:
 			}
 		},
 	}
 
-	room, err := lksdk.ConnectToRoomWithToken(cfg.SignalURL, token, cb)
+	room, err := lksdk.ConnectToRoomWithToken(p.cfg.SignalURL, token, cb)
 	if err != nil {
-		return nil, fmt.Errorf("livekit: connect: %w", err)
+		return fmt.Errorf("livekit: connect: %w", err)
 	}
 
+	p.roomMu.Lock()
 	p.room = room
-	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.closing = false
+	p.roomMu.Unlock()
 
 	p.pipeMu.Lock()
-	p.pipe = newPipe(room.LocalParticipant, cfg.DataTopic, "")
+	if p.pipe == nil {
+		p.pipe = newPipe(room.LocalParticipant, p.cfg.DataTopic, "")
+	} else {
+		p.pipe.UpdateLocal(room.LocalParticipant)
+	}
+	pipe := p.pipe
 	p.pipeMu.Unlock()
 
-	already := room.GetRemoteParticipants()
-	if len(already) > 0 {
-		p.pipe.SetRemoteID(already[0].Identity())
-	} else {
-		timeout := 15 * time.Second
-		select {
-		case id := <-participantCh:
-			p.pipe.SetRemoteID(id)
-		case <-ctx.Done():
-			room.Disconnect()
-			p.cancel()
-			return nil, ctx.Err()
-		case <-time.After(timeout):
-			room.Disconnect()
-			p.cancel()
-			return nil, fmt.Errorf("livekit: timeout waiting for remote participant")
-		}
+	if rps := room.GetRemoteParticipants(); len(rps) > 0 {
+		pipe.SetRemoteID(rps[0].Identity())
 	}
 
-	logger.Info("livekit: room=", cfg.Room,
-		" identity=", identity,
-		" remote=", p.pipe.GetRemoteID(),
-		" topic=", cfg.DataTopic)
+	p.logger.Info("livekit: room=", p.cfg.Room,
+		" identity=", p.identity,
+		" remote=", pipe.GetRemoteID(),
+		" topic=", p.cfg.DataTopic)
 
-	return p, nil
+	return nil
+}
+
+func (p *Provider) supervise() {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-p.disconnected:
+		}
+
+		if p.ctx.Err() != nil {
+			return
+		}
+
+		p.logger.Info("livekit: reconnecting...")
+
+		p.roomMu.Lock()
+		p.closing = true
+		oldRoom := p.room
+		p.room = nil
+		p.roomMu.Unlock()
+		if oldRoom != nil {
+			oldRoom.Disconnect()
+		}
+
+		delay := time.Second
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+
+			if p.ctx.Err() != nil {
+				return
+			}
+
+			if err := p.connect(); err != nil {
+				p.logger.Warn("livekit: reconnect failed: ", err)
+				delay *= 2
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
+				continue
+			}
+			p.logger.Info("livekit: reconnected")
+			break
+		}
+	}
 }
 
 func makeToken(apiKey, apiSecret, room, identity string) (string, error) {
 	at := auth.NewAccessToken(apiKey, apiSecret)
 	grant := &auth.VideoGrant{RoomJoin: true, Room: room}
-	at.SetVideoGrant(grant).SetIdentity(identity).SetValidFor(time.Hour)
+	at.SetVideoGrant(grant).SetIdentity(identity).SetValidFor(24 * time.Hour)
 	return at.ToJWT()
 }
 
-func (p *Provider) Pipe() *Pipe { return p.pipe }
+func (p *Provider) Pipe() *Pipe {
+	p.pipeMu.Lock()
+	defer p.pipeMu.Unlock()
+	return p.pipe
+}
 
 func (p *Provider) Start(context.Context) error { return nil }
 
-func (p *Provider) Stop(context.Context) error {
-	if p.cancel != nil {
-		p.cancel()
-	}
-	if p.room != nil {
-		p.room.Disconnect()
-	}
+func (p *Provider) Stop(ctx context.Context) error {
+	p.stopOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+
+		p.pipeMu.Lock()
+		pipe := p.pipe
+		p.pipeMu.Unlock()
+		if pipe != nil {
+			_ = pipe.Stop(ctx)
+		}
+
+		p.roomMu.Lock()
+		p.closing = true
+		room := p.room
+		p.room = nil
+		p.roomMu.Unlock()
+		if room != nil {
+			room.Disconnect()
+		}
+
+		p.wg.Wait()
+	})
 	return nil
 }
 

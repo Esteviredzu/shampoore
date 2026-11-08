@@ -100,6 +100,8 @@ func (s *Server) dispatch(req Request) Response {
 		return ok(map[string]any{"has_dir": s.mgr.HasDir()})
 	case "list":
 		return ok(s.mgr.List())
+	case "stats":
+		return ok(s.mgr.Stats())
 	case "get":
 		v, found := s.mgr.Get(req.Name)
 		if !found {

@@ -94,6 +94,8 @@ type ReliableSession struct {
 	bytesDelivered atomic.Int64
 	bytesAcked     atomic.Int64
 
+	ctr transport.Counters
+
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started bool
@@ -172,6 +174,17 @@ func (s *ReliableSession) BytesDelivered() int64 {
 
 func (s *ReliableSession) BytesAcked() int64 {
 	return s.bytesAcked.Load()
+}
+
+func (s *ReliableSession) WalkLayers() []transport.Layer {
+	out := []transport.Layer{{
+		Kind: "transport", Type: "reliable",
+		Snapshot: s.ctr.Snapshot(),
+	}}
+	if tw, ok := s.pipe.(transport.Telemetry); ok {
+		out = append(out, tw.WalkLayers()...)
+	}
+	return out
 }
 
 func (s *ReliableSession) Start(ctx context.Context) error {
@@ -279,6 +292,9 @@ func (s *ReliableSession) Send(ctx context.Context, data []byte) error {
 		retryDelay: initialRetryDelay,
 	}
 	s.sendMu.Unlock()
+
+	s.ctr.UsefulSent.Add(int64(len(data)))
+
 	select {
 	case s.wakeRetry <- struct{}{}:
 	default:
@@ -317,6 +333,7 @@ func (s *ReliableSession) Receive(ctx context.Context) ([]byte, error) {
 				}
 			}
 			s.bytesDelivered.Add(int64(len(v.data)))
+			s.ctr.UsefulRecv.Add(int64(len(v.data)))
 			return v.data, nil
 		default:
 			return nil, fmt.Errorf("unexpected queue item type %T", item)
@@ -442,6 +459,7 @@ func (s *ReliableSession) transmitPacket(p *pendingPacket) error {
 		if err := s.pipe.SendMessage(s.ctx, chunk, key); err != nil {
 			return err
 		}
+		s.ctr.NetworkSent.Add(int64(len(chunk)))
 	}
 	s.sendMu.Lock()
 	p.attempts++
@@ -481,6 +499,8 @@ func (s *ReliableSession) receiveLoop() {
 			s.signalTransportReset("receive loop error: " + err.Error())
 			return
 		}
+
+		s.ctr.NetworkRecv.Add(int64(len(raw)))
 
 		pkt := s.codec.Decode(raw)
 		if pkt == nil {
@@ -717,3 +737,4 @@ push:
 }
 
 var _ transport.Transport = (*ReliableSession)(nil)
+var _ transport.Telemetry = (*ReliableSession)(nil)

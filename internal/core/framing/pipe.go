@@ -76,6 +76,8 @@ type Pipe struct {
 	stBytes  atomic.Int64
 	stMsgs   atomic.Int64
 	stFull   atomic.Int64
+
+	ctr transport.Counters
 }
 
 func NewPipe(ch channel.MediaChannel, cfg Config, palette *Palette) (*Pipe, error) {
@@ -140,9 +142,11 @@ func NewPipe(ch channel.MediaChannel, cfg Config, palette *Palette) (*Pipe, erro
 		hdrCells:     palette.HdrCells(),
 		frameDur:     time.Second / time.Duration(cfg.FPS),
 		sendCh:       make(chan []byte, sendQueueCap),
-		recvCh:       make(chan []byte, recvBufferSize),
+		recvCh:       make(chan []byte, recvQueueSize(recvBufferSize)),
 	}, nil
 }
+
+func recvQueueSize(n int) int { return n }
 
 func (p *Pipe) Start(ctx context.Context) error {
 	if p.started {
@@ -198,6 +202,10 @@ func (p *Pipe) SessionID() string                                   { return "fr
 func (p *Pipe) MaxMessageSize() int                                 { return p.maxMessage }
 func (p *Pipe) DeleteMessage(ctx context.Context, key string) error { return nil }
 func (p *Pipe) SetSharing(on bool)                                  { p.sharing = on }
+
+func (p *Pipe) WalkLayers() []transport.Layer {
+	return []transport.Layer{{Kind: "pipe", Type: "framing", Snapshot: p.ctr.Snapshot()}}
+}
 
 func (p *Pipe) SendMessage(ctx context.Context, data []byte, key string) error {
 	if !p.started {
@@ -309,25 +317,19 @@ func (p *Pipe) sendBatch(batch [][]byte) error {
 	binary.LittleEndian.PutUint32(payload[4:8], crc32.ChecksumIEEE(data))
 	copy(payload[HdrLen:], data)
 	p.stMsgs.Add(int64(len(batch)))
+	p.ctr.UsefulSent.Add(int64(len(data)))
+	p.ctr.MessagesSent.Add(int64(len(batch)))
 	return p.emit(payload, fmt.Sprintf("batch msgs=%d bytes=%d", len(batch), len(data)))
 }
 
+// sendIdle emits a completely uniform YUV frame whose payload is all zeros.
+// The receiver interprets a zero length header as "idle" and drops it, so the
+// exact cell pattern is irrelevant. Keeping the frame perfectly static lets the
+// VBR encoder compress it into a tiny P-frame instead of ~10 KB per tick,
+// which previously flooded mobile links and caused RTP gaps → KCP resets.
 func (p *Pipe) sendIdle() error {
 	p.idleSeq++
-	seq := int(p.idleSeq)
-	payload := make([]byte, p.payloadBytes)
-	shades := p.palette.Shades()
-	bits := p.palette.BitsPerCell
-	for r := 0; r < p.cfg.Rows; r++ {
-		for c := 0; c < p.cfg.Cols; c++ {
-			idx := r*p.cfg.Cols + c
-			if idx < p.hdrCells {
-				continue
-			}
-			val := byte((r + c + seq/8) % shades)
-			setNBits(payload, idx*bits, bits, val)
-		}
-	}
+	payload := make([]byte, p.payloadBytes) // all zeros → length == 0
 	return p.emit(payload, "")
 }
 
@@ -356,6 +358,9 @@ func (p *Pipe) emit(payload []byte, label string) error {
 	if werr != nil {
 		return fmt.Errorf("framing: write: %w", werr)
 	}
+
+	p.ctr.NetworkSent.Add(int64(len(frame)))
+	p.ctr.FramesSent.Add(1)
 
 	n := p.stFrames.Add(1)
 	p.stBytes.Add(int64(len(frame)))
@@ -399,6 +404,9 @@ func (p *Pipe) recvLoop() {
 			return
 		}
 		frameCount++
+		p.ctr.NetworkRecv.Add(int64(len(raw)))
+		p.ctr.FramesRecv.Add(1)
+
 		yuv, err := p.dec.Decode(raw)
 		if err != nil {
 			log.Printf("[framing] recv #%d vp8=%d DECODE-FAIL: %v",
@@ -454,8 +462,11 @@ func (p *Pipe) recvLoop() {
 				return
 			}
 		}
+		p.ctr.UsefulRecv.Add(int64(len(data)))
+		p.ctr.MessagesRecv.Add(int64(n))
 		log.Printf("[framing] recv #%d OK msgs=%d bytes=%d", frameCount, n, length)
 	}
 }
 
 var _ transport.Pipe = (*Pipe)(nil)
+var _ transport.Telemetry = (*Pipe)(nil)

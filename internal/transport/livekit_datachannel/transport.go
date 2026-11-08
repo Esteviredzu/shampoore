@@ -37,9 +37,16 @@ func (t *directTransport) Receive(ctx context.Context) ([]byte, error) {
 	return data, err
 }
 
-func (t *directTransport) MaxMessageSize() int   { return t.pipe.MaxMessageSize() }
-func (t *directTransport) BytesDelivered() int64 { return t.bytesDelivered.Load() }
+func (t *directTransport) MaxMessageSize() int    { return t.pipe.MaxMessageSize() }
+func (t *directTransport) BytesDelivered() int64  { return t.bytesDelivered.Load() }
+func (t *directTransport) BytesAcked() int64      { return t.bytesSent.Load() }
 
-func (t *directTransport) BytesAcked() int64 { return t.bytesSent.Load() }
+func (t *directTransport) WalkLayers() []transport.Layer {
+	if tw, ok := t.pipe.(transport.Telemetry); ok {
+		return tw.WalkLayers()
+	}
+	return nil
+}
 
 var _ transport.Transport = (*directTransport)(nil)
+var _ transport.Telemetry = (*directTransport)(nil)

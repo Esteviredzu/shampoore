@@ -63,6 +63,13 @@ func (p *FECPipe) Stop(ctx context.Context) error  { return p.inner.Stop(ctx) }
 func (p *FECPipe) SessionID() string               { return p.inner.SessionID() }
 func (p *FECPipe) MaxMessageSize() int             { return p.inner.MaxMessageSize() }
 
+func (p *FECPipe) WalkLayers() []transport.Layer {
+	if tw, ok := p.inner.(transport.Telemetry); ok {
+		return tw.WalkLayers()
+	}
+	return nil
+}
+
 func (p *FECPipe) SendMessage(ctx context.Context, data []byte, key string) error {
 	if len(data) == 0 {
 		return p.inner.SendMessage(ctx, data, key)
@@ -182,3 +189,5 @@ func (p *FECPipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 func (p *FECPipe) DeleteMessage(ctx context.Context, key string) error {
 	return p.inner.DeleteMessage(ctx, key)
 }
+
+var _ transport.Telemetry = (*FECPipe)(nil)

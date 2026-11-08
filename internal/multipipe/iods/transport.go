@@ -69,6 +69,8 @@ type subflow struct {
 
 	dead   bool
 	deadAt time.Time
+
+	ctr transport.Counters
 }
 
 type unackedFrame struct {
@@ -98,6 +100,8 @@ type Transport struct {
 	unackedMu sync.Mutex
 	unacked   map[uint32]*unackedFrame
 
+	ctr transport.Counters
+
 	ctx      context.Context
 	cancel   context.CancelFunc
 	started  bool
@@ -106,6 +110,7 @@ type Transport struct {
 }
 
 var _ transport.Transport = (*Transport)(nil)
+var _ transport.Telemetry = (*Transport)(nil)
 
 func New(cfg Config) (*Transport, error) {
 	if len(cfg.Subflows) == 0 {
@@ -184,6 +189,24 @@ func (t *Transport) Stop(ctx context.Context) error {
 	return lastErr
 }
 
+func (t *Transport) WalkLayers() []transport.Layer {
+	out := []transport.Layer{{
+		Kind: "transport", Type: "iods",
+		Snapshot: t.ctr.Snapshot(),
+	}}
+	for _, sf := range t.subflows {
+		if tw, ok := sf.transport.(transport.Telemetry); ok {
+			for _, l := range tw.WalkLayers() {
+				if l.Name == "" {
+					l.Name = sf.name
+				}
+				out = append(out, l)
+			}
+		}
+	}
+	return out
+}
+
 func (t *Transport) Send(ctx context.Context, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -198,6 +221,8 @@ func (t *Transport) Send(ctx context.Context, data []byte) error {
 	frame[0] = typeData
 	binary.BigEndian.PutUint32(frame[1:5], seq)
 	copy(frame[dataHdrSize:], data)
+
+	t.ctr.UsefulSent.Add(int64(len(data)))
 
 	t.unackedMu.Lock()
 	uf := &unackedFrame{seq: seq, data: frame, sentAt: time.Now()}
@@ -284,6 +309,8 @@ func (t *Transport) trySend(sf *subflow, frame []byte) bool {
 	}
 	select {
 	case sf.outCh <- frame:
+		t.ctr.NetworkSent.Add(int64(len(frame)))
+		sf.ctr.NetworkSent.Add(int64(len(frame)))
 		return true
 	default:
 		return false
@@ -361,6 +388,9 @@ func (t *Transport) handleData(raw []byte, sf *subflow) {
 	seq := binary.BigEndian.Uint32(raw[1:5])
 	payload := make([]byte, len(raw)-dataHdrSize)
 	copy(payload, raw[dataHdrSize:])
+
+	t.ctr.NetworkRecv.Add(int64(len(raw)))
+	sf.ctr.NetworkRecv.Add(int64(len(raw)))
 
 	ack := make([]byte, ackHdrSize)
 	ack[0] = typeAck
@@ -633,6 +663,7 @@ func (t *Transport) Receive(ctx context.Context) ([]byte, error) {
 	case <-t.allDead:
 		return nil, io.EOF
 	case d := <-t.incoming:
+		t.ctr.UsefulRecv.Add(int64(len(d)))
 		return d, nil
 	}
 }

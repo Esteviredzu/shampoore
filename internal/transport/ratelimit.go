@@ -27,3 +27,10 @@ func (r *rateLimited) Send(ctx context.Context, data []byte) error {
 	}
 	return r.Transport.Send(ctx, data)
 }
+
+func (r *rateLimited) WalkLayers() []Layer {
+	if tw, ok := r.Transport.(Telemetry); ok {
+		return tw.WalkLayers()
+	}
+	return nil
+}

@@ -70,6 +70,8 @@ type Pipe struct {
 	stRecvMsgs   atomic.Int64
 	stDrops      atomic.Int64
 	stKeyframes  atomic.Int64
+
+	ctr transport.Counters
 }
 
 func New(ch channel.MediaChannel, cfg Config, logger logging.ContextLogger) *Pipe {
@@ -141,6 +143,10 @@ func (p *Pipe) Stop(ctx context.Context) error {
 func (p *Pipe) SessionID() string                                   { return "raw" }
 func (p *Pipe) DeleteMessage(ctx context.Context, key string) error { return nil }
 func (p *Pipe) MaxMessageSize() int                                 { return p.maxData - recHdr }
+
+func (p *Pipe) WalkLayers() []transport.Layer {
+	return []transport.Layer{{Kind: "pipe", Type: "raw", Snapshot: p.ctr.Snapshot()}}
+}
 
 func (p *Pipe) SendMessage(ctx context.Context, data []byte, key string) error {
 	if !p.started {
@@ -256,6 +262,8 @@ func (p *Pipe) emitKeyframe() error {
 	if err := p.ch.WriteRawVP8(p.keyframe); err != nil {
 		return err
 	}
+	p.ctr.NetworkSent.Add(int64(len(p.keyframe)))
+	p.ctr.FramesSent.Add(1)
 	n := p.stFrames.Add(1)
 	k := p.stKeyframes.Add(1)
 	p.logger.Debug("raw: SEND KEYFRAME #", k,
@@ -275,6 +283,8 @@ func (p *Pipe) sendIdle() error {
 	if err := p.ch.WriteRawVP8(frame); err != nil {
 		return err
 	}
+	p.ctr.NetworkSent.Add(int64(len(frame)))
+	p.ctr.FramesSent.Add(1)
 	n := p.stFrames.Add(1)
 	if n <= 5 || n%300 == 0 {
 		p.logger.Debug("raw: SEND idle #", n, " vp8=", len(frame))
@@ -302,6 +312,12 @@ func (p *Pipe) emitPFrame(batch [][]byte) error {
 	if err := p.ch.WriteRawVP8(frame); err != nil {
 		return err
 	}
+
+	p.ctr.NetworkSent.Add(int64(len(frame)))
+	p.ctr.UsefulSent.Add(int64(len(data)))
+	p.ctr.FramesSent.Add(1)
+	p.ctr.MessagesSent.Add(int64(len(batch)))
+
 	n := p.stFrames.Add(1)
 	p.stBytes.Add(int64(len(data)))
 	p.logger.Debug("raw: SEND P-frame #", n,
@@ -331,8 +347,11 @@ func (p *Pipe) recvLoop() {
 			continue
 		}
 
+		p.ctr.NetworkRecv.Add(int64(len(raw)))
+
 		if (raw[0] & 0x01) == 0 {
 			rf := p.stRecvFrames.Add(1)
+			p.ctr.FramesRecv.Add(1)
 			if rf <= 5 || rf%300 == 0 {
 				p.logger.Debug("raw: RECV KEYFRAME #", rf, " raw=", len(raw))
 			}
@@ -386,6 +405,9 @@ func (p *Pipe) recvLoop() {
 			}
 		}
 		rf := p.stRecvFrames.Add(1)
+		p.ctr.FramesRecv.Add(1)
+		p.ctr.UsefulRecv.Add(int64(len(data)))
+		p.ctr.MessagesRecv.Add(int64(n))
 		p.stRecvBytes.Add(int64(len(data)))
 		p.stRecvMsgs.Add(int64(n))
 		if n > 0 {
@@ -413,3 +435,4 @@ func generateVP8Keyframe(width, height int) ([]byte, error) {
 }
 
 var _ transport.Pipe = (*Pipe)(nil)
+var _ transport.Telemetry = (*Pipe)(nil)

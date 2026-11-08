@@ -64,6 +64,16 @@ func (c *Client) List() ([]manager.EntryView, error) {
 	return out, nil
 }
 
+func (c *Client) Stats() ([]manager.EntryStats, error) {
+	r, err := c.call(Request{Cmd: "stats"})
+	if err != nil {
+		return nil, err
+	}
+	var out []manager.EntryStats
+	_ = json.Unmarshal(r.Data, &out)
+	return out, nil
+}
+
 func (c *Client) Get(name string) (manager.EntryView, error) {
 	r, err := c.call(Request{Cmd: "get", Name: name})
 	if err != nil {

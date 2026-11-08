@@ -43,6 +43,8 @@ type TunnelMultiplexer struct {
 	outboundBuf    []byte
 	outboundNotify chan struct{}
 
+	ctr transport.Counters
+
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started bool
@@ -119,6 +121,17 @@ func (m *TunnelMultiplexer) Stop(ctx context.Context) error {
 	return m.transport.Stop(ctx)
 }
 
+func (m *TunnelMultiplexer) WalkLayers() []transport.Layer {
+	out := []transport.Layer{{
+		Kind: "mux", Type: "tunnel",
+		Snapshot: m.ctr.Snapshot(),
+	}}
+	if tw, ok := m.transport.(transport.Telemetry); ok {
+		out = append(out, tw.WalkLayers()...)
+	}
+	return out
+}
+
 func (m *TunnelMultiplexer) OpenStream(
 	ctx context.Context,
 	metadata map[string]any,
@@ -178,6 +191,7 @@ func (m *TunnelMultiplexer) writeData(id string, data []byte) error {
 	if !ok {
 		return fmt.Errorf("tunnel: stream not found: %s", id)
 	}
+	m.ctr.UsefulSent.Add(int64(len(data)))
 	return m.enqueueFrame(m.ctx, &TunnelFrame{
 		StreamID: id,
 		Type:     FrameData,
@@ -282,6 +296,7 @@ func (m *TunnelMultiplexer) flushOutbound(ctx context.Context) {
 			}
 			return
 		}
+		m.ctr.NetworkSent.Add(int64(len(chunk)))
 		buf = buf[len(chunk):]
 	}
 }
@@ -343,6 +358,8 @@ func (m *TunnelMultiplexer) receiveLoop() {
 			return
 		}
 
+		m.ctr.NetworkRecv.Add(int64(len(data)))
+
 		frames, err := decoder.Feed(data)
 		if err != nil {
 			m.logger.Warn("tunnel: decode error: ", err)
@@ -386,6 +403,7 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 		stream := m.streams[f.StreamID]
 		m.mu.Unlock()
 		if stream != nil {
+			m.ctr.UsefulRecv.Add(int64(len(f.Data)))
 			stream.deliverData(f.Data)
 		}
 
@@ -413,3 +431,5 @@ func (m *TunnelMultiplexer) closeAllStreams(err error) {
 		s.deliverEOF(err)
 	}
 }
+
+var _ transport.Telemetry = (*TunnelMultiplexer)(nil)

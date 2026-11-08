@@ -3,6 +3,7 @@ package yandex
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"sync"
 	"time"
@@ -70,6 +71,8 @@ type YandexPipe struct {
 	recvMessages uint64
 	recvBytes    uint64
 	statsTicker  *time.Ticker
+
+	ctr transport.Counters
 }
 
 func NewYandexPipe(client *BoardClient, logger logging.ContextLogger, cfg PipeConfig) *YandexPipe {
@@ -135,6 +138,10 @@ func (p *YandexPipe) Stop(ctx context.Context) error {
 func (p *YandexPipe) SessionID() string   { return p.session }
 func (p *YandexPipe) MaxMessageSize() int { return maxValueSize }
 
+func (p *YandexPipe) WalkLayers() []transport.Layer {
+	return []transport.Layer{{Kind: "pipe", Type: "yandex", Snapshot: p.ctr.Snapshot()}}
+}
+
 func (p *YandexPipe) SendMessage(ctx context.Context, data []byte, key string) error {
 	value := base64.StdEncoding.EncodeToString(data)
 	objectID := objectIDFromKey(key)
@@ -150,6 +157,9 @@ func (p *YandexPipe) SendMessage(ctx context.Context, data []byte, key string) e
 	p.sentMessages++
 	p.sentBytes += uint64(len(data))
 	p.statsMu.Unlock()
+
+	p.ctr.UsefulSent.Add(int64(len(data)))
+	p.ctr.MessagesSent.Add(1)
 	return nil
 }
 
@@ -208,17 +218,22 @@ func (p *YandexPipe) flushOutboundLocked(ctx context.Context) error {
 
 	objects := make([]map[string]any, 0, len(p.outboundBuf))
 	valueChanges := make(map[string]bool, len(p.outboundBuf))
+	var wire int64
 	for _, id := range p.outboundOrder {
 		value, ok := p.outboundBuf[id]
 		if !ok {
 			continue
 		}
-		objects = append(objects, createBoardObject(
+		obj := createBoardObject(
 			id, value,
 			p.client.creds.Participant,
 			p.client.creds.Dashboard,
-		))
+		)
+		objects = append(objects, obj)
 		valueChanges[id] = false
+		if b, err := json.Marshal(obj); err == nil {
+			wire += int64(len(b))
+		}
 	}
 
 	p.outboundBuf = make(map[string]string)
@@ -230,6 +245,9 @@ func (p *YandexPipe) flushOutboundLocked(ctx context.Context) error {
 			n, " objects): ", err)
 		return err
 	}
+
+	p.ctr.NetworkSent.Add(wire)
+	p.ctr.FramesSent.Add(int64(n))
 	return nil
 }
 
@@ -261,6 +279,10 @@ func (p *YandexPipe) receiveLoop() {
 				p.recvMessages++
 				p.recvBytes += uint64(len(value))
 				p.statsMu.Unlock()
+
+				p.ctr.UsefulRecv.Add(int64(len(value)))
+				p.ctr.NetworkRecv.Add(int64(len(value))*4/3 + 500)
+				p.ctr.MessagesRecv.Add(1)
 
 				select {
 				case p.messages <- value:

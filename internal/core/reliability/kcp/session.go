@@ -70,6 +70,8 @@ type Session struct {
 	bytesDelivered atomic.Int64
 	bytesSent      atomic.Int64
 
+	ctr transport.Counters
+
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -172,6 +174,17 @@ func (s *Session) BytesAcked() int64 {
 	return acked
 }
 
+func (s *Session) WalkLayers() []transport.Layer {
+	out := []transport.Layer{{
+		Kind: "transport", Type: "kcp",
+		Snapshot: s.ctr.Snapshot(),
+	}}
+	if tw, ok := s.pipe.(transport.Telemetry); ok {
+		out = append(out, tw.WalkLayers()...)
+	}
+	return out
+}
+
 func (s *Session) output(buf []byte, size int) {
 	maxChunk := s.pipe.MaxMessageSize()
 
@@ -212,7 +225,9 @@ func (s *Session) output(buf []byte, size int) {
 			s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
 			s.outMu.Unlock()
 			s.logger.Debug("kcp: output deferred: ", err)
+			continue
 		}
+		s.ctr.NetworkSent.Add(int64(len(data)))
 		start = end
 	}
 }
@@ -234,6 +249,7 @@ func (s *Session) flushPendingOutput() {
 			s.outMu.Unlock()
 			return
 		}
+		s.ctr.NetworkSent.Add(int64(len(p.data)))
 	}
 }
 
@@ -302,6 +318,7 @@ func (s *Session) recvLoop() {
 		}
 
 		inCount++
+		s.ctr.NetworkRecv.Add(int64(len(data)))
 		if inCount <= 5 || inCount%1000 == 0 {
 			log.Printf("[kcp] input #%d size=%d", inCount, len(data))
 		}
@@ -350,6 +367,7 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 		return errors.New("kcp: send failed")
 	}
 	s.bytesSent.Add(int64(len(data)))
+	s.ctr.UsefulSent.Add(int64(len(data)))
 	return nil
 }
 
@@ -400,6 +418,7 @@ func (s *Session) Receive(ctx context.Context) ([]byte, error) {
 		out := make([]byte, n)
 		copy(out, buf[:n])
 		s.bytesDelivered.Add(int64(n))
+		s.ctr.UsefulRecv.Add(int64(n))
 		return out, nil
 	}
 }
@@ -421,3 +440,4 @@ func (s *Session) Stop(ctx context.Context) error {
 }
 
 var _ transport.Transport = (*Session)(nil)
+var _ transport.Telemetry = (*Session)(nil)

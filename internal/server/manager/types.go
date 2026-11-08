@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
 type ConfigEntry struct {
@@ -33,4 +34,12 @@ type EntryView struct {
 	StartedAt *time.Time    `json:"started_at,omitempty"`
 	UpdatedAt time.Time     `json:"updated_at"`
 	FilePath  string        `json:"file_path,omitempty"`
+}
+
+type EntryStats struct {
+	Name     string                   `json:"name"`
+	Status   Status                   `json:"status"`
+	Overall  transport.Snapshot       `json:"overall"`
+	Rates    transport.Rates          `json:"rates"`
+	Subflows []transport.SubflowStats `json:"subflows,omitempty"`
 }
