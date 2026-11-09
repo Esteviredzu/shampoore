@@ -82,12 +82,18 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		cancelFn()
 		return err
 	}
-	muxCfg := tunnel.Config{
-		FlushThreshold: rt.MuxConfig.FlushThreshold,
-		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
-	}
 
-	mux := tunnel.New(rt.Transport, lg, muxCfg)
+	var mux multiplexing.StreamMultiplexer
+	if rt.StreamMux != nil {
+		mux = rt.StreamMux
+		lg.Info("mobile: using flowmux")
+	} else {
+		muxCfg := tunnel.Config{
+			FlushThreshold: rt.MuxConfig.FlushThreshold,
+			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+		}
+		mux = tunnel.New(rt.Transport, lg, muxCfg)
+	}
 
 	if err := mux.Start(ctx); err != nil {
 		cancelFn()

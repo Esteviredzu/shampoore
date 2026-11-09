@@ -19,6 +19,10 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	}
 
 	var cfg config
+	if s := q.Get("strategy"); s != "" {
+		cfg.Strategy = s
+	}
+
 	for _, n := range indices {
 		prefix := fmt.Sprintf("t%d.", n)
 		subQ := url.Values{}
@@ -124,6 +128,10 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if len(cfg.Transports) == 0 {
 		return errors.New("multipipe: no transports")
+	}
+
+	if cfg.Strategy != "" {
+		q.Set("strategy", cfg.Strategy)
 	}
 
 	for i, spec := range cfg.Transports {

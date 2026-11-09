@@ -322,14 +322,9 @@ func (p *Pipe) sendBatch(batch [][]byte) error {
 	return p.emit(payload, fmt.Sprintf("batch msgs=%d bytes=%d", len(batch), len(data)))
 }
 
-// sendIdle emits a completely uniform YUV frame whose payload is all zeros.
-// The receiver interprets a zero length header as "idle" and drops it, so the
-// exact cell pattern is irrelevant. Keeping the frame perfectly static lets the
-// VBR encoder compress it into a tiny P-frame instead of ~10 KB per tick,
-// which previously flooded mobile links and caused RTP gaps → KCP resets.
 func (p *Pipe) sendIdle() error {
 	p.idleSeq++
-	payload := make([]byte, p.payloadBytes) // all zeros → length == 0
+	payload := make([]byte, p.payloadBytes)
 	return p.emit(payload, "")
 }
 

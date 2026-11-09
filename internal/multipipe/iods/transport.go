@@ -23,22 +23,29 @@ const (
 	ackHdrSize  = 1 + 4
 	pingHdrSize = 1 + 8
 
-	pingInterval   = 200 * time.Millisecond
-	pingTimeout    = 5 * time.Second
-	rttEWMAAlpha   = 0.2
-	defaultRTT     = 50 * time.Millisecond
+	pingInterval = 250 * time.Millisecond
+	pingTimeout  = 15 * time.Second
+	rttEWMAAlpha = 0.2
+	defaultRTT   = 50 * time.Millisecond
+
 	incomingBuffer = 4096
-	maxReorderBuf  = 8192
-	outQueueSize   = 64
+	outQueueSize   = 512
+
+	defaultReorderBuf = 1 << 20
+	maxReorderBufCap  = 1 << 20
 
 	throughputSampleInterval = 500 * time.Millisecond
 	throughputEWMAAlpha      = 0.3
-	defaultThroughput        = 50_000
-	quantum                  = 1500
+	defaultThroughput        = 50000
+	minUsefulThroughput      = 1000
 
-	retransmitTick    = 200 * time.Millisecond
-	minRetransmitTime = 2 * time.Second
-	maxBackoffShift   = 4
+	retransmitTick  = 100 * time.Millisecond
+	minRTO          = 200 * time.Millisecond
+	maxBackoffShift = 4
+
+	probationPackets = 5
+
+	maxDuration = time.Duration(1 << 62)
 )
 
 type Subflow struct {
@@ -55,22 +62,18 @@ type subflow struct {
 	name      string
 	transport transport.Transport
 
-	rtt        time.Duration
-	lastPongAt time.Time
-
-	ackedBytes     atomic.Int64
+	rtt            time.Duration
+	lastPongAt     time.Time
+	throughput     float64
 	lastAckedBytes int64
 	lastSampleAt   time.Time
-	throughput     float64
+	dead           bool
+	deadAt         time.Time
+	probation      int
 
-	deficit int
-
-	outCh chan []byte
-
-	dead   bool
-	deadAt time.Time
-
-	ctr transport.Counters
+	ackedBytes atomic.Int64
+	outCh      chan []byte
+	ctr        transport.Counters
 }
 
 type unackedFrame struct {
@@ -87,7 +90,6 @@ type Transport struct {
 
 	incoming  chan []byte
 	deliverCh chan struct{}
-	allDead   chan struct{}
 
 	mu             sync.Mutex
 	nextSeq        uint32
@@ -95,18 +97,17 @@ type Transport struct {
 	buf            map[uint32][]byte
 	pendingDeliver [][]byte
 	deadCount      int
-	rrIndex        int
+	reorderBufSize int
 
 	unackedMu sync.Mutex
 	unacked   map[uint32]*unackedFrame
 
 	ctr transport.Counters
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	started  bool
-	wg       sync.WaitGroup
-	deadOnce sync.Once
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started bool
+	wg      sync.WaitGroup
 }
 
 var _ transport.Transport = (*Transport)(nil)
@@ -117,12 +118,12 @@ func New(cfg Config) (*Transport, error) {
 		return nil, errors.New("iods: no subflows")
 	}
 	t := &Transport{
-		logger:    cfg.Logger,
-		incoming:  make(chan []byte, incomingBuffer),
-		deliverCh: make(chan struct{}, 1),
-		allDead:   make(chan struct{}),
-		buf:       make(map[uint32][]byte),
-		unacked:   make(map[uint32]*unackedFrame),
+		logger:         cfg.Logger,
+		incoming:       make(chan []byte, incomingBuffer),
+		deliverCh:      make(chan struct{}, 1),
+		buf:            make(map[uint32][]byte),
+		unacked:        make(map[uint32]*unackedFrame),
+		reorderBufSize: defaultReorderBuf,
 	}
 	now := time.Now()
 	for _, s := range cfg.Subflows {
@@ -207,6 +208,45 @@ func (t *Transport) WalkLayers() []transport.Layer {
 	return out
 }
 
+func (sf *subflow) estimateCompletionLocked(dataLen int) time.Duration {
+	rtt := sf.rtt
+	if rtt <= 0 {
+		rtt = defaultRTT
+	}
+	tp := sf.throughput
+	if tp <= 0 {
+		tp = defaultThroughput
+	}
+	transmit := time.Duration(float64(dataLen) / tp * float64(time.Second))
+	queueBytes := int64(len(sf.outCh)) * 1500
+	queue := time.Duration(float64(queueBytes) / tp * float64(time.Second))
+	return rtt + transmit + queue
+}
+
+func (t *Transport) pickLocked(dataLen int) *subflow {
+
+	for _, sf := range t.subflows {
+		if !sf.dead && sf.probation > 0 {
+			sf.probation--
+			return sf
+		}
+	}
+
+	var best *subflow
+	bestEst := maxDuration
+	for _, sf := range t.subflows {
+		if sf.dead {
+			continue
+		}
+		est := sf.estimateCompletionLocked(dataLen)
+		if est < bestEst {
+			bestEst = est
+			best = sf
+		}
+	}
+	return best
+}
+
 func (t *Transport) Send(ctx context.Context, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -224,93 +264,42 @@ func (t *Transport) Send(ctx context.Context, data []byte) error {
 
 	t.ctr.UsefulSent.Add(int64(len(data)))
 
-	t.unackedMu.Lock()
 	uf := &unackedFrame{seq: seq, data: frame, sentAt: time.Now()}
+	t.unackedMu.Lock()
 	t.unacked[seq] = uf
 	t.unackedMu.Unlock()
 
-	tried := make(map[*subflow]bool, len(t.subflows))
 	for {
-		t.mu.Lock()
-		sf := t.pickLockedSkipping(len(frame), tried)
-		t.mu.Unlock()
-
-		if sf == nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-t.ctx.Done():
-				return io.EOF
-			case <-t.allDead:
-				return errors.New("iods: all subflows dead")
-			case <-time.After(5 * time.Millisecond):
-			}
-			tried = make(map[*subflow]bool, len(t.subflows))
-			continue
-		}
-		tried[sf] = true
-
-		if t.trySend(sf, frame) {
-			t.unackedMu.Lock()
-			uf.subflow = sf
-			t.unackedMu.Unlock()
+		if t.trySendFrame(uf) {
 			return nil
 		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.ctx.Done():
+			return io.EOF
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
-func (t *Transport) pickLockedSkipping(dataLen int, skip map[*subflow]bool) *subflow {
-	n := len(t.subflows)
-	var totalWeight float64
-	for _, sf := range t.subflows {
-		if !sf.dead && !skip[sf] && sf.throughput > 0 {
-			totalWeight += sf.throughput
-		}
-	}
-	if totalWeight <= 0 {
-		return nil
-	}
-	for attempt := 0; attempt < 2*n; attempt++ {
-		t.rrIndex = (t.rrIndex + 1) % n
-		sf := t.subflows[t.rrIndex]
-		if sf.dead || skip[sf] {
-			continue
-		}
-		weight := sf.throughput / totalWeight
-		sf.deficit += int(float64(quantum) * weight * float64(n))
-		if sf.deficit >= dataLen {
-			sf.deficit -= dataLen
-			return sf
-		}
-	}
-	var best *subflow
-	bestDeficit := 1 << 30
-	for _, sf := range t.subflows {
-		if sf.dead || skip[sf] {
-			continue
-		}
-		if sf.deficit < bestDeficit {
-			bestDeficit = sf.deficit
-			best = sf
-		}
-	}
-	if best != nil {
-		best.deficit -= dataLen
-	}
-	return best
-}
-
-func (t *Transport) trySend(sf *subflow, frame []byte) bool {
+func (t *Transport) trySendFrame(uf *unackedFrame) bool {
 	t.mu.Lock()
-	dead := sf.dead
+	sf := t.pickLocked(len(uf.data))
 	t.mu.Unlock()
-	if dead {
+	if sf == nil {
 		return false
 	}
+
 	select {
-	case sf.outCh <- frame:
-		t.ctr.NetworkSent.Add(int64(len(frame)))
-		sf.ctr.NetworkSent.Add(int64(len(frame)))
+	case sf.outCh <- uf.data:
+		t.unackedMu.Lock()
+		uf.subflow = sf
+		uf.sentAt = time.Now()
+		uf.attempts++
+		t.unackedMu.Unlock()
+		t.ctr.NetworkSent.Add(int64(len(uf.data)))
+		sf.ctr.NetworkSent.Add(int64(len(uf.data)))
 		return true
 	default:
 		return false
@@ -324,14 +313,63 @@ func (t *Transport) sendLoop(sf *subflow) {
 		case <-t.ctx.Done():
 			return
 		case frame := <-sf.outCh:
+			t.mu.Lock()
+			dead := sf.dead
+			t.mu.Unlock()
+			if dead {
+				continue
+			}
 			if err := sf.transport.Send(t.ctx, frame); err != nil {
 				if t.ctx.Err() != nil {
 					return
 				}
 				t.logger.Warn("iods: send on ", sf.name, " failed: ", err)
 				t.markDead(sf)
-				return
 			}
+		}
+	}
+}
+
+func (t *Transport) retransmitLoop() {
+	defer t.wg.Done()
+	ticker := time.NewTicker(retransmitTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			t.retransmitExpired()
+		}
+	}
+}
+
+func (t *Transport) retransmitExpired() {
+	now := time.Now()
+	t.unackedMu.Lock()
+	var expired []*unackedFrame
+	for _, f := range t.unacked {
+		if f.sentAt.IsZero() {
+			expired = append(expired, f)
+			continue
+		}
+		shift := f.attempts - 1
+		if shift < 0 {
+			shift = 0
+		}
+		if shift > maxBackoffShift {
+			shift = maxBackoffShift
+		}
+		rto := minRTO << shift
+		if now.Sub(f.sentAt) > rto {
+			expired = append(expired, f)
+		}
+	}
+	t.unackedMu.Unlock()
+
+	for _, f := range expired {
+		if !t.trySendFrame(f) {
+			t.logger.Debug("iods: retransmit failed seq=", f.seq)
 		}
 	}
 }
@@ -344,9 +382,14 @@ func (t *Transport) readLoop(sf *subflow) {
 			if t.ctx.Err() != nil {
 				return
 			}
-			t.logger.Warn("iods: subflow ", sf.name, " died: ", err)
+			t.logger.Warn("iods: subflow ", sf.name, " read error: ", err)
 			t.markDead(sf)
-			return
+			select {
+			case <-t.ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
+			continue
 		}
 		if len(raw) < 1 {
 			continue
@@ -361,23 +404,6 @@ func (t *Transport) readLoop(sf *subflow) {
 		case typePong:
 			t.handlePong(raw, sf)
 		}
-	}
-}
-
-func (t *Transport) markDead(sf *subflow) {
-	t.mu.Lock()
-	if sf.dead {
-		t.mu.Unlock()
-		return
-	}
-	sf.dead = true
-	sf.deadAt = time.Now()
-	t.deadCount++
-	allGone := t.deadCount == len(t.subflows)
-	t.mu.Unlock()
-
-	if allGone {
-		t.deadOnce.Do(func() { close(t.allDead) })
 	}
 }
 
@@ -400,27 +426,28 @@ func (t *Transport) handleData(raw []byte, sf *subflow) {
 	}()
 
 	t.mu.Lock()
+
 	if seq < t.nextExpect {
 		t.mu.Unlock()
 		return
 	}
-	if seq > t.nextExpect+maxReorderBuf {
-		minSeq := seq
-		for s := range t.buf {
-			if s < minSeq {
-				minSeq = s
-			}
+
+	if seq > t.nextExpect+uint32(t.reorderBufSize) {
+		want := int(seq - t.nextExpect)
+		if want > maxReorderBufCap {
+			want = maxReorderBufCap
 		}
-		t.logger.Warn("iods: reorder overflow seq=", seq,
-			" expected=", t.nextExpect, "; skipping to ", minSeq)
-		for s := t.nextExpect; s < minSeq; s++ {
-			delete(t.buf, s)
+		if want > t.reorderBufSize {
+			t.reorderBufSize = want
+			t.logger.Info("iods: reorder buffer expanded to ", want,
+				" (seq=", seq, " expect=", t.nextExpect, ")")
 		}
-		t.nextExpect = minSeq
 	}
+
 	if _, exists := t.buf[seq]; !exists {
 		t.buf[seq] = payload
 	}
+
 	for {
 		d, ok := t.buf[t.nextExpect]
 		if !ok {
@@ -479,14 +506,91 @@ func (t *Transport) handlePong(raw []byte, sf *subflow) {
 	if sample <= 0 {
 		return
 	}
+
 	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if sf.dead {
+		sf.dead = false
+		sf.throughput = defaultThroughput
+		sf.lastSampleAt = time.Now()
+		sf.lastAckedBytes = sf.ackedBytes.Load()
+		sf.rtt = 0
+		sf.probation = probationPackets
+		if t.deadCount > 0 {
+			t.deadCount--
+		}
+		t.logger.Info("iods: subflow ", sf.name, " revived (pong, was dead ",
+			time.Since(sf.deadAt).Round(time.Second), ")")
+	}
 	if sf.rtt == 0 {
 		sf.rtt = sample
 	} else {
-		sf.rtt = time.Duration(float64(sf.rtt)*(1-rttEWMAAlpha) + float64(sample)*rttEWMAAlpha)
+		sf.rtt = time.Duration(float64(sf.rtt)*(1-rttEWMAAlpha) +
+			float64(sample)*rttEWMAAlpha)
 	}
 	sf.lastPongAt = time.Now()
+}
+
+func (t *Transport) markDead(sf *subflow) {
+	t.mu.Lock()
+	if sf.dead {
+		t.mu.Unlock()
+		return
+	}
+	sf.dead = true
+	sf.deadAt = time.Now()
+	t.deadCount++
+	alive := len(t.subflows) - t.deadCount
 	t.mu.Unlock()
+
+	t.logger.Warn("iods: subflow ", sf.name, " marked dead (alive=",
+		alive, "/", len(t.subflows), ")")
+
+	t.unackedMu.Lock()
+	invalidated := 0
+	for _, f := range t.unacked {
+		if f.subflow == sf {
+			f.sentAt = time.Time{}
+			invalidated++
+		}
+	}
+	t.unackedMu.Unlock()
+	if invalidated > 0 {
+		t.logger.Warn("iods: invalidated ", invalidated,
+			" unacked frames from dead subflow ", sf.name)
+	}
+}
+
+func (t *Transport) pingLoop(sf *subflow) {
+	defer t.wg.Done()
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		t.mu.Lock()
+		dead := sf.dead
+		lastPong := sf.lastPongAt
+		t.mu.Unlock()
+
+		if !dead && !lastPong.IsZero() && time.Since(lastPong) > pingTimeout {
+			t.logger.Warn("iods: subflow ", sf.name, " no pong for ",
+				time.Since(lastPong).Round(time.Second), ", marking dead")
+			t.markDead(sf)
+		}
+
+		ping := make([]byte, pingHdrSize)
+		ping[0] = typePing
+		binary.BigEndian.PutUint64(ping[1:9], uint64(time.Now().UnixNano()))
+		go func() {
+			_ = sf.transport.Send(t.ctx, ping)
+		}()
+	}
 }
 
 func (t *Transport) deliverLoop() {
@@ -538,119 +642,14 @@ func (t *Transport) sampleThroughputs() {
 		dt := now.Sub(sf.lastSampleAt).Seconds()
 		if dt > 0 && delta > 0 {
 			sample := float64(delta) / dt
-			sf.throughput = throughputEWMAAlpha*sample + (1-throughputEWMAAlpha)*sf.throughput
+			sf.throughput = throughputEWMAAlpha*sample +
+				(1-throughputEWMAAlpha)*sf.throughput
+			if sf.throughput < minUsefulThroughput {
+				sf.throughput = minUsefulThroughput
+			}
 		}
 		sf.lastAckedBytes = acked
 		sf.lastSampleAt = now
-	}
-}
-
-func (t *Transport) retransmitLoop() {
-	defer t.wg.Done()
-	ticker := time.NewTicker(retransmitTick)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-ticker.C:
-			t.retransmitExpired()
-		}
-	}
-}
-
-func (t *Transport) retransmitExpired() {
-	now := time.Now()
-	t.unackedMu.Lock()
-	var expired []*unackedFrame
-	for _, f := range t.unacked {
-		if f.subflow == nil {
-			continue
-		}
-		if f.subflow.dead {
-			expired = append(expired, f)
-			continue
-		}
-		timeout := 3 * f.subflow.rtt
-		if timeout < minRetransmitTime {
-			timeout = minRetransmitTime
-		}
-		shift := f.attempts
-		if shift > maxBackoffShift {
-			shift = maxBackoffShift
-		}
-		timeout <<= shift
-		if now.Sub(f.sentAt) > timeout {
-			expired = append(expired, f)
-		}
-	}
-	t.unackedMu.Unlock()
-
-	for _, f := range expired {
-		t.retransmit(f)
-	}
-}
-
-func (t *Transport) retransmit(f *unackedFrame) {
-	t.mu.Lock()
-	var newSf *subflow
-	for _, sf := range t.subflows {
-		if sf.dead || sf == f.subflow {
-			continue
-		}
-		if newSf == nil || sf.throughput > newSf.throughput {
-			newSf = sf
-		}
-	}
-	t.mu.Unlock()
-	if newSf == nil {
-		return
-	}
-	if !t.trySend(newSf, f.data) {
-		return
-	}
-	t.unackedMu.Lock()
-	old := f.subflow
-	f.subflow = newSf
-	f.sentAt = time.Now()
-	f.attempts++
-	att := f.attempts
-	t.unackedMu.Unlock()
-
-	if old != nil {
-		t.logger.Info("iods: retransmit seq=", f.seq,
-			" from ", old.name, " to ", newSf.name,
-			" attempt=", att)
-	}
-}
-
-func (t *Transport) pingLoop(sf *subflow) {
-	defer t.wg.Done()
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		t.mu.Lock()
-		dead := sf.dead
-		lastPong := sf.lastPongAt
-		t.mu.Unlock()
-		if dead {
-			return
-		}
-		if !lastPong.IsZero() && time.Since(lastPong) > pingTimeout {
-			t.logger.Warn("iods: subflow ", sf.name,
-				" no pong for ", time.Since(lastPong), ", marking dead")
-			t.markDead(sf)
-			return
-		}
-		ping := make([]byte, pingHdrSize)
-		ping[0] = typePing
-		binary.BigEndian.PutUint64(ping[1:9], uint64(time.Now().UnixNano()))
-		_ = sf.transport.Send(t.ctx, ping)
 	}
 }
 
@@ -659,8 +658,6 @@ func (t *Transport) Receive(ctx context.Context) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-t.ctx.Done():
-		return nil, io.EOF
-	case <-t.allDead:
 		return nil, io.EOF
 	case d := <-t.incoming:
 		t.ctr.UsefulRecv.Add(int64(len(d)))

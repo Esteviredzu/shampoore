@@ -1,9 +1,15 @@
 package app
 
-import "github.com/Esteviredzu/shampoore-core/internal/transport"
+import (
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore-core/internal/transport"
+)
 
 type BuildResult struct {
-	Transport   transport.Transport
+	Transport transport.Transport
+
+	StreamMux multiplexing.StreamMultiplexer
+
 	Provider    Provider
 	BypassHosts []string
 	Side        []SideService

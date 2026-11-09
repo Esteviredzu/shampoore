@@ -11,6 +11,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore-core/internal/runtime"
 	"github.com/Esteviredzu/shampoore-core/internal/socks5"
@@ -53,12 +54,17 @@ func main() {
 		log.Fatalf("build runtime: %v", err)
 	}
 
-	muxCfg := tunnel.Config{
-		FlushThreshold: rt.MuxConfig.FlushThreshold,
-		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+	var mux multiplexing.StreamMultiplexer
+	if rt.StreamMux != nil {
+		mux = rt.StreamMux
+		lg.Info("client: using flowmux (per-stream distribution)")
+	} else {
+		muxCfg := tunnel.Config{
+			FlushThreshold: rt.MuxConfig.FlushThreshold,
+			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+		}
+		mux = tunnel.New(rt.Transport, lg, muxCfg)
 	}
-
-	mux := tunnel.New(rt.Transport, lg, muxCfg)
 
 	if err := mux.Start(ctx); err != nil {
 		log.Fatalf("mux start: %v", err)

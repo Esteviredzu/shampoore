@@ -1,0 +1,3 @@
+config	median_KBps	mean_KBps	runs_Bps
+single: yandex	700.6	687.1	650123 717372 743149
+single: yandex_telemost_raw	65.5	64.8	48271 67106 83555

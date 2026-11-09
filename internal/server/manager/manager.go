@@ -236,12 +236,18 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		cancel()
 		return fmt.Errorf("build runtime: %w", err)
 	}
-	muxCfg := tunnel.Config{
-		FlushThreshold: rt.MuxConfig.FlushThreshold,
-		FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
-	}
 
-	mux := tunnel.New(rt.Transport, logger, muxCfg)
+	var mux multiplexing.StreamMultiplexer
+	if rt.StreamMux != nil {
+		mux = rt.StreamMux
+		logger.Info("manager: ", me.Name, " using flowmux")
+	} else {
+		muxCfg := tunnel.Config{
+			FlushThreshold: rt.MuxConfig.FlushThreshold,
+			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+		}
+		mux = tunnel.New(rt.Transport, logger, muxCfg)
+	}
 
 	if err := mux.Start(ctx); err != nil {
 		cancel()

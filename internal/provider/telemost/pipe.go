@@ -47,8 +47,6 @@ func (p *Pipe) Start(ctx context.Context) error {
 	p.sig.onPublishReady = func() { pubOnce.Do(func() { close(pubReady) }) }
 	p.sig.onSubscribe = func() { subOnce.Do(func() { close(subReady) }) }
 
-	// True reconnects (peer's PeerConnection recreated) are signalled here.
-	// This is the only place we reset the underlying transport session.
 	p.sig.onSubscriberReconnect = func() {
 		p.logger.Info("telemost: signaling reconnect")
 		if p.transportResetFunc != nil {
@@ -89,12 +87,6 @@ func (p *Pipe) Start(ctx context.Context) error {
 	}
 	p.tunnel = tunnel
 
-	// RTP gap + keyframe is NOT a reliable indicator of a real reconnect —
-	// it fires on ordinary mobile hiccups (radio sleep, brief congestion,
-	// or any burst of lost packets), and resetting the KCP session on top
-	// of a live transmit path causes in-flight packet loss and long stalls.
-	// We keep the log line for diagnostics, but delegate the actual reset
-	// decision to signaling (onSubscriberReconnect above).
 	tunnel.SetReconnectCallback(func() {
 		p.logger.Info("telemost: tunnel gap+keyframe (KCP reset deferred to signaling)")
 	})

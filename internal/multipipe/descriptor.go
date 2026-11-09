@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/multipipe/flowmux"
 	"github.com/Esteviredzu/shampoore-core/internal/multipipe/iods"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
@@ -22,6 +24,8 @@ type subflowSpec struct {
 
 type config struct {
 	Transports []subflowSpec `json:"transports"`
+
+	Strategy string `json:"strategy,omitempty"`
 }
 
 type outcome struct {
@@ -106,18 +110,17 @@ func build(
 	}
 
 	var (
-		subflows  []iods.Subflow
-		bypass    []string
-		sides     []app.SideService
-		providers []app.Provider
-		connected []func() []string
+		transports []transport.Transport
+		names      []string
+		bypass     []string
+		sides      []app.SideService
+		providers  []app.Provider
+		connected  []func() []string
 	)
 
 	for _, o := range outcomes {
-		subflows = append(subflows, iods.Subflow{
-			Name:      o.name,
-			Transport: o.res.Transport,
-		})
+		transports = append(transports, o.res.Transport)
+		names = append(names, o.name)
 		bypass = append(bypass, o.res.BypassHosts...)
 		sides = append(sides, o.res.Side...)
 		if o.res.Provider != nil {
@@ -145,22 +148,50 @@ func build(
 		}
 	}
 
-	if len(subflows) == 1 {
-		result.Transport = subflows[0].Transport
+	switch cfg.Strategy {
+	case "", "flowmux":
+
+		fmCfg := flowmux.DefaultConfig()
+		fmCfg.FlushThreshold = eff.Int("mux_flush_threshold", 12000)
+		fmCfg.FlushInterval = time.Duration(eff.Int("mux_flush_ms", 20)) * time.Millisecond
+
+		fm, err := flowmux.New(transports, names, logger, fmCfg)
+		if err != nil {
+			stopAll(outcomes)
+			return nil, fmt.Errorf("multipipe: flowmux: %w", err)
+		}
+		result.StreamMux = fm
+		logger.Info("multipipe: flowmux enabled, subflows=", len(transports))
 		return result, nil
-	}
 
-	bonded, err := iods.New(iods.Config{
-		Subflows: subflows,
-		Logger:   logger,
-	})
-	if err != nil {
+	case "iods":
+
+		if len(transports) == 1 {
+			result.Transport = transports[0]
+			return result, nil
+		}
+
+		var subs []iods.Subflow
+		for _, o := range outcomes {
+			subs = append(subs, iods.Subflow{Name: o.name, Transport: o.res.Transport})
+		}
+
+		bonded, err := iods.New(iods.Config{
+			Subflows: subs,
+			Logger:   logger,
+		})
+		if err != nil {
+			stopAll(outcomes)
+			return nil, fmt.Errorf("multipipe: build iods: %w", err)
+		}
+		result.Transport = bonded
+		logger.Info("multipipe: iods (packet-level) enabled")
+		return result, nil
+
+	default:
 		stopAll(outcomes)
-		return nil, fmt.Errorf("multipipe: build iods: %w", err)
+		return nil, fmt.Errorf("multipipe: unknown strategy %q (want flowmux|iods)", cfg.Strategy)
 	}
-	result.Transport = bonded
-
-	return result, nil
 }
 
 func buildAll(
