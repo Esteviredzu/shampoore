@@ -109,7 +109,7 @@ func (m *Mux) Start(ctx context.Context) error {
 		tubes[i] = &transportTube{t: t}
 	}
 
-	m.conn = NewBondConn(m.ctx, m.names, tubes)
+	m.conn = NewBondConn(m.ctx, m.names, tubes, m.logger)
 
 	ct := &connTransport{
 		c:          m.conn,

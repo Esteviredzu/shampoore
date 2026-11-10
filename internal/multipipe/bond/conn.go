@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Esteviredzu/shampoore-core/internal/logging"
 )
 
 type tubeLike interface {
@@ -17,15 +19,30 @@ type tubeLike interface {
 	MaxMessageSize() int
 }
 
+const (
+	writeTimeout    = 5 * time.Second
+	samplePeriod    = 2 * time.Second
+	enqueueDeadline = 30 * time.Second
+	enqueueWaitTick = 200 * time.Millisecond
+)
+
+type queuedChunk struct {
+	seq  uint32
+	data []byte
+}
+
 type BondConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	sched      *scheduler
 	maxPayload int
+	logger     logging.ContextLogger
 
 	sendSeq atomic.Uint32
 	recvSeq uint32
+
+	readySignal chan struct{}
 
 	mu      sync.Mutex
 	reorder map[uint32][]byte
@@ -34,9 +51,15 @@ type BondConn struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	wg        sync.WaitGroup
 }
 
-func NewBondConn(ctx context.Context, names []string, tubes []tubeLike) *BondConn {
+func NewBondConn(
+	ctx context.Context,
+	names []string,
+	tubes []tubeLike,
+	logger logging.ContextLogger,
+) *BondConn {
 	c, cancel := context.WithCancel(ctx)
 
 	maxPayload := 65535
@@ -53,23 +76,94 @@ func NewBondConn(ctx context.Context, names []string, tubes []tubeLike) *BondCon
 	}
 
 	bc := &BondConn{
-		ctx:        c,
-		cancel:     cancel,
-		sched:      newScheduler(names, tubes),
-		maxPayload: maxPayload,
-		reorder:    make(map[uint32][]byte),
-		readCh:     make(chan []byte, 512),
-		closed:     make(chan struct{}),
+		ctx:         c,
+		cancel:      cancel,
+		sched:       newScheduler(names, tubes),
+		maxPayload:  maxPayload,
+		logger:      logger,
+		readySignal: make(chan struct{}, 1),
+		reorder:     make(map[uint32][]byte),
+		readCh:      make(chan []byte, 512),
+		closed:      make(chan struct{}),
 	}
+
 	for _, sf := range bc.sched.subflows {
+		bc.wg.Add(1)
 		go bc.readLoop(sf)
+		bc.wg.Add(1)
+		go bc.workerLoop(sf)
 	}
+	bc.wg.Add(1)
+	go bc.statsLoop()
+
 	return bc
 }
 
 func (bc *BondConn) MaxPayload() int { return bc.maxPayload }
 
+func (bc *BondConn) workerLoop(sf *subflow) {
+	defer bc.wg.Done()
+	defer close(sf.workerDone)
+
+	for {
+		select {
+		case <-bc.closed:
+			return
+		case chunk := <-sf.queue:
+			select {
+			case bc.readySignal <- struct{}{}:
+			default:
+			}
+			bc.sendChunk(sf, chunk)
+		}
+	}
+}
+
+func (bc *BondConn) sendChunk(sf *subflow, chunk queuedChunk) {
+	buf := make([]byte, frameHeaderSize+len(chunk.data))
+	binary.BigEndian.PutUint32(buf[0:4], chunk.seq)
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(chunk.data)))
+	copy(buf[frameHeaderSize:], chunk.data)
+
+	ctx, cancel := context.WithTimeout(bc.ctx, writeTimeout)
+	err := sf.tube.Send(ctx, buf)
+	cancel()
+	if err == nil {
+		sf.sentBytes.Add(int64(len(chunk.data)))
+		bc.sched.MarkAlive(sf)
+		return
+	}
+
+	bc.sched.MarkDead(sf, err)
+	if bc.logger != nil {
+		bc.logger.Warn("bond: send on ", sf.name, " failed: ", err)
+	}
+
+	alt := bc.sched.pickNonFull(sf)
+	if alt == nil {
+		if bc.logger != nil {
+			bc.logger.Warn("bond: chunk seq=", chunk.seq,
+				" lost (no other alive path)")
+		}
+		return
+	}
+	ctx2, cancel2 := context.WithTimeout(bc.ctx, writeTimeout)
+	err2 := alt.tube.Send(ctx2, buf)
+	cancel2()
+	if err2 != nil {
+		bc.sched.MarkDead(alt, err2)
+		if bc.logger != nil {
+			bc.logger.Warn("bond: chunk seq=", chunk.seq,
+				" lost (retry on ", alt.name, " failed: ", err2, ")")
+		}
+		return
+	}
+	alt.sentBytes.Add(int64(len(chunk.data)))
+	bc.sched.MarkAlive(alt)
+}
+
 func (bc *BondConn) readLoop(sf *subflow) {
+	defer bc.wg.Done()
 	for {
 		data, err := sf.tube.Receive(bc.ctx)
 		if err != nil {
@@ -79,7 +173,6 @@ func (bc *BondConn) readLoop(sf *subflow) {
 		if err != nil {
 			continue
 		}
-		bc.sched.SubInflight(sf, int64(len(payload)))
 
 		bc.mu.Lock()
 		if seq < bc.recvSeq {
@@ -121,95 +214,70 @@ func decodeFrame(data []byte) (uint32, []byte, error) {
 	return seq, data[frameHeaderSize : frameHeaderSize+int(n)], nil
 }
 
-type writeJob struct {
-	data []byte
-	seq  uint32
-}
-
 func (bc *BondConn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	select {
 	case <-bc.closed:
 		return 0, net.ErrClosed
 	default:
 	}
 
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	var jobs []writeJob
 	total := 0
+	deadline := time.Now().Add(enqueueDeadline)
+
 	for len(p) > 0 {
 		n := len(p)
 		if n > bc.maxPayload {
 			n = bc.maxPayload
 		}
-		jobs = append(jobs, writeJob{
-			data: p[:n],
+		chunk := queuedChunk{
 			seq:  bc.sendSeq.Add(1) - 1,
-		})
-		total += n
+			data: make([]byte, n),
+		}
+		copy(chunk.data, p[:n])
 		p = p[n:]
-	}
 
-	const maxParallel = 64
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
-
-	for _, j := range jobs {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(j writeJob) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			tries := len(bc.sched.subflows) + 2
-			var lastErr error
-			for attempt := 0; attempt < tries; attempt++ {
-				sf := bc.sched.Pick()
-				bc.sched.AddInflight(sf, int64(len(j.data)))
-
-				start := time.Now()
-				err := writeFrameToTube(sf.tube, j.seq, j.data)
-				if err != nil {
-					bc.sched.SubInflight(sf, int64(len(j.data)))
-					bc.sched.MarkDead(sf, err)
-					lastErr = err
-					continue
-				}
-				bc.sched.UpdateRTT(sf, time.Since(start))
-				bc.sched.MarkAlive(sf)
-				return
-			}
-
-			errMu.Lock()
-			if firstErr == nil {
-				if lastErr == nil {
-					lastErr = fmt.Errorf("bond: no alive subflows")
-				}
-				firstErr = lastErr
-			}
-			errMu.Unlock()
-		}(j)
-	}
-
-	wg.Wait()
-	if firstErr != nil {
-		return total, firstErr
+		if err := bc.enqueue(chunk, deadline); err != nil {
+			return total, err
+		}
+		total += n
 	}
 	return total, nil
 }
 
-func writeFrameToTube(t tubeLike, seq uint32, data []byte) error {
-	buf := make([]byte, frameHeaderSize+len(data))
-	binary.BigEndian.PutUint32(buf[0:4], seq)
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(data)))
-	copy(buf[frameHeaderSize:], data)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return t.Send(ctx, buf)
+func (bc *BondConn) enqueue(chunk queuedChunk, deadline time.Time) error {
+	for {
+		select {
+		case <-bc.closed:
+			return net.ErrClosed
+		default:
+		}
+
+		if sf := bc.sched.pickNonFull(nil); sf != nil {
+			select {
+			case sf.queue <- chunk:
+				return nil
+			default:
+				continue
+			}
+		}
+
+		if bc.sched.allDead() {
+			return fmt.Errorf("bond: all subflows dead")
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("bond: enqueue timeout (all queues full)")
+		}
+
+		select {
+		case <-bc.closed:
+			return net.ErrClosed
+		case <-bc.readySignal:
+		case <-time.After(enqueueWaitTick):
+		}
+	}
 }
 
 func (bc *BondConn) Read(p []byte) (int, error) {
@@ -239,11 +307,70 @@ func (bc *BondConn) ReadContext(ctx context.Context, p []byte) (int, error) {
 	}
 }
 
+func (bc *BondConn) statsLoop() {
+	defer bc.wg.Done()
+	ticker := time.NewTicker(samplePeriod)
+	defer ticker.Stop()
+
+	prev := make(map[string]int64)
+	for {
+		select {
+		case <-bc.closed:
+			return
+		case <-ticker.C:
+		}
+		if bc.logger == nil {
+			continue
+		}
+		snaps := bc.sched.Snapshot()
+		parts := make([]string, 0, len(snaps))
+		for _, s := range snaps {
+			rate := (s.SentBytes - prev[s.Name]) / int64(samplePeriod/time.Second)
+			prev[s.Name] = s.SentBytes
+			tag := ""
+			if s.Dead {
+				tag = " DEAD"
+			}
+			parts = append(parts, fmt.Sprintf(
+				"%s{q=%d/%d rate=%dB/s%s}",
+				s.Name, s.QueueLen, s.QueueCap, rate, tag,
+			))
+		}
+		bc.logger.Info("bond[stats] ", joinStrings(parts, " "))
+	}
+}
+
+func joinStrings(parts []string, sep string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	out := parts[0]
+	for _, p := range parts[1:] {
+		out += sep + p
+	}
+	return out
+}
+
 func (bc *BondConn) Close() error {
 	bc.closeOnce.Do(func() {
+		drainDeadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(drainDeadline) {
+			empty := true
+			for _, sf := range bc.sched.subflows {
+				if len(sf.queue) > 0 {
+					empty = false
+					break
+				}
+			}
+			if empty {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 		close(bc.closed)
 		bc.cancel()
 	})
+	bc.wg.Wait()
 	return nil
 }
 

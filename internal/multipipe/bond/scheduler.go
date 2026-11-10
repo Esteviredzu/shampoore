@@ -1,59 +1,41 @@
 package bond
 
 import (
-	"math/rand/v2"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	queueCap = 32
 )
 
 type subflow struct {
 	name string
 	tube tubeLike
 
-	rttNs      atomic.Int64
-	inflight   atomic.Int64
+	queue      chan queuedChunk
+	workerDone chan struct{}
+
 	deadUntil  atomic.Int64
 	errorCount atomic.Int64
+	sentBytes  atomic.Int64
 }
 
 type scheduler struct {
 	subflows []*subflow
-	rr       atomic.Uint64
-	rng      *rand.Rand
 }
 
 func newScheduler(names []string, tubes []tubeLike) *scheduler {
-	s := &scheduler{
-		rng: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 42)),
-	}
+	s := &scheduler{}
 	for i := range tubes {
 		s.subflows = append(s.subflows, &subflow{
-			name: names[i],
-			tube: tubes[i],
+			name:       names[i],
+			tube:       tubes[i],
+			queue:      make(chan queuedChunk, queueCap),
+			workerDone: make(chan struct{}),
 		})
 	}
 	return s
-}
-
-func (s *scheduler) Pick() *subflow {
-	now := time.Now().UnixNano()
-
-	alive := make([]*subflow, 0, len(s.subflows))
-	for _, sf := range s.subflows {
-		if sf.deadUntil.Load() > now {
-			continue
-		}
-		alive = append(alive, sf)
-	}
-	if len(alive) == 0 {
-		return s.subflows[s.rng.IntN(len(s.subflows))]
-	}
-	if len(alive) == 1 {
-		return alive[0]
-	}
-
-	idx := s.rr.Add(1) - 1
-	return alive[idx%uint64(len(alive))]
 }
 
 func (s *scheduler) MarkDead(sf *subflow, _ error) {
@@ -71,13 +53,59 @@ func (s *scheduler) MarkAlive(sf *subflow) {
 	sf.deadUntil.Store(0)
 }
 
-func (s *scheduler) AddInflight(sf *subflow, n int64) { sf.inflight.Add(n) }
-func (s *scheduler) SubInflight(sf *subflow, n int64) { sf.inflight.Add(-n) }
-func (s *scheduler) UpdateRTT(sf *subflow, rtt time.Duration) {
-	old := sf.rttNs.Load()
-	if old == 0 {
-		sf.rttNs.Store(int64(rtt))
-	} else {
-		sf.rttNs.Store((old*7 + int64(rtt)*3) / 10)
+func (s *scheduler) pickNonFull(exclude *subflow) *subflow {
+	now := time.Now().UnixNano()
+	var best *subflow
+	bestDepth := int(^uint(0) >> 1)
+	for _, sf := range s.subflows {
+		if sf == exclude {
+			continue
+		}
+		if sf.deadUntil.Load() > now {
+			continue
+		}
+		depth := len(sf.queue)
+		if depth >= cap(sf.queue) {
+			continue
+		}
+		if depth < bestDepth {
+			best = sf
+			bestDepth = depth
+		}
 	}
+	return best
+}
+
+func (s *scheduler) allDead() bool {
+	now := time.Now().UnixNano()
+	for _, sf := range s.subflows {
+		if sf.deadUntil.Load() <= now {
+			return false
+		}
+	}
+	return true
+}
+
+type SubflowSnapshot struct {
+	Name      string
+	QueueLen  int
+	QueueCap  int
+	SentBytes int64
+	Dead      bool
+	Pending   int
+}
+
+func (s *scheduler) Snapshot() []SubflowSnapshot {
+	now := time.Now().UnixNano()
+	out := make([]SubflowSnapshot, 0, len(s.subflows))
+	for _, sf := range s.subflows {
+		out = append(out, SubflowSnapshot{
+			Name:      sf.name,
+			QueueLen:  len(sf.queue),
+			QueueCap:  cap(sf.queue),
+			SentBytes: sf.sentBytes.Load(),
+			Dead:      sf.deadUntil.Load() > now,
+		})
+	}
+	return out
 }

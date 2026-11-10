@@ -9,6 +9,8 @@ import (
 const (
 	frameHeaderSize = 8
 	maxFramePayload = 64 * 1024
+
+	seqAck = ^uint32(0)
 )
 
 func writeFrame(w io.Writer, seq uint32, data []byte) error {
