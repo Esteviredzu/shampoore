@@ -27,6 +27,7 @@ func (tt *transportTube) MaxMessageSize() int { return tt.t.MaxMessageSize() }
 type connTransport struct {
 	c          *BondConn
 	maxPayload int
+	numTubes   int
 }
 
 func (ct *connTransport) Start(ctx context.Context) error { return nil }
@@ -45,7 +46,11 @@ func (ct *connTransport) Receive(ctx context.Context) ([]byte, error) {
 	copy(out, buf[:n])
 	return out, nil
 }
-func (ct *connTransport) MaxMessageSize() int   { return ct.maxPayload }
+
+func (ct *connTransport) MaxMessageSize() int {
+	return ct.maxPayload * ct.numTubes
+}
+
 func (ct *connTransport) BytesDelivered() int64 { return 0 }
 func (ct *connTransport) BytesAcked() int64     { return 0 }
 
@@ -106,9 +111,15 @@ func (m *Mux) Start(ctx context.Context) error {
 
 	m.conn = NewBondConn(m.ctx, m.names, tubes)
 
-	ct := &connTransport{c: m.conn, maxPayload: m.conn.MaxPayload()}
+	ct := &connTransport{
+		c:          m.conn,
+		maxPayload: m.conn.MaxPayload(),
+		numTubes:   len(m.transports),
+	}
+	aggregate := ct.MaxMessageSize()
+
 	cfg := tunnel.Config{
-		FlushThreshold: ct.maxPayload,
+		FlushThreshold: aggregate,
 		FlushInterval:  20 * time.Millisecond,
 	}
 	m.inner = tunnel.New(ct, m.logger, cfg)
@@ -123,7 +134,9 @@ func (m *Mux) Start(ctx context.Context) error {
 
 	m.started = true
 	m.logger.Info("bond: started, subflows=", len(m.names),
-		" max_payload=", ct.maxPayload)
+		" per_tube_payload=", ct.maxPayload,
+		" aggregate_payload=", aggregate,
+		" flush_threshold=", aggregate)
 	return nil
 }
 

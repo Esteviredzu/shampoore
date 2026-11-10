@@ -24,7 +24,8 @@ const (
 	defaultWindow      = 64
 
 	sendWindowPollInterval = 5 * time.Millisecond
-	sendWindowTimeout      = 500 * time.Millisecond
+
+	sendWindowTimeout = 10 * time.Second
 )
 
 type Config struct {
