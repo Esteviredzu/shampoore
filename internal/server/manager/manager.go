@@ -240,7 +240,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	var mux multiplexing.StreamMultiplexer
 	if rt.StreamMux != nil {
 		mux = rt.StreamMux
-		logger.Info("manager: ", me.Name, " using flowmux")
+		logger.Info("manager: ", me.Name, " using stream mux")
 	} else {
 		muxCfg := tunnel.Config{
 			FlushThreshold: rt.MuxConfig.FlushThreshold,

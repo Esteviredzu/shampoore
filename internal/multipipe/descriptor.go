@@ -10,8 +10,8 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/app"
 	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore-core/internal/multipipe/bond"
 	"github.com/Esteviredzu/shampoore-core/internal/multipipe/flowmux"
-	"github.com/Esteviredzu/shampoore-core/internal/multipipe/iods"
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
@@ -84,8 +84,6 @@ func build(
 	logger logging.ContextLogger,
 	eff app.Values,
 ) (*app.BuildResult, error) {
-	_ = eff
-
 	var cfg config
 	if data := s.TransportData(); len(data) > 0 {
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -150,7 +148,6 @@ func build(
 
 	switch cfg.Strategy {
 	case "", "flowmux":
-
 		fmCfg := flowmux.DefaultConfig()
 		fmCfg.FlushThreshold = eff.Int("mux_flush_threshold", 12000)
 		fmCfg.FlushInterval = time.Duration(eff.Int("mux_flush_ms", 20)) * time.Millisecond
@@ -164,33 +161,19 @@ func build(
 		logger.Info("multipipe: flowmux enabled, subflows=", len(transports))
 		return result, nil
 
-	case "iods":
-
-		if len(transports) == 1 {
-			result.Transport = transports[0]
-			return result, nil
-		}
-
-		var subs []iods.Subflow
-		for _, o := range outcomes {
-			subs = append(subs, iods.Subflow{Name: o.name, Transport: o.res.Transport})
-		}
-
-		bonded, err := iods.New(iods.Config{
-			Subflows: subs,
-			Logger:   logger,
-		})
+	case "bond":
+		bm, err := bond.NewMux(transports, names, logger)
 		if err != nil {
 			stopAll(outcomes)
-			return nil, fmt.Errorf("multipipe: build iods: %w", err)
+			return nil, fmt.Errorf("multipipe: bond: %w", err)
 		}
-		result.Transport = bonded
-		logger.Info("multipipe: iods (packet-level) enabled")
+		result.StreamMux = bm
+		logger.Info("multipipe: bond enabled, subflows=", len(transports))
 		return result, nil
 
 	default:
 		stopAll(outcomes)
-		return nil, fmt.Errorf("multipipe: unknown strategy %q (want flowmux|iods)", cfg.Strategy)
+		return nil, fmt.Errorf("multipipe: unknown strategy %q (want flowmux|bond)", cfg.Strategy)
 	}
 }
 

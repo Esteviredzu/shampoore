@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	boardsWSPath = "wss://socket63.boards.yandex.ru/socket.io/?EIO=4&transport=websocket"
+	boardsWSPath = "wss://socket92.boards.yandex.ru/socket.io/?EIO=4&transport=websocket"
 	boardsOrigin = "https://boards.yandex.ru"
 	boardsUA     = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 
@@ -103,7 +103,7 @@ func (c *BoardClient) Connect(ctx context.Context) error {
 
 	go c.readerLoop(ctx)
 
-	supervisorCtx, cancel := context.WithCancel(context.Background())
+	supervisorCtx, cancel := context.WithCancel(ctx)
 	c.supervisorCancel = cancel
 	go c.supervisor(supervisorCtx)
 

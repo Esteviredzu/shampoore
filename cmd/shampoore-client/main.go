@@ -57,7 +57,7 @@ func main() {
 	var mux multiplexing.StreamMultiplexer
 	if rt.StreamMux != nil {
 		mux = rt.StreamMux
-		lg.Info("client: using flowmux (per-stream distribution)")
+		lg.Info("client: using stream mux (mpquic or flowmux)")
 	} else {
 		muxCfg := tunnel.Config{
 			FlushThreshold: rt.MuxConfig.FlushThreshold,
