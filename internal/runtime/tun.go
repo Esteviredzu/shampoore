@@ -17,7 +17,7 @@ import (
 
 	"github.com/xjasonlyu/tun2socks/v2/engine"
 
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 const (

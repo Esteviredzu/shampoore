@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Esteviredzu/shampoore-core/internal/names"
+	"github.com/Esteviredzu/shampoore/internal/names"
 )
 
 type Config struct {

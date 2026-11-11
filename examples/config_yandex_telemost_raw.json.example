@@ -1,5 +1,5 @@
 {
-  "name": "🇵🇱 Yandex telemost raw-Polska",
+  "name": "🇵🇱 Yandex telemost raw",
   "type": "yandex_telemost_raw",
   "transport": {
     "conference_id": "YOUR_NUMBERS"

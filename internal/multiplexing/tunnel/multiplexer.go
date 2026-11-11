@@ -10,9 +10,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const maxOutboundBuf = 64 * 1024 * 1024

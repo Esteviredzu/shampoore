@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type directTransport struct {

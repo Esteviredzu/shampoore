@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
+	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
 const (

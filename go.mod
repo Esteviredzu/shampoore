@@ -1,4 +1,4 @@
-module github.com/Esteviredzu/shampoore-core
+module github.com/Esteviredzu/shampoore
 
 go 1.26.8
 
@@ -9,7 +9,6 @@ require (
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/livekit/protocol v1.53.2
 	github.com/livekit/server-sdk-go/v2 v2.19.0
-	github.com/pion/ice/v4 v4.4.7
 	github.com/pion/interceptor v0.1.49
 	github.com/pion/rtcp v1.2.19
 	github.com/pion/rtp v1.10.5
@@ -59,6 +58,7 @@ require (
 	github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/dtls/v3 v3.1.10 // indirect
+	github.com/pion/ice/v4 v4.4.7 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.2.2 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
@@ -74,7 +74,6 @@ require (
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect
-	github.com/quic-go/quic-go v0.65.0 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/twitchtv/twirp v8.1.3+incompatible // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect

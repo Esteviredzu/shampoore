@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/app"
 )
 
 func decodeURL(q url.Values) (json.RawMessage, error) {

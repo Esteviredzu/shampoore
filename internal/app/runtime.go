@@ -3,8 +3,8 @@ package app
 import (
 	"context"
 
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type SideService interface {

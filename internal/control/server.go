@@ -8,8 +8,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
 type Server struct {

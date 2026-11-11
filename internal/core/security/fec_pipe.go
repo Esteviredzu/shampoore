@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 	"github.com/klauspost/reedsolomon"
 )
 

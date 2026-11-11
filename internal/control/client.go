@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
 type Client struct {

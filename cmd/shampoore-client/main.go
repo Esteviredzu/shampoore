@@ -9,18 +9,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
-	"github.com/Esteviredzu/shampoore-core/internal/runtime"
-	"github.com/Esteviredzu/shampoore-core/internal/socks5"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/runtime"
+	"github.com/Esteviredzu/shampoore/internal/socks5"
 
-	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/livekit_datachannel"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
+	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_raw"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_squares"
 )
 
 func main() {

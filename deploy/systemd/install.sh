@@ -31,7 +31,7 @@ BANNER
 
 print_banner
 
-REPO="${SHAMPOORE_REPO:-Esteviredzu/shampoore-core}"
+REPO="${SHAMPOORE_REPO:-Esteviredzu/shampoore}"
 VERSION="${SHAMPOORE_VERSION:-latest}"
 LISTEN="${SHAMPOORE_LISTEN:-127.0.0.1:8080}"
 TOKEN_OVERRIDE="${SHAMPOORE_TOKEN:-}"

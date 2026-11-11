@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/app"
 )
 
 func ParseConfigContent(content string) (*app.Settings, error) {

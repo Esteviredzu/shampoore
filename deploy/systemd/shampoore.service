@@ -1,6 +1,6 @@
 [Unit]
 Description=Shampoore panel and VPN server
-Documentation=https://github.com/Esteviredzu/shampoore-core
+Documentation=https://github.com/Esteviredzu/shampoore
 After=network-online.target
 Wants=network-online.target
 

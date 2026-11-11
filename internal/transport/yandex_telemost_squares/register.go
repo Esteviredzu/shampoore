@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"hash/crc32"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/core/framing"
-	"github.com/Esteviredzu/shampoore-core/internal/core/reliability/kcp"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/provider/telemost"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/core/framing"
+	"github.com/Esteviredzu/shampoore/internal/core/reliability/kcp"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/provider/telemost"
 )
 
 var defaults = app.Values{

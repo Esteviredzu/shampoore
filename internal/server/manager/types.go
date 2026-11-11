@@ -3,8 +3,8 @@ package manager
 import (
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type ConfigEntry struct {

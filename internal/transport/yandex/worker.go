@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
 type WorkerConfig struct {

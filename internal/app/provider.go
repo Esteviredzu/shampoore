@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
+	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 )
 
 type Provider interface {

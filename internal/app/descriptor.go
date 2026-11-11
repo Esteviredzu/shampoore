@@ -9,7 +9,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
 type Builder func(

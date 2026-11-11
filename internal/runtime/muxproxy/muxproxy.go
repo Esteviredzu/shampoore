@@ -10,7 +10,7 @@ import (
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	"github.com/xjasonlyu/tun2socks/v2/proxy"
 
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 var (

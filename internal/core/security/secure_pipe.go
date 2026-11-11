@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type SecurePipe struct {

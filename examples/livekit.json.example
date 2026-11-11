@@ -1,0 +1,12 @@
+{
+  "name": "🇵🇱 Livekit",
+  "type": "livekit_datachannel",
+  "transport": {
+    "signal_url": "wss://...",
+    "api_key": "",
+    "api_secret": "",
+    "room": "shampoore-room-1",
+    "data_topic": "shampoore"
+  },
+  "encryption_password": ""
+}

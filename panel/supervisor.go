@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/control"
-	"github.com/Esteviredzu/shampoore-core/internal/server/logbuf"
+	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/server/logbuf"
 )
 
 type ServerManager interface {

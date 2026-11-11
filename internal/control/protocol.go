@@ -3,7 +3,7 @@ package control
 import (
 	"encoding/json"
 
-	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
 type Request struct {

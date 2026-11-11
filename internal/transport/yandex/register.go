@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/core/reliability"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/core/reliability"
+	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
 func init() {

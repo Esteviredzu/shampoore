@@ -82,8 +82,8 @@ for ARCH in "${ARCHES[@]}"; do
     shopt -u nullglob
 
     log "copying install helpers for $ARCH"
-    install -m 0755 deploy/systemd/install.sh       "$STAGE/install.sh"
-    install -m 0755 deploy/systemd/uninstall.sh     "$STAGE/uninstall.sh"
+    install -m 0755 deploy/systemd/install.sh        "$STAGE/install.sh"
+    install -m 0755 deploy/systemd/uninstall.sh      "$STAGE/uninstall.sh"
     install -m 0644 deploy/systemd/shampoore.service "$STAGE/shampoore.service"
 
     OUT="$DIST/shampoore-linux-$ARCH.tar.gz"
@@ -96,10 +96,62 @@ cp -p deploy/systemd/install.sh   "$DIST/install.sh"
 cp -p deploy/systemd/uninstall.sh "$DIST/uninstall.sh"
 chmod +x "$DIST/install.sh" "$DIST/uninstall.sh"
 
+# --- Android AAR (optional, gracefully skipped) ---------------------------
+AAR_BUILT=0
+
+# auto-discover Android SDK if not in env
+if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ]; then
+    for d in "$HOME/Android/Sdk" "$HOME/Android/sdk" "$HOME/android-sdk" "/opt/android-sdk" "/usr/lib/android-sdk"; do
+        if [ -d "$d/cmdline-tools" ] || [ -d "$d/platform-tools" ]; then
+            export ANDROID_HOME="$d"
+            break
+        fi
+    done
+fi
+
+# auto-discover NDK if not in env
+if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
+    NDK_LATEST="$(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | sort -V | tail -n1 || true)"
+    if [ -n "$NDK_LATEST" ]; then
+        export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_LATEST"
+    fi
+fi
+
+if command -v gomobile >/dev/null 2>&1 \
+   && [ -n "${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}" ] \
+   && [ -n "${ANDROID_NDK_HOME:-}" ]; then
+    log "building Android AAR"
+    log "  ANDROID_HOME=$ANDROID_HOME"
+    log "  ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+
+    rm -f "$DIST/shampoore.aar" "$DIST/shampoore-sources.jar"
+    if gomobile bind \
+        -target=android/arm64,android/arm \
+        -androidapi 21 \
+        -ldflags="-checklinkname=0" \
+        -o "$DIST/shampoore.aar" \
+        ./mobile; then
+        rm -f "$DIST/shampoore-sources.jar"
+        AAR_BUILT=1
+        log "AAR built: $DIST/shampoore.aar"
+    else
+        log "warning: gomobile bind failed; skipping AAR"
+    fi
+else
+    log "skipping AAR"
+    log "  gomobile:         $(command -v gomobile >/dev/null 2>&1 && echo yes || echo no)"
+    log "  ANDROID_HOME:     ${ANDROID_HOME:-<unset>}"
+    log "  ANDROID_NDK_HOME: ${ANDROID_NDK_HOME:-<unset>}"
+fi
+
+# --- checksums ------------------------------------------------------------
 log "generating SHA256SUMS"
 (
     cd "$DIST"
     sha256sum install.sh uninstall.sh shampoore-linux-*.tar.gz > SHA256SUMS
+    if [ "$AAR_BUILT" -eq 1 ]; then
+        sha256sum shampoore.aar >> SHA256SUMS
+    fi
 )
 
 rm -rf "$STAGE_ROOT"

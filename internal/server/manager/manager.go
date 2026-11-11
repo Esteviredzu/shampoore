@@ -12,13 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
-	"github.com/Esteviredzu/shampoore-core/internal/server/logbuf"
-	"github.com/Esteviredzu/shampoore-core/internal/socks5"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/server/logbuf"
+	"github.com/Esteviredzu/shampoore/internal/socks5"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type Manager struct {
@@ -562,16 +562,40 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 	if entry.Settings == nil {
 		return errors.New("settings required")
 	}
+
+	newName := entry.Settings.Name
+	if newName == "" {
+		newName = name
+	}
+	entry.Settings.Name = newName
+
 	if err := entry.Settings.ApplyDefaults(); err != nil {
 		return err
 	}
 
-	entry.Settings.Name = name
+	m.stopEntry(me)
+
+	if newName != name {
+		newPath := filepath.Join(filepath.Dir(me.FilePath), sanitizeName(newName)+".json")
+		os.Remove(me.FilePath)
+		me.FilePath = newPath
+		me.Name = newName
+		
+		m.mu.Lock()
+		delete(m.entries, name)
+		m.entries[newName] = me
+		m.mu.Unlock()
+
+		wasEnabled := m.state.IsEnabled(name)
+		m.state.Remove(name)
+		if wasEnabled {
+			m.state.Set(newName, true)
+		}
+	}
 
 	if err := writeSettingsFile(me.FilePath, entry.Settings); err != nil {
 		return err
 	}
-	m.stopEntry(me)
 
 	me.settingsMu.Lock()
 	me.settings = entry.Settings
@@ -580,7 +604,7 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 	me.updatedAt = time.Now()
 	me.mu.Unlock()
 
-	if m.state.IsEnabled(name) {
+	if m.state.IsEnabled(newName) || m.startAll {
 		m.startEntry(me)
 	}
 	return nil

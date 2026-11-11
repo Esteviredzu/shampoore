@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing/tunnel"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const (

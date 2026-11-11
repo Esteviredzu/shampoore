@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 func dialTCP(target string, ipv4Only bool) (net.Conn, error) {

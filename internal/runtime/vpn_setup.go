@@ -3,9 +3,9 @@ package runtime
 import (
 	"log"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
-	"github.com/Esteviredzu/shampoore-core/internal/runtime/muxproxy"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/runtime/muxproxy"
 )
 
 func ComputeBypassHosts(s *app.Settings, rt *app.Runtime) []string {

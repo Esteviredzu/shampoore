@@ -13,4 +13,7 @@ shampoore-sources.jar
 .idea/
 *.swp
 *~
-.DS_Store
+.DS_Store/bin/
+/shampoore-server
+/shampoore-panel
+/shampoore-client

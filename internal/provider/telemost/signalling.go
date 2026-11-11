@@ -13,8 +13,8 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
+	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
 const wsPingPeriod = 5 * time.Second

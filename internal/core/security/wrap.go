@@ -1,8 +1,8 @@
 package security
 
 import (
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 func WrapPipe(inner transport.Pipe, password string, logger logging.ContextLogger) (transport.Pipe, error) {

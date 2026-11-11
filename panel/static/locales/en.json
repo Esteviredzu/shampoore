@@ -1,0 +1,101 @@
+{
+  "app": { "title": "Shampoore Panel" },
+  "server": {
+    "checking": "Checking…",
+    "running": "Server running",
+    "stopped": "Server stopped",
+    "offline": "Server offline",
+    "start": "Start server",
+    "stop": "Stop server",
+    "logs": "Server logs",
+    "confirmStop": "Stop the server process? All active tunnels will drop immediately.",
+    "processRunning": "Server process running",
+    "processStopped": "Server process stopped"
+  },
+  "config": {
+    "title": "Configurations",
+    "add": "Add config",
+    "refresh": "Refresh",
+    "search": "Search configs…",
+    "sort": {
+      "name": "Name (A–Z)",
+      "status": "Status (running first)",
+      "updated": "Recently updated"
+    },
+    "empty": "No configurations yet.",
+    "emptyAction": "Add your first config",
+    "warningOffline": "Server is offline. Configs will not run until you click “Start server”.",
+    "noActive": "Server is running, but no configs are enabled.",
+    "count": "config(s)"
+  },
+  "status": {
+    "running": "Running",
+    "stopped": "Stopped",
+    "starting": "Starting",
+    "error": "Error"
+  },
+  "actions": {
+    "enable": "Enable",
+    "disable": "Disable",
+    "restart": "Restart",
+    "logs": "Logs",
+    "edit": "Edit",
+    "delete": "Delete",
+    "export": "Export",
+    "save": "Save",
+    "cancel": "Cancel",
+    "create": "Create",
+    "close": "Close",
+    "copy": "Copy",
+    "add": "Add",
+    "remove": "Remove"
+  },
+  "dialog": {
+    "newConfig": "New config",
+    "editConfig": "Edit config",
+    "tabForm": "Form",
+    "tabJson": "Raw JSON",
+    "general": "General",
+    "name": "Name",
+    "nameHint": "Optional. Allowed: a–z, A–Z, 0–9, -, _",
+    "namePlaceholder": "meeting-1",
+    "type": "Type",
+    "encryption": "Encryption password",
+    "encryptionHint": "Optional. Shared secret for XChaCha20-Poly1305.",
+    "transport": "Transport",
+    "advanced": "Advanced",
+    "advancedHint": "Extra parameters for this transport. Empty = use defaults.",
+    "advancedEmpty": "No parameters yet.",
+    "addPair": "Add parameter",
+    "keyPlaceholder": "key",
+    "valuePlaceholder": "value",
+    "json": "Config (JSON or shampoore:// URL)",
+    "template": "Load template",
+    "templateEmpty": "Empty",
+    "logsTitle": "Logs",
+    "exportTitle": "Export",
+    "exportHint": "Share this URL to import the same config elsewhere.",
+    "exportCopied": "Copied to clipboard"
+  },
+  "validation": {
+    "checking": "Checking…",
+    "ok": "Valid",
+    "invalid": "Invalid",
+    "empty": "Content is empty"
+  },
+  "toast": {
+    "saved": "Saved",
+    "deleted": "Deleted",
+    "started": "Config started",
+    "stopped": "Config stopped",
+    "restarted": "Config restarted",
+    "serverStarted": "Server started",
+    "serverStopped": "Server stopped",
+    "copied": "Copied to clipboard",
+    "error": "Error",
+    "copyFailed": "Copy failed"
+  },
+  "confirm": {
+    "deleteConfig": "Delete this config? This cannot be undone."
+  }
+}

@@ -13,9 +13,9 @@ import (
 	"github.com/google/uuid"
 	kcp "github.com/xtaci/kcp-go/v5"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/security"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/core/security"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const (

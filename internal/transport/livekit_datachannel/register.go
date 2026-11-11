@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/core/security"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	lk "github.com/Esteviredzu/shampoore-core/internal/provider/livekit"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/core/security"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	lk "github.com/Esteviredzu/shampoore/internal/provider/livekit"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 var defaults = app.Values{

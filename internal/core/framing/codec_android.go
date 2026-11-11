@@ -2,6 +2,61 @@
 
 package framing
 
+/*
+#cgo LDFLAGS: -lmediandk
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+static inline void shampoore_fmt_set_string(AMediaFormat *fmt, const char *key, const char *val) {
+    AMediaFormat_setString(fmt, key, val);
+}
+
+static inline void shampoore_fmt_set_int32(AMediaFormat *fmt, const char *key, int32_t val) {
+    AMediaFormat_setInt32(fmt, key, val);
+}
+
+static inline media_status_t shampoore_configure_encode(AMediaCodec *codec, AMediaFormat *fmt) {
+    return AMediaCodec_configure(codec, fmt, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+}
+
+static inline media_status_t shampoore_configure_decode(AMediaCodec *codec, AMediaFormat *fmt) {
+    return AMediaCodec_configure(codec, fmt, NULL, NULL, 0);
+}
+
+static inline media_status_t shampoore_release_output(AMediaCodec *codec, size_t idx) {
+    return AMediaCodec_releaseOutputBuffer(codec, idx, false);
+}
+
+typedef struct {
+    int32_t width;
+    int32_t height;
+    int32_t stride;
+    int32_t slice_height;
+    int32_t color_format;
+} shampoore_fmt_info;
+
+static inline shampoore_fmt_info shampoore_read_fmt(AMediaCodec *codec) {
+    shampoore_fmt_info info;
+    info.width = 0;
+    info.height = 0;
+    info.stride = 0;
+    info.slice_height = 0;
+    info.color_format = 0;
+    AMediaFormat *fmt = AMediaCodec_getOutputFormat(codec);
+    if (fmt != NULL) {
+        AMediaFormat_getInt32(fmt, "width", &info.width);
+        AMediaFormat_getInt32(fmt, "height", &info.height);
+        AMediaFormat_getInt32(fmt, "stride", &info.stride);
+        AMediaFormat_getInt32(fmt, "slice-height", &info.slice_height);
+        AMediaFormat_getInt32(fmt, "color-format", &info.color_format);
+        AMediaFormat_delete(fmt);
+    }
+    return info;
+}
+*/
 import "C"
 
 import (

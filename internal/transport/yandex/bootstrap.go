@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Esteviredzu/shampoore-core/internal/names"
+	"github.com/Esteviredzu/shampoore/internal/names"
 )
 
 const (

@@ -5,8 +5,8 @@ package runtime
 import (
 	"context"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 func StartClientTUN(

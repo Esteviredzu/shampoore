@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 type datagramAddr string

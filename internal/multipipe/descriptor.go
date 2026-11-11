@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel/vp8"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/multipipe/bond"
-	"github.com/Esteviredzu/shampoore-core/internal/multipipe/flowmux"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/multipipe/bond"
+	"github.com/Esteviredzu/shampoore/internal/multipipe/flowmux"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type subflowSpec struct {

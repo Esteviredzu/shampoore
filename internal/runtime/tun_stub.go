@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/Esteviredzu/shampoore-core/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
 var errTUNUnsupported = errors.New("tun: not supported on this platform")

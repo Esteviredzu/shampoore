@@ -1,10 +1,13 @@
 package panel
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -14,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/control"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
 //go:embed static
@@ -53,6 +56,7 @@ func (a *API) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/stats", a.stats)
 	mux.HandleFunc("GET /api/stats/stream", a.statsStream)
+	mux.HandleFunc("GET /api/system/stats", a.systemStats)
 
 	mux.HandleFunc("GET /api/templates", a.templates)
 	mux.HandleFunc("GET /api/configs", a.list)
@@ -67,9 +71,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/configs/{name}/restart", a.restart)
 	mux.HandleFunc("GET /api/configs/{name}/logs", a.logs)
 
+	mux.HandleFunc("GET /api/backup", a.backup)
+
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
-
 		a.logger.Warn("panel: static dir missing from embed: ", err)
 		sub = staticFS
 	}
@@ -85,6 +90,53 @@ func (a *API) Handler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (a *API) systemStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, 200, getSystemStats())
+}
+
+func (a *API) backup(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(a.configsDir)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="shampoore-backup-%s.tar.gz"`,
+			time.Now().Format("2006-01-02-150405")))
+
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		path := filepath.Join(a.configsDir, e.Name())
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			continue
+		}
+		hdr.Name = e.Name()
+		if err := tw.WriteHeader(hdr); err != nil {
+			return
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(tw, f)
+		f.Close()
+	}
 }
 
 func (a *API) findConfigPath(name string) (string, error) {
@@ -470,12 +522,38 @@ func (a *API) update(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, fmt.Errorf("settings required"))
 			return
 		}
+		
+		newName := entry.Settings.Name
+		if newName == "" {
+			newName = name
+		}
+		entry.Settings.Name = newName
 		entry.Settings.ApplyDefaults()
-		entry.Settings.Name = name
+		
 		data, _ := json.MarshalIndent(entry.Settings, "", "  ")
-		if err := os.WriteFile(path, data, 0644); err != nil {
-			writeErr(w, 500, err)
-			return
+		
+		if newName != name {
+			oldPath := path
+			newPath := filepath.Join(a.configsDir, sanitizeName(newName)+".json")
+			if err := os.WriteFile(newPath, data, 0644); err != nil {
+				writeErr(w, 500, err)
+				return
+			}
+			os.Remove(oldPath)
+			
+			st, _ := manager.LoadState(a.configsDir)
+			if st != nil {
+				wasEnabled := st.IsEnabled(name)
+				st.Remove(name)
+				if wasEnabled {
+					st.Set(newName, true)
+				}
+			}
+		} else {
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				writeErr(w, 500, err)
+				return
+			}
 		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})

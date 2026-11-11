@@ -1,0 +1,101 @@
+{
+  "app": { "title": "Shampoore Panel" },
+  "server": {
+    "checking": "Kontrolante…",
+    "running": "Servilo funkcias",
+    "stopped": "Servilo haltigita",
+    "offline": "Servilo neatingebla",
+    "start": "Startigi servilon",
+    "stop": "Haltigi servilon",
+    "logs": "Protokoloj de servilo",
+    "confirmStop": "Haltigi la servilon? Ĉiuj aktivaj tuneloj rompiĝos.",
+    "processRunning": "Servila procezo funkcias",
+    "processStopped": "Servila procezo haltigita"
+  },
+  "config": {
+    "title": "Agordoj",
+    "add": "Aldoni agordon",
+    "refresh": "Ĝisdatigi",
+    "search": "Serĉi agordojn…",
+    "sort": {
+      "name": "Nomo (A–Z)",
+      "status": "Stato (aktivaj unue)",
+      "updated": "Ĵuse ŝanĝitaj"
+    },
+    "empty": "Neniu agordo ankoraŭ.",
+    "emptyAction": "Aldoni unuan agordon",
+    "warningOffline": "Servilo haltigita. Agordoj ne funkcios ĝis vi klakos «Startigi servilon».",
+    "noActive": "Servilo funkcias sed neniu agordo estas ŝaltita.",
+    "count": "agordo(j)"
+  },
+  "status": {
+    "running": "Aktiva",
+    "stopped": "Haltigita",
+    "starting": "Startanta",
+    "error": "Eraro"
+  },
+  "actions": {
+    "enable": "Ŝalti",
+    "disable": "Malŝalti",
+    "restart": "Restartigi",
+    "logs": "Protokoloj",
+    "edit": "Redakti",
+    "delete": "Forigi",
+    "export": "Eksporti",
+    "save": "Konservi",
+    "cancel": "Nuligi",
+    "create": "Krei",
+    "close": "Fermi",
+    "copy": "Kopii",
+    "add": "Aldoni",
+    "remove": "Forigi"
+  },
+  "dialog": {
+    "newConfig": "Nova agordo",
+    "editConfig": "Redakti agordon",
+    "tabForm": "Formularo",
+    "tabJson": "Kruda JSON",
+    "general": "Ĝenerala",
+    "name": "Nomo",
+    "nameHint": "Laŭvola. Permesitaj: a–z, A–Z, 0–9, -, _",
+    "namePlaceholder": "kunveno-1",
+    "type": "Tipo",
+    "encryption": "Ĉifra pasvorto",
+    "encryptionHint": "Laŭvola. Komuna sekreto por XChaCha20-Poly1305.",
+    "transport": "Transporto",
+    "advanced": "Specialaj agordoj",
+    "advancedHint": "Pliaj transportaj parametroj. Malplena = defaŭltoj.",
+    "advancedEmpty": "Neniuj parametroj ankoraŭ.",
+    "addPair": "Aldoni parametron",
+    "keyPlaceholder": "ŝlosilo",
+    "valuePlaceholder": "valoro",
+    "json": "Agordo (JSON aŭ shampoore:// URL)",
+    "template": "Ŝargi ŝablonon",
+    "templateEmpty": "Malplena",
+    "logsTitle": "Protokoloj",
+    "exportTitle": "Eksporti",
+    "exportHint": "Kunhavigu ĉi tiun URL por importi la agordon aliloke.",
+    "exportCopied": "Kopiita al tondujo"
+  },
+  "validation": {
+    "checking": "Kontrolante…",
+    "ok": "Valida",
+    "invalid": "Nevalida",
+    "empty": "Enhavo malplenas"
+  },
+  "toast": {
+    "saved": "Konservita",
+    "deleted": "Forigita",
+    "started": "Agordo ŝaltita",
+    "stopped": "Agordo malŝaltita",
+    "restarted": "Agordo restartigita",
+    "serverStarted": "Servilo startigita",
+    "serverStopped": "Servilo haltigita",
+    "copied": "Kopiita al tondujo",
+    "error": "Eraro",
+    "copyFailed": "Kopiado malsukcesis"
+  },
+  "confirm": {
+    "deleteConfig": "Forigi ĉi tiun agordon? Ne eblas malfari."
+  }
+}

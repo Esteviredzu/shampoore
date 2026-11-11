@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/control"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/panel"
+	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/panel"
 
-	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/livekit_datachannel"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
+	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_raw"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_squares"
 )
 
 func main() {

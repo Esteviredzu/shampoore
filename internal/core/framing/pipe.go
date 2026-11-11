@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Esteviredzu/shampoore-core/internal/core/channel"
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/core/channel"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const (

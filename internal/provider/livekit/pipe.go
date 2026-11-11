@@ -9,7 +9,7 @@ import (
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
 
-	"github.com/Esteviredzu/shampoore-core/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const (

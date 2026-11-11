@@ -10,16 +10,16 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Esteviredzu/shampoore-core/internal/app"
-	"github.com/Esteviredzu/shampoore-core/internal/control"
-	"github.com/Esteviredzu/shampoore-core/internal/logging"
-	"github.com/Esteviredzu/shampoore-core/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/server/manager"
 
-	_ "github.com/Esteviredzu/shampoore-core/internal/multipipe"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/livekit_datachannel"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_raw"
-	_ "github.com/Esteviredzu/shampoore-core/internal/transport/yandex_telemost_squares"
+	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_raw"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_squares"
 )
 
 type stringList []string
