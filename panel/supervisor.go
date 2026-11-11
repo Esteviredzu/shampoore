@@ -42,12 +42,6 @@ func (s *Supervisor) Logs(limit int) []string {
 }
 
 func (s *Supervisor) IsRunning() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.isRunningLocked()
-}
-
-func (s *Supervisor) isRunningLocked() bool {
 	if _, err := os.Stat(s.sockPath); err != nil {
 		return false
 	}
@@ -56,74 +50,105 @@ func (s *Supervisor) isRunningLocked() bool {
 	return err == nil
 }
 
-func (s *Supervisor) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.isRunningLocked() {
-		return nil
-	}
-
-	_ = os.Remove(s.sockPath)
-
-	bin := "shampoore-server"
+func (s *Supervisor) resolveBinary() string {
 	exe, _ := os.Executable()
 	dir := filepath.Dir(exe)
-
-	candidates := []string{
+	for _, c := range []string{
 		filepath.Join(dir, "shampoore-server"),
 		"./shampoore-server",
 		"../shampoore-server",
 		"bin/shampoore-server",
-	}
-	for _, c := range candidates {
+	} {
 		if _, err := os.Stat(c); err == nil {
-			bin = c
-			break
+			return c
 		}
 	}
+	return "shampoore-server"
+}
 
-	cmd := exec.Command(bin,
+func (s *Supervisor) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.IsRunning() {
+		return nil
+	}
+
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Signal(syscall.SIGTERM)
+		if s.waitCh != nil {
+			select {
+			case <-s.waitCh:
+			case <-time.After(2 * time.Second):
+				_ = s.cmd.Process.Signal(syscall.SIGKILL)
+			}
+		}
+		s.cmd = nil
+		s.waitCh = nil
+	}
+
+	_ = os.Remove(s.sockPath)
+
+	cmd := exec.Command(s.resolveBinary(),
 		"--configs-dir", s.configsDir,
 		"--control-socket", s.sockPath,
 	)
 	cmd.Stdout = s.logRing
 	cmd.Stderr = s.logRing
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}
-	s.cmd = cmd
 
 	waitCh := make(chan struct{})
+	procDone := make(chan error, 1)
+	s.cmd = cmd
 	s.waitCh = waitCh
-	go func(c *exec.Cmd, ch chan struct{}) {
-		_ = c.Wait()
+
+	go func(c *exec.Cmd, ch chan struct{}, done chan error) {
+		err := c.Wait()
+		select {
+		case done <- err:
+		default:
+		}
 		close(ch)
 		s.mu.Lock()
 		if s.cmd == c {
 			s.cmd = nil
 		}
 		s.mu.Unlock()
-	}(cmd, waitCh)
+	}(cmd, waitCh, procDone)
 
-	for i := 0; i < 100; i++ {
-		if _, err := os.Stat(s.sockPath); err == nil {
-			return nil
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(10 * time.Second)
+
+	for {
+		select {
+		case <-procDone:
+			return fmt.Errorf("server exited before socket was ready")
+		case <-timeout:
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Process.Signal(syscall.SIGKILL)
+			return fmt.Errorf("timeout waiting for server socket")
+		case <-ticker.C:
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		if _, err := os.Stat(s.sockPath); err == nil {
+			if s.IsRunning() {
+				return nil
+			}
+		}
 	}
-	return fmt.Errorf("timeout waiting for server socket")
 }
 
 func (s *Supervisor) Stop() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	cmd := s.cmd
 	waitCh := s.waitCh
-	s.mu.Unlock()
 
 	if s.IsRunning() {
 		c := control.NewClient(s.sockPath)
@@ -151,11 +176,8 @@ func (s *Supervisor) Stop() error {
 		}
 	}
 
-	s.mu.Lock()
 	s.cmd = nil
 	s.waitCh = nil
-	s.mu.Unlock()
-
 	_ = os.Remove(s.sockPath)
 	return nil
 }

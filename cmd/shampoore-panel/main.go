@@ -25,20 +25,11 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "panel HTTP listen")
 	token := flag.String("token", "", "optional X-Panel-Token for /api/*")
 	configsDir := flag.String("configs-dir", "./configs", "directory with managed configs")
-	examplesDir := flag.String("examples", "",
-		"directory with template examples "+
-			"(default: first existing of ./examples, /usr/share/shampoore/examples, /var/lib/shampoore/examples)")
 	autoStart := flag.Bool("auto-start-server", false,
 		"start shampoore-server automatically on panel launch (useful under systemd)")
 	flag.Parse()
 
 	logger := logging.New("panel", true)
-
-	effExamples := *examplesDir
-	if effExamples == "" {
-		effExamples = pickExamplesDir()
-	}
-	logger.Info("panel: examples dir = ", effExamples)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -46,7 +37,7 @@ func main() {
 	sup := panel.NewSupervisor(*sockPath, *configsDir)
 	client := control.NewClient(*sockPath)
 
-	api := panel.New(client, sup, logger, *token, effExamples, *configsDir)
+	api := panel.New(client, sup, logger, *token, *configsDir)
 
 	srv := &http.Server{Addr: *listen, Handler: api.Handler()}
 	go func() {
@@ -58,7 +49,6 @@ func main() {
 
 	if *autoStart {
 		go func() {
-
 			time.Sleep(500 * time.Millisecond)
 			if err := sup.Start(); err != nil {
 				logger.Warn("panel: auto-start server failed: ", err)
@@ -75,17 +65,4 @@ func main() {
 	_ = srv.Shutdown(shCtx)
 	c()
 	logger.Info("panel: stopped")
-}
-
-func pickExamplesDir() string {
-	for _, p := range []string{
-		"./examples",
-		"/usr/share/shampoore/examples",
-		"/var/lib/shampoore/examples",
-	} {
-		if st, err := os.Stat(p); err == nil && st.IsDir() {
-			return p
-		}
-	}
-	return "./examples"
 }

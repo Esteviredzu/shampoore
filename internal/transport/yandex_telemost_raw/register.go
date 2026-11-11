@@ -39,11 +39,22 @@ var defaults = app.Values{
 func init() {
 	err := app.RegisterDescriptor(app.Descriptor{
 		Kind:        "yandex_telemost_raw",
-		DisplayName: "Yandex Telemost (raw VP8)",
-		Defaults:    defaults,
-		DecodeURL:   telemost.DecodeURL,
-		EncodeURL:   telemost.EncodeURL,
-		Build:       build,
+		DisplayName: "Telemost Raw",
+		Description: "Yandex Telemost with raw VP8 tunnel",
+		Fields: []app.Field{
+			{
+				Key:         "conference_link",
+				Label:       "Conference Link",
+				Type:        app.FieldTypeText,
+				Required:    true,
+				Placeholder: "https://telemost.yandex.ru/j/...",
+				Hint:        "Conference URL or its ID",
+			},
+		},
+		Defaults:  defaults,
+		DecodeURL: telemost.DecodeURL,
+		EncodeURL: telemost.EncodeURL,
+		Build:     build,
 	})
 	if err != nil {
 		panic(err)

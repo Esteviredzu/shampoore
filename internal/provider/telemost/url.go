@@ -7,15 +7,17 @@ import (
 )
 
 func DecodeURL(q url.Values) (json.RawMessage, error) {
-	conf := q.Get("conf")
-	if conf == "" {
-		return nil, errors.New("telemost: missing conf")
+	raw := q.Get("conference_link")
+	if raw == "" {
+		return nil, errors.New("telemost: missing conference_link")
 	}
-	id := extractConferenceID(conf)
+	id := extractConferenceID(raw)
 	if id == "" {
-		return nil, errors.New("telemost: invalid conf")
+		return nil, errors.New("telemost: invalid conference_link")
 	}
-	out := map[string]any{"conference_id": id}
+	out := map[string]any{
+		"conference_link": "https://telemost.yandex.ru/j/" + id,
+	}
 	return json.Marshal(out)
 }
 
@@ -27,7 +29,7 @@ func EncodeURL(raw json.RawMessage, q url.Values) error {
 		}
 	}
 	if id := extractConferenceID(cfg.EffectiveConferenceLink()); id != "" {
-		q.Set("conf", id)
+		q.Set("conference_link", id)
 	}
 	return nil
 }

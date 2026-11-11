@@ -12,6 +12,24 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 )
 
+type FieldType string
+
+const (
+	FieldTypeText     FieldType = "text"
+	FieldTypePassword FieldType = "password"
+	FieldTypeNumber   FieldType = "number"
+	FieldTypeBool     FieldType = "bool"
+)
+
+type Field struct {
+	Key         string    `json:"key"`
+	Label       string    `json:"label"`
+	Placeholder string    `json:"placeholder,omitempty"`
+	Hint        string    `json:"hint,omitempty"`
+	Type        FieldType `json:"type"`
+	Required    bool      `json:"required,omitempty"`
+}
+
 type Builder func(
 	ctx context.Context,
 	s *Settings,
@@ -24,6 +42,8 @@ type Descriptor struct {
 	Kind        string
 	DisplayName string
 	Description string
+
+	Fields []Field
 
 	DecodeURL func(q url.Values) (json.RawMessage, error)
 	EncodeURL func(raw json.RawMessage, q url.Values) error

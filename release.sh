@@ -51,7 +51,6 @@ log() { echo "==> $*"; }
 command -v go  >/dev/null || die "go is required"
 command -v tar >/dev/null || die "tar is required"
 [ -f go.mod ] || die "run from repo root (go.mod not found)"
-[ -d examples ] || die "examples/ directory not found at repo root"
 [ -f deploy/systemd/install.sh ]         || die "deploy/systemd/install.sh is missing"
 [ -f deploy/systemd/uninstall.sh ]       || die "deploy/systemd/uninstall.sh is missing"
 [ -f deploy/systemd/shampoore.service ]  || die "deploy/systemd/shampoore.service is missing"
@@ -66,7 +65,7 @@ LDFLAGS="-s -w"
 
 for ARCH in "${ARCHES[@]}"; do
     STAGE="$STAGE_ROOT/shampoore-linux-$ARCH"
-    mkdir -p "$STAGE/examples"
+    mkdir -p "$STAGE"
 
     log "building linux/$ARCH"
     CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
@@ -75,13 +74,6 @@ for ARCH in "${ARCHES[@]}"; do
     CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
         go build -trimpath -ldflags="$LDFLAGS" \
         -o "$STAGE/shampoore-server" ./cmd/shampoore-server
-
-    log "collecting examples for $ARCH"
-    shopt -s nullglob
-    for f in examples/*.json.example; do
-        cp -p "$f" "$STAGE/examples/"
-    done
-    shopt -u nullglob
 
     log "copying install helpers for $ARCH"
     install -m 0755 deploy/systemd/install.sh        "$STAGE/install.sh"

@@ -20,11 +20,45 @@ var defaults = app.Values{
 func init() {
 	err := app.RegisterDescriptor(app.Descriptor{
 		Kind:        "livekit_datachannel",
-		DisplayName: "LiveKit (Reliable DataChannel)",
-		Defaults:    defaults,
-		DecodeURL:   lk.DecodeURL,
-		EncodeURL:   lk.EncodeURL,
-		Build:       build,
+		DisplayName: "LiveKit",
+		Description: "LiveKit Reliable DataChannel",
+		Fields: []app.Field{
+			{
+				Key:         "signal_url",
+				Label:       "Signal URL",
+				Type:        app.FieldTypeText,
+				Required:    true,
+				Placeholder: "wss://...",
+			},
+			{
+				Key:      "api_key",
+				Label:    "API Key",
+				Type:     app.FieldTypeText,
+				Required: true,
+			},
+			{
+				Key:      "api_secret",
+				Label:    "API Secret",
+				Type:     app.FieldTypePassword,
+				Required: true,
+			},
+			{
+				Key:      "room",
+				Label:    "Room",
+				Type:     app.FieldTypeText,
+				Required: true,
+			},
+			{
+				Key:         "data_topic",
+				Label:       "Data Topic",
+				Type:        app.FieldTypeText,
+				Placeholder: "shampoore",
+			},
+		},
+		Defaults:  defaults,
+		DecodeURL: lk.DecodeURL,
+		EncodeURL: lk.EncodeURL,
+		Build:     build,
 	})
 	if err != nil {
 		panic(err)

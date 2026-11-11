@@ -227,3 +227,45 @@ func GetStats() string {
 	}
 	return string(data)
 }
+
+type TransportField struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Placeholder string `json:"placeholder,omitempty"`
+	Hint        string `json:"hint,omitempty"`
+	Type        string `json:"type"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+type TransportSchema struct {
+	Kind        string           `json:"kind"`
+	DisplayName string           `json:"display_name"`
+	Description string           `json:"description,omitempty"`
+	Fields      []TransportField `json:"fields"`
+}
+
+func GetTransportSchemas() string {
+	descs := app.AllDescriptors()
+	schemas := make([]TransportSchema, 0, len(descs))
+	for _, d := range descs {
+		fields := make([]TransportField, 0, len(d.Fields))
+		for _, f := range d.Fields {
+			fields = append(fields, TransportField{
+				Key:         f.Key,
+				Label:       f.Label,
+				Placeholder: f.Placeholder,
+				Hint:        f.Hint,
+				Type:        string(f.Type),
+				Required:    f.Required,
+			})
+		}
+		schemas = append(schemas, TransportSchema{
+			Kind:        d.Kind,
+			DisplayName: d.DisplayName,
+			Description: d.Description,
+			Fields:      fields,
+		})
+	}
+	data, _ := json.Marshal(schemas)
+	return string(data)
+}

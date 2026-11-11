@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,16 +15,33 @@ type SystemStats struct {
 	Uptime   uint64  `json:"uptime"`
 }
 
-func readCPU() (uint64, uint64) {
+type sysSampler struct {
+	mu       sync.RWMutex
+	cpuUsage float64
+	memUsed  uint64
+	memTotal uint64
+	uptime   uint64
+
+	prevTotal uint64
+	prevIdle  uint64
+	hasPrev   bool
+}
+
+var (
+	sysSamplerInst = &sysSampler{}
+	sysSamplerOnce sync.Once
+)
+
+func readCPUTicks() (uint64, uint64) {
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0, 0
 	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) == 0 {
-		return 0, 0
+	nl := strings.IndexByte(string(data), '\n')
+	if nl < 0 {
+		nl = len(data)
 	}
-	fields := strings.Fields(lines[0])
+	fields := strings.Fields(string(data[:nl]))
 	if len(fields) < 5 {
 		return 0, 0
 	}
@@ -38,44 +56,75 @@ func readCPU() (uint64, uint64) {
 	return total, idle
 }
 
-func getSystemStats() SystemStats {
-	var s SystemStats
+func (s *sysSampler) sample() {
+	total, idle := readCPUTicks()
 
+	var memTotal, memAvail uint64
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			val, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch {
+			case strings.HasPrefix(line, "MemTotal:"):
+				memTotal = val * 1024
+			case strings.HasPrefix(line, "MemAvailable:"):
+				memAvail = val * 1024
+			}
+		}
+	}
+
+	var up uint64
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
 		fields := strings.Fields(string(data))
 		if len(fields) > 0 {
 			f, _ := strconv.ParseFloat(fields[0], 64)
-			s.Uptime = uint64(f)
+			up = uint64(f)
 		}
 	}
 
-	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
-		lines := strings.Split(string(data), "\n")
-		var total, avail uint64
-		for _, line := range lines {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val, _ := strconv.ParseUint(fields[1], 10, 64)
-				if strings.HasPrefix(line, "MemTotal:") {
-					total = val * 1024
-				} else if strings.HasPrefix(line, "MemAvailable:") {
-					avail = val * 1024
-				}
-			}
-		}
-		s.MemTotal = total
-		s.MemUsed = total - avail
+	s.mu.Lock()
+	if s.hasPrev && total > s.prevTotal {
+		dt := float64(total - s.prevTotal)
+		di := float64(idle - s.prevIdle)
+		s.cpuUsage = (dt - di) / dt * 100.0
 	}
-
-	t1, idle1 := readCPU()
-	time.Sleep(100 * time.Millisecond)
-	t2, idle2 := readCPU()
-
-	if t2 > t1 {
-		dt := float64(t2 - t1)
-		didle := float64(idle2 - idle1)
-		s.CPUUsage = (dt - didle) / dt * 100.0
+	s.prevTotal = total
+	s.prevIdle = idle
+	s.hasPrev = true
+	s.memTotal = memTotal
+	if memTotal > memAvail {
+		s.memUsed = memTotal - memAvail
 	}
+	s.uptime = up
+	s.mu.Unlock()
+}
 
-	return s
+func (s *sysSampler) run() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.sample()
+	}
+}
+
+func getSystemStats() SystemStats {
+	sysSamplerOnce.Do(func() {
+		sysSamplerInst.sample()
+		time.Sleep(100 * time.Millisecond)
+		sysSamplerInst.sample()
+		go sysSamplerInst.run()
+	})
+
+	s := sysSamplerInst
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return SystemStats{
+		CPUUsage: s.cpuUsage,
+		MemUsed:  s.memUsed,
+		MemTotal: s.memTotal,
+		Uptime:   s.uptime,
+	}
 }

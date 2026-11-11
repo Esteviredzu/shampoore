@@ -22,10 +22,20 @@ func init() {
 	err := app.RegisterDescriptor(app.Descriptor{
 		Kind:        "yandex",
 		DisplayName: "Yandex Board",
-		Defaults:    defaults,
-		DecodeURL:   decodeURL,
-		EncodeURL:   encodeURL,
-		Build:       buildTransport,
+		Description: "Yandex Board as a channel",
+		Fields: []app.Field{
+			{
+				Key:      "hash",
+				Label:    "Board Hash",
+				Type:     app.FieldTypeText,
+				Required: true,
+				Hint:     "32 hex chars from the board URL",
+			},
+		},
+		Defaults:  defaults,
+		DecodeURL: decodeURL,
+		EncodeURL: encodeURL,
+		Build:     buildTransport,
 	})
 	if err != nil {
 		panic(err)

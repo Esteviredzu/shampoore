@@ -580,7 +580,7 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 		os.Remove(me.FilePath)
 		me.FilePath = newPath
 		me.Name = newName
-		
+
 		m.mu.Lock()
 		delete(m.entries, name)
 		m.entries[newName] = me

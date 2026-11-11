@@ -210,18 +210,20 @@ function render() {
         ${c.error ? `<div class="card__error">${esc(c.error)}</div>` : ''}
         ${warn}
         <div class="card__footer">
-          <label class="switch" title="${isEnabled ? 'Enabled' : 'Disabled'}">
-            <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleCfg('${n}', this.checked)">
-            <span class="slider"></span>
-          </label>
-          <div class="card__actions">
-            <button class="btn btn--tonal btn--compact" onclick="exportCfg('${n}')" style="height:32px; font-size:12px; padding:0 12px;">
-              <span class="material-symbols-rounded" style="font-size:16px;">ios_share</span> ${t('actions.export')}
-            </button>
-            <button class="icon-btn" onclick="openLogs('${n}')" title="${t('actions.logs')}"><span class="material-symbols-rounded">terminal</span></button>
-            <button class="icon-btn" onclick="openEditDialog('${n}')" title="${t('actions.edit')}"><span class="material-symbols-rounded">edit</span></button>
-            <button class="icon-btn icon-btn--danger" onclick="delCfg('${n}')" title="${t('actions.delete')}"><span class="material-symbols-rounded">delete</span></button>
+          <div class="switch-wrapper">
+            <label class="switch">
+              <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleCfg('${n}', this.checked)">
+              <span class="slider"></span>
+            </label>
+            <span>${isEnabled ? 'Enabled' : 'Disabled'}</span>
           </div>
+          <div class="spacer"></div>
+          <button class="btn btn--tonal btn--compact" onclick="exportCfg('${n}')" title="${t('actions.export')}" style="height:32px; font-size:12px; padding:0 12px;">
+            <span class="material-symbols-rounded" style="font-size:16px;">ios_share</span> ${t('actions.export')}
+          </button>
+          <button class="icon-btn" onclick="openLogs('${n}')" title="${t('actions.logs')}"><span class="material-symbols-rounded">terminal</span></button>
+          <button class="icon-btn" onclick="openEditDialog('${n}')" title="${t('actions.edit')}"><span class="material-symbols-rounded">edit</span></button>
+          <button class="icon-btn icon-btn--danger" onclick="delCfg('${n}')" title="${t('actions.delete')}"><span class="material-symbols-rounded">delete</span></button>
         </div>
       </div>`;
   }).join('');
@@ -299,8 +301,13 @@ function openConfigDialog(editName = null, initialData = null) {
     transport: data.transport || {},
     advanced: data.advanced || {}
   };
+  
   let activeTab = 'form';
   let jsonCache = '';
+  let selectedKind = form.type;
+  let fieldValues = { ...form.transport };
+  let multiStrategy = form.transport.strategy || 'flowmux';
+  let multiSubflows = form.transport.transports || [];
 
   const dialog = openModal({
     title: t(editName ? 'dialog.editConfig' : 'dialog.newConfig'),
@@ -311,87 +318,36 @@ function openConfigDialog(editName = null, initialData = null) {
     ]
   });
 
+  function getSchema(kind) {
+    return state.templates.find(t => t.kind === kind);
+  }
+
   function buildObj() {
-    const obj = { type: form.type, transport: form.transport };
-    if (form.encryption_password) obj.encryption_password = form.encryption_password;
-    if (form.advanced && Object.keys(form.advanced).length) obj.advanced = form.advanced;
+    const obj = { type: selectedKind };
     if (form.name) obj.name = form.name;
-    return obj;
-  }
-
-  function getObjByPath(path) {
-    const parts = path.split('.');
-    let cur = form;
-    for (const p of parts) {
-      if (!cur[p]) cur[p] = {};
-      cur = cur[p];
-    }
-    return cur;
-  }
-
-  function drawKV(obj, path, containerId) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
+    if (form.encryption_password) obj.encryption_password = form.encryption_password;
     
-    container.innerHTML = Object.entries(obj).map(([k, v], i) => `
-      <div class="kv-row">
-        <input type="text" value="${escAttr(k)}" onchange="updateKVKey('${path}', ${i}, this.value, '${containerId}')" placeholder="key">
-        <input type="text" value="${escAttr(String(v))}" onchange="updateKVVal('${path}', ${i}, this.value)" placeholder="value">
-        <button type="button" class="icon-btn icon-btn--danger" onclick="removeKV('${path}', ${i}, '${containerId}')"><span class="material-symbols-rounded">delete</span></button>
-      </div>
-    `).join('');
-  }
-
-  window.updateKVKey = (path, idx, newKey, containerId) => {
-    const obj = getObjByPath(path);
-    const keys = Object.keys(obj);
-    const oldKey = keys[idx];
-    if (oldKey === newKey) return;
-    const val = obj[oldKey];
-    delete obj[oldKey];
-    obj[newKey] = val;
-    drawKV(obj, path, containerId);
-  };
-
-  window.updateKVVal = (path, idx, newVal) => {
-    const obj = getObjByPath(path);
-    const k = Object.keys(obj)[idx];
-    obj[k] = parseVal(newVal);
-  };
-
-  window.removeKV = (path, idx, containerId) => {
-    const obj = getObjByPath(path);
-    delete obj[Object.keys(obj)[idx]];
-    drawKV(obj, path, containerId);
-  };
-
-  window.addKV = (path, containerId) => {
-    const obj = getObjByPath(path);
-    let newKey = 'key';
-    let i = 1;
-    while (obj[newKey] !== undefined) {
-      newKey = 'key' + i++;
+    if (selectedKind === 'multi') {
+      obj.transport = {
+        strategy: multiStrategy,
+        transports: multiSubflows
+      };
+    } else {
+      obj.transport = {};
+      const schema = getSchema(selectedKind);
+      if (schema) {
+        schema.fields.forEach(f => {
+          if (fieldValues[f.key] !== undefined && fieldValues[f.key] !== '') {
+            obj.transport[f.key] = fieldValues[f.key];
+          }
+        });
+      } else {
+         Object.assign(obj.transport, fieldValues);
+      }
     }
-    obj[newKey] = '';
-    drawKV(obj, path, containerId);
-  };
-
-  function getKnownTypes() {
-    const types = new Set(state.templates.map(t => t.kind));
-    types.add('multi');
-    if (form.type) types.add(form.type);
-    return Array.from(types).sort();
-  }
-
-  function getTransportDefaults(type) {
-    const tpl = state.templates.find(t => t.kind === type);
-    if (tpl && tpl.example) {
-      try {
-        const ex = JSON.parse(tpl.example);
-        return ex.transport || {};
-      } catch (e) {}
-    }
-    return {};
+    
+    if (form.advanced && Object.keys(form.advanced).length) obj.advanced = form.advanced;
+    return obj;
   }
 
   function renderBody() {
@@ -408,8 +364,15 @@ function openConfigDialog(editName = null, initialData = null) {
       return;
     }
 
-    const knownTypes = getKnownTypes();
+    const schema = getSchema(selectedKind);
     
+    // Custom Select HTML
+    let optionsHtml = state.templates.map(t => `
+      <div class="custom-select-option ${t.kind === selectedKind ? 'selected' : ''}" onclick="window.selectTransport('${t.kind}')">
+        ${esc(t.display_name)}
+      </div>
+    `).join('');
+
     let html = `
       <div class="form-group">
         <div class="field">
@@ -418,139 +381,190 @@ function openConfigDialog(editName = null, initialData = null) {
         </div>
         <div class="field">
           <label>${t('dialog.type')}</label>
-          <select id="f-type" class="input">
-            ${knownTypes.map(kt => `<option value="${escAttr(kt)}" ${kt === form.type ? 'selected' : ''}>${esc(kt)}</option>`).join('')}
-          </select>
+          <div class="custom-select-wrapper" id="transport-select-wrapper">
+            <div class="custom-select-trigger" onclick="document.getElementById('transport-options').classList.toggle('hidden')">
+              <span id="current-transport-label">${esc(schema ? schema.display_name : selectedKind)}</span>
+              <span class="material-symbols-rounded">arrow_drop_down</span>
+            </div>
+            <div class="custom-select-options hidden" id="transport-options">
+              ${optionsHtml}
+            </div>
+          </div>
         </div>
         <div class="field">
           <label>${t('dialog.encryption')}</label>
           <input type="password" id="f-pw" value="${escAttr(form.encryption_password)}">
         </div>
+        <hr style="border:none;border-top:1px solid var(--md-outline-variant);margin:8px 0;">
     `;
 
-    if (form.type === 'multi') {
+    if (selectedKind === 'multi') {
       html += `
-        <hr>
         <div class="field">
           <label>Strategy</label>
-          <select id="f-strategy" class="input">
-            <option value="flowmux" ${form.transport.strategy === 'flowmux' ? 'selected' : ''}>flowmux</option>
-            <option value="bond" ${form.transport.strategy === 'bond' ? 'selected' : ''}>bond</option>
+          <select id="f-strategy" class="input" style="height:56px;">
+            <option value="flowmux" ${multiStrategy === 'flowmux' ? 'selected' : ''}>flowmux</option>
+            <option value="bond" ${multiStrategy === 'bond' ? 'selected' : ''}>bond</option>
           </select>
         </div>
-        
         <div class="field">
           <label>Transports (Subflows)</label>
           <div id="multi-transports">
-            ${(form.transport.transports || []).map((t, i) => `
+            ${multiSubflows.map((t, i) => `
               <div style="background:var(--md-surface-container-highest); padding:16px; border-radius:16px; margin-bottom:16px;">
                 <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
-                  <select class="input" style="flex:1; height:40px;" data-mt-type="${i}">
-                    ${knownTypes.filter(kt => kt !== 'multi').map(kt => `<option value="${escAttr(kt)}" ${kt === t.type ? 'selected' : ''}>${esc(kt)}</option>`).join('')}
+                  <select class="input" style="flex:1; height:40px;" onchange="window.updateSubflowType(${i}, this.value)">
+                    ${state.templates.filter(k => k.kind !== 'multi').map(k => `<option value="${escAttr(k.kind)}" ${k.kind === t.type ? 'selected' : ''}>${esc(k.display_name)}</option>`).join('')}
                   </select>
-                  <button type="button" class="icon-btn icon-btn--danger" onclick="rmTransport(${i})"><span class="material-symbols-rounded">delete</span></button>
+                  <button type="button" class="icon-btn icon-btn--danger" onclick="window.rmSubflow(${i})"><span class="material-symbols-rounded">delete</span></button>
                 </div>
                 <div class="field" style="margin-bottom:12px;">
                   <label>Rate limit (KB/s, 0 = unlimited)</label>
-                  <input type="number" class="input" style="height:40px;" data-mt-ratelimit="${i}" value="${t.rate_limit_kb || 0}">
+                  <input type="number" class="input" style="height:40px;" value="${t.rate_limit_kb || 0}" oninput="window.updateSubflowRate(${i}, this.value)">
                 </div>
                 <div class="field">
                   <label>Transport Params</label>
-                  <div id="kv-transports-${i}" class="kv-container"></div>
-                  <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="addKV('transports.${i}.transport', 'kv-transports-${i}')">
-                    <span class="material-symbols-rounded">add</span> Add parameter
-                  </button>
+                  <div id="kv-transports-${i}" class="kv-container">
+                    ${renderSubflowFields(i, t)}
+                  </div>
                 </div>
               </div>
             `).join('')}
           </div>
-          <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="addTransport()">
+          <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="window.addSubflow()">
             <span class="material-symbols-rounded">add</span> Add Transport
           </button>
         </div>
       `;
-    } else {
+    } else if (schema && schema.fields) {
       html += `
-        <hr>
         <div class="field">
           <label>Transport Params</label>
-          <div id="kv-transport" class="kv-container"></div>
-          <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="addKV('transport', 'kv-transport')">
-            <span class="material-symbols-rounded">add</span> Add parameter
-          </button>
+          ${schema.fields.map(f => `
+            <div class="field" style="margin-bottom:8px;">
+              <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
+              <input type="${f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text'}" 
+                     class="input" 
+                     style="height:40px;" 
+                     value="${escAttr(String(fieldValues[f.key] || ''))}"
+                     placeholder="${escAttr(f.placeholder || '')}"
+                     oninput="window.updateField('${escAttr(f.key)}', this.value)">
+              ${f.hint ? `<span class="hint" style="font-size:11px; margin-top:4px;">${esc(f.hint)}</span>` : ''}
+            </div>
+          `).join('')}
         </div>
       `;
     }
 
     html += `
-      <hr>
-      <div class="field">
-        <label>${t('dialog.advanced')}</label>
-        <div id="kv-advanced" class="kv-container"></div>
-        <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="addKV('advanced', 'kv-advanced')">
-          <span class="material-symbols-rounded">add</span> Add parameter
-        </button>
+        <hr style="border:none;border-top:1px solid var(--md-outline-variant);margin:8px 0;">
+        <div class="field">
+          <label>${t('dialog.advanced')}</label>
+          <div id="kv-advanced" class="kv-container">
+             ${Object.entries(form.advanced || {}).map(([k, v], i) => renderKV(k, v, i)).join('')}
+          </div>
+          <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="window.addKV()">
+            <span class="material-symbols-rounded">add</span> Add parameter
+          </button>
+        </div>
       </div>
-    </div>`;
+    `;
 
     dialog.setBody(html);
 
     document.getElementById('f-name').addEventListener('input', e => form.name = e.target.value);
-    
-    document.getElementById('f-type').addEventListener('change', e => {
-      const newType = e.target.value;
-      form.type = newType;
-      if (newType === 'multi') {
-        if (!form.transport.transports) {
-          form.transport = { strategy: 'flowmux', transports: [] };
-        }
-      } else {
-        form.transport = getTransportDefaults(newType);
-      }
-      renderBody();
-    });
-    
     document.getElementById('f-pw').addEventListener('input', e => form.encryption_password = e.target.value);
-
-    if (form.type === 'multi') {
-      document.getElementById('f-strategy').addEventListener('change', e => {
-        form.transport.strategy = e.target.value;
-      });
-
-      document.querySelectorAll('[data-mt-type]').forEach(el => el.addEventListener('change', e => {
-        const idx = Number(e.target.dataset.mtType);
-        const newType = e.target.value;
-        form.transport.transports[idx].type = newType;
-        form.transport.transports[idx].transport = getTransportDefaults(newType);
-        renderBody();
-      }));
-
-      document.querySelectorAll('[data-mt-ratelimit]').forEach(el => el.addEventListener('input', e => {
-        const idx = Number(e.target.dataset.mtRatelimit);
-        form.transport.transports[idx].rate_limit_kb = Number(e.target.value) || 0;
-      }));
-
-      (form.transport.transports || []).forEach((t, i) => {
-        drawKV(t.transport || {}, `transports.${i}.transport`, `kv-transports-${i}`);
-      });
-
-      window.addTransport = () => {
-        form.transport.transports = form.transport.transports || [];
-        const defaultType = knownTypes.find(t => t !== 'multi') || 'yandex';
-        form.transport.transports.push({ type: defaultType, rate_limit_kb: 0, transport: getTransportDefaults(defaultType) });
-        renderBody();
-      };
-
-      window.rmTransport = (i) => {
-        form.transport.transports.splice(i, 1);
-        renderBody();
-      };
-    } else {
-      drawKV(form.transport || {}, 'transport', 'kv-transport');
+    
+    if (selectedKind === 'multi') {
+      document.getElementById('f-strategy').addEventListener('change', e => { multiStrategy = e.target.value; });
     }
-
-    drawKV(form.advanced || {}, 'advanced', 'kv-advanced');
   }
+
+  function renderSubflowFields(idx, subflow) {
+    const subSchema = getSchema(subflow.type);
+    if (!subSchema) return '';
+    return subSchema.fields.map(f => `
+      <div class="field" style="margin-bottom:8px;">
+        <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
+        <input type="text" class="input" style="height:40px;" 
+               value="${escAttr(String((subflow.transport && subflow.transport[f.key]) || ''))}"
+               placeholder="${escAttr(f.placeholder || '')}"
+               oninput="window.updateSubflowField(${idx}, '${escAttr(f.key)}', this.value)">
+      </div>
+    `).join('');
+  }
+
+  function renderKV(k, v, i) {
+    return `
+      <div class="kv-row">
+        <input type="text" value="${escAttr(k)}" onchange="window.updateKVKey(${i}, this.value)" placeholder="key">
+        <input type="text" value="${escAttr(String(v))}" onchange="window.updateKVVal(${i}, this.value)" placeholder="value">
+        <button type="button" class="icon-btn icon-btn--danger" onclick="window.rmKV(${i})"><span class="material-symbols-rounded">delete</span></button>
+      </div>
+    `;
+  }
+
+  window.selectTransport = (kind) => {
+    selectedKind = kind;
+    fieldValues = {}; // Reset fields
+    document.getElementById('transport-options').classList.add('hidden');
+    renderBody();
+  };
+
+  window.updateField = (key, val) => {
+    fieldValues[key] = val;
+  };
+
+  window.addSubflow = () => {
+    const defaultType = state.templates.find(t => t.kind !== 'multi')?.kind || 'yandex';
+    multiSubflows.push({ type: defaultType, transport: {}, rate_limit_kb: 0 });
+    renderBody();
+  };
+
+  window.rmSubflow = (i) => {
+    multiSubflows.splice(i, 1);
+    renderBody();
+  };
+
+  window.updateSubflowType = (i, val) => {
+    multiSubflows[i].type = val;
+    multiSubflows[i].transport = {};
+    renderBody();
+  };
+
+  window.updateSubflowRate = (i, val) => {
+    multiSubflows[i].rate_limit_kb = Number(val) || 0;
+  };
+
+  window.updateSubflowField = (i, key, val) => {
+    if (!multiSubflows[i].transport) multiSubflows[i].transport = {};
+    multiSubflows[i].transport[key] = val;
+  };
+
+  window.updateKVKey = (idx, newKey) => {
+    const keys = Object.keys(form.advanced);
+    const oldKey = keys[idx];
+    if (oldKey === newKey) return;
+    const val = form.advanced[oldKey];
+    delete form.advanced[oldKey];
+    form.advanced[newKey] = val;
+    renderBody();
+  };
+
+  window.updateKVVal = (idx, newVal) => {
+    const k = Object.keys(form.advanced)[idx];
+    form.advanced[k] = newVal;
+  };
+
+  window.rmKV = (idx) => {
+    delete form.advanced[Object.keys(form.advanced)[idx]];
+    renderBody();
+  };
+
+  window.addKV = () => {
+    form.advanced['key'] = '';
+    renderBody();
+  };
 
   function submit() {
     let payloadObj = form;
@@ -577,8 +591,15 @@ function openConfigDialog(editName = null, initialData = null) {
       try {
         const parsed = JSON.parse(jsonCache);
         form = { ...form, ...parsed };
-        form.transport = form.transport || {};
-        form.advanced = form.advanced || {};
+        if (parsed.transport) {
+            if (parsed.type === 'multi') {
+                multiStrategy = parsed.transport.strategy || 'flowmux';
+                multiSubflows = parsed.transport.transports || [];
+            } else {
+                fieldValues = parsed.transport;
+            }
+        }
+        selectedKind = parsed.type || 'yandex';
       } catch (e) {
         toast('Invalid JSON, cannot switch to form', 'error');
         return false;
@@ -590,13 +611,6 @@ function openConfigDialog(editName = null, initialData = null) {
   };
 
   renderBody();
-}
-
-function parseVal(v) {
-  if (v === 'true') return true;
-  if (v === 'false') return false;
-  if (v !== '' && !isNaN(v)) return Number(v);
-  return v;
 }
 
 function openModal({ title, body = '', actions = [], tabs = [] }) {

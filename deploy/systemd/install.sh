@@ -100,22 +100,8 @@ install -d -m 0755 "$PREFIX/bin"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-panel"  "$PREFIX/bin/shampoore-panel"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-server" "$PREFIX/bin/shampoore-server"
 
-log "preparing state directories"
+log "preparing state directory"
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 0755 "$STATE_DIR/configs"
-install -d -o "$USER_NAME" -g "$USER_NAME" -m 0755 "$STATE_DIR/examples"
-
-if [ -d "$SRC_DIR/examples" ]; then
-    log "installing examples into $STATE_DIR/examples (existing files kept)"
-    shopt -s nullglob
-    for f in "$SRC_DIR"/examples/*.json.example; do
-        dst="$STATE_DIR/examples/$(basename "$f")"
-        if [ ! -e "$dst" ]; then
-            install -o "$USER_NAME" -g "$USER_NAME" -m 0644 "$f" "$dst"
-            log "  + $(basename "$f")"
-        fi
-    done
-    shopt -u nullglob
-fi
 
 if [ -f "$SRC_DIR/uninstall.sh" ]; then
     install -o root -g root -m 0755 "$SRC_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
@@ -166,8 +152,7 @@ if systemctl is-active --quiet shampoore; then
 
     logs:      journalctl -u shampoore -f
     configs:   $STATE_DIR/configs/
-    examples:  $STATE_DIR/examples/
-    uninstall: sudo $PREFIX/uninstall.sh [--purge]
+    uninstall: sudo $PREFIX/uninstall.sh --purge
 
 EOF
 else

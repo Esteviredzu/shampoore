@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/livekit/protocol/auth"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/names"
 )
 
 type Provider struct {
@@ -46,7 +46,7 @@ func NewProvider(
 
 	identity := cfg.Identity
 	if identity == "" {
-		identity = uuid.NewString()
+		identity = names.Random()
 	}
 
 	p := &Provider{

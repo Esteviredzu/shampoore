@@ -39,6 +39,7 @@ func init() {
 	err := app.RegisterDescriptor(app.Descriptor{
 		Kind:        "multi",
 		DisplayName: "MultiPipe",
+		Description: "Aggregate multiple transports",
 		DecodeURL:   decodeURL,
 		EncodeURL:   encodeURL,
 		Defaults: app.Values{

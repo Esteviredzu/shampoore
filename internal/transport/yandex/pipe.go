@@ -81,6 +81,12 @@ func NewYandexPipe(client *BoardClient, logger logging.ContextLogger, cfg PipeCo
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 65536
 	}
+	if cfg.SendBatch <= 0 {
+		cfg.SendBatch = 32
+	}
+	if cfg.DeleteBatch <= 0 {
+		cfg.DeleteBatch = 512
+	}
 	return &YandexPipe{
 		client:         client,
 		logger:         logger,
@@ -222,38 +228,63 @@ func (p *YandexPipe) flushOutboundLocked(ctx context.Context) error {
 		return nil
 	}
 
-	objects := make([]map[string]any, 0, len(p.outboundBuf))
-	valueChanges := make(map[string]bool, len(p.outboundBuf))
-	var wire int64
-	for _, id := range p.outboundOrder {
-		value, ok := p.outboundBuf[id]
-		if !ok {
+	batchSize := p.cfg.SendBatch
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+
+	for len(p.outboundOrder) > 0 {
+		n := batchSize
+		if n > len(p.outboundOrder) {
+			n = len(p.outboundOrder)
+		}
+
+		objects := make([]map[string]any, 0, n)
+		valueChanges := make(map[string]bool, n)
+		ids := make([]string, 0, n)
+		var wire int64
+
+		for _, id := range p.outboundOrder[:n] {
+			value, ok := p.outboundBuf[id]
+			if !ok {
+				continue
+			}
+			obj := createBoardObject(
+				id, value,
+				p.client.creds.Participant,
+				p.client.creds.Dashboard,
+			)
+			objects = append(objects, obj)
+			valueChanges[id] = false
+			ids = append(ids, id)
+			if b, err := json.Marshal(obj); err == nil {
+				wire += int64(len(b))
+			}
+		}
+
+		if len(objects) == 0 {
+			p.outboundOrder = p.outboundOrder[n:]
 			continue
 		}
-		obj := createBoardObject(
-			id, value,
-			p.client.creds.Participant,
-			p.client.creds.Dashboard,
-		)
-		objects = append(objects, obj)
-		valueChanges[id] = false
-		if b, err := json.Marshal(obj); err == nil {
-			wire += int64(len(b))
+
+		cnt := len(objects)
+		if _, err := p.client.SendObjects(ctx, objects, valueChanges, false); err != nil {
+			p.logger.Warn("yandex-pipe: outbound flush failed (",
+				cnt, " objects): ", err)
+			return err
+		}
+
+		p.ctr.NetworkSent.Add(wire)
+		p.ctr.FramesSent.Add(int64(cnt))
+
+		for _, id := range ids {
+			delete(p.outboundBuf, id)
+		}
+		p.outboundOrder = p.outboundOrder[n:]
+		if len(p.outboundOrder) == 0 {
+			p.outboundOrder = nil
 		}
 	}
-
-	p.outboundBuf = make(map[string]string)
-	p.outboundOrder = nil
-
-	n := len(objects)
-	if _, err := p.client.SendObjects(ctx, objects, valueChanges, false); err != nil {
-		p.logger.Warn("yandex-pipe: outbound flush failed (",
-			n, " objects): ", err)
-		return err
-	}
-
-	p.ctr.NetworkSent.Add(wire)
-	p.ctr.FramesSent.Add(int64(n))
 	return nil
 }
 
@@ -353,21 +384,39 @@ func (p *YandexPipe) flushDeletesLocked(ctx context.Context) error {
 	if len(p.deleteBuf) == 0 {
 		return nil
 	}
-	ids := p.deleteBuf
-	p.deleteBuf = nil
 
-	objects := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		objects = append(objects, createBoardObject(
-			id, "",
-			p.client.creds.Participant,
-			p.client.creds.Dashboard,
-		))
+	batchSize := p.cfg.DeleteBatch
+	if batchSize <= 0 {
+		batchSize = 512
 	}
 
-	if err := p.client.DropObjects(ctx, objects); err != nil {
-		p.logger.Warn("yandex-pipe: drop batch failed (", len(ids), " objects): ", err)
-		return err
+	for len(p.deleteBuf) > 0 {
+		n := batchSize
+		if n > len(p.deleteBuf) {
+			n = len(p.deleteBuf)
+		}
+
+		ids := make([]string, n)
+		copy(ids, p.deleteBuf[:n])
+
+		objects := make([]map[string]any, 0, n)
+		for _, id := range ids {
+			objects = append(objects, createBoardObject(
+				id, "",
+				p.client.creds.Participant,
+				p.client.creds.Dashboard,
+			))
+		}
+
+		if err := p.client.DropObjects(ctx, objects); err != nil {
+			p.logger.Warn("yandex-pipe: drop batch failed (", n, " objects): ", err)
+			return err
+		}
+
+		p.deleteBuf = p.deleteBuf[n:]
+		if len(p.deleteBuf) == 0 {
+			p.deleteBuf = nil
+		}
 	}
 	return nil
 }

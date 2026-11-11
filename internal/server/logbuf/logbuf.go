@@ -1,6 +1,9 @@
 package logbuf
 
-import "sync"
+import (
+	"bytes"
+	"sync"
+)
 
 type Ring struct {
 	mu    sync.Mutex
@@ -19,20 +22,30 @@ func New(max int) *Ring {
 func (r *Ring) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, b := range p {
-		if b == '\n' {
-			if len(r.buf) > 0 {
-				r.lines = append(r.lines, string(r.buf))
-				if len(r.lines) > r.max {
-					r.lines = r.lines[1:]
-				}
-				r.buf = r.buf[:0]
-			}
-		} else {
-			r.buf = append(r.buf, b)
+	n := len(p)
+	for len(p) > 0 {
+		idx := bytes.IndexByte(p, '\n')
+		if idx < 0 {
+			r.buf = append(r.buf, p...)
+			break
 		}
+		if len(r.buf) == 0 {
+			r.push(string(p[:idx]))
+		} else {
+			r.buf = append(r.buf, p[:idx]...)
+			r.push(string(r.buf))
+			r.buf = r.buf[:0]
+		}
+		p = p[idx+1:]
 	}
-	return len(p), nil
+	return n, nil
+}
+
+func (r *Ring) push(line string) {
+	r.lines = append(r.lines, line)
+	if len(r.lines) > r.max {
+		r.lines = r.lines[1:]
+	}
 }
 
 func (r *Ring) Lines(limit int) []string {

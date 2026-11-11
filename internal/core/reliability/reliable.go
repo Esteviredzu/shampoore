@@ -22,8 +22,8 @@ const (
 	retryScanInterval  = 100 * time.Millisecond
 	maxReorderDistance = 256
 	defaultWindow      = 64
-
-	sendWindowTimeout = 10 * time.Second
+	sendWindowTimeout  = 10 * time.Second
+	sessionCooldown    = 5 * time.Second
 )
 
 type Config struct {
@@ -67,6 +67,7 @@ type ReliableSession struct {
 
 	remoteMu                 sync.Mutex
 	remoteSessionID          string
+	lastSessionChange        time.Time
 	unexpectedRemoteSessions map[string]bool
 
 	sendMu           sync.Mutex
@@ -513,60 +514,85 @@ func (s *ReliableSession) receiveLoop() {
 		if pkt == nil {
 			continue
 		}
-		if err := s.dispatch(pkt); err != nil {
-			s.logger.Warn("reliable: dispatch error: ", err)
-			s.signalTransportReset(err.Error())
-			return
-		}
+		s.dispatch(pkt)
 	}
 }
 
-func (s *ReliableSession) dispatch(pkt *DecodedPacket) error {
+func (s *ReliableSession) dispatch(pkt *DecodedPacket) {
 	if pkt.Kind == "data" {
 		if pkt.SessionID == s.ownSessionID {
-			return nil
+			return
 		}
 		key := fmt.Sprintf("d:%s:%d:%d",
 			pkt.SessionID, pkt.Sequence, pkt.ChunkIndex)
-		err := s.acceptRemoteSession(pkt.SessionID)
-		if err == nil {
+		if s.acceptRemoteSession(pkt.SessionID) {
 			s.processChunk(pkt)
 		}
 		s.safeDelete(key)
-		return err
+		return
 	}
 
 	if pkt.Kind == "ack" {
 		if pkt.SessionID != s.ownSessionID {
-			return nil
+			return
 		}
 		key := fmt.Sprintf("a:%s:%s:%d",
 			pkt.SenderSessionID, pkt.SessionID, pkt.Sequence)
-		err := s.acceptRemoteSession(pkt.SenderSessionID)
-		if err == nil {
+		if s.acceptRemoteSession(pkt.SenderSessionID) {
 			s.processACK(pkt.Sequence)
 		}
 		s.safeDelete(key)
-		return err
 	}
-	return nil
 }
 
-func (s *ReliableSession) acceptRemoteSession(sessionID string) error {
+func (s *ReliableSession) acceptRemoteSession(sessionID string) bool {
 	s.remoteMu.Lock()
-	defer s.remoteMu.Unlock()
 	if s.remoteSessionID == "" {
 		s.remoteSessionID = sessionID
-		return nil
+		s.remoteMu.Unlock()
+		return true
 	}
 	if sessionID == s.remoteSessionID {
-		return nil
+		s.remoteMu.Unlock()
+		return true
 	}
+	now := time.Now()
+	if !s.lastSessionChange.IsZero() && now.Sub(s.lastSessionChange) < sessionCooldown {
+		s.remoteMu.Unlock()
+		return false
+	}
+	oldID := s.remoteSessionID
+	s.remoteSessionID = sessionID
+	s.lastSessionChange = now
 	if !s.unexpectedRemoteSessions[sessionID] {
 		s.unexpectedRemoteSessions[sessionID] = true
-		s.logger.Warn("reliable: remote session changed")
 	}
-	return fmt.Errorf("remote session changed to %s", sessionID)
+	s.remoteMu.Unlock()
+
+	s.logger.Warn("reliable: remote session changed from ", oldID, " to ", sessionID)
+	s.resetForNewRemoteSession()
+	return true
+}
+
+func (s *ReliableSession) resetForNewRemoteSession() {
+	s.recvMu.Lock()
+	s.incomingChunks = make(map[int]map[int][]byte)
+	s.incomingTotals = make(map[int]int)
+	s.completedPackets = make(map[int][]byte)
+	s.ackDirty = false
+	s.nextReceiveSequence = 0
+	s.nextACKSequence = 0
+	s.recvMu.Unlock()
+
+	s.sendMu.Lock()
+	s.pendingPackets = make(map[int]*pendingPacket)
+	s.nextSendSequence = 0
+	s.sendMu.Unlock()
+
+	select {
+	case s.spaceCh <- struct{}{}:
+	default:
+	}
 }
 
 func (s *ReliableSession) processACK(sequence int) {
@@ -691,8 +717,8 @@ func (s *ReliableSession) flushCompletedLocked(sessionID string) {
 		}
 		select {
 		case s.receiveQueue <- pkt:
-		default:
-			s.receiveQueue <- pkt
+		case <-s.ctx.Done():
+			return
 		}
 		s.nextReceiveSequence++
 	}
@@ -718,10 +744,13 @@ func (s *ReliableSession) signalTransportReset(reason string) {
 	s.incomingTotals = make(map[int]int)
 	s.completedPackets = make(map[int][]byte)
 	s.ackDirty = false
+	s.nextReceiveSequence = 0
+	s.nextACKSequence = 0
 	s.recvMu.Unlock()
 
 	s.sendMu.Lock()
 	s.pendingPackets = make(map[int]*pendingPacket)
+	s.nextSendSequence = 0
 	s.sendMu.Unlock()
 
 	select {
@@ -732,10 +761,6 @@ func (s *ReliableSession) signalTransportReset(reason string) {
 	s.remoteMu.Lock()
 	s.remoteSessionID = ""
 	s.remoteMu.Unlock()
-
-	s.nextSendSequence = 0
-	s.nextReceiveSequence = 0
-	s.nextACKSequence = 0
 
 	for {
 		select {

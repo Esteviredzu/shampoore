@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -13,8 +14,23 @@ const (
 )
 
 func ParseSource(src string) (*Settings, error) {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return nil, fmt.Errorf("app: empty source")
+	}
 	if strings.HasPrefix(src, URLScheme+"://") {
 		return ParseURL(src)
+	}
+	if strings.HasPrefix(src, "{") {
+		var s Settings
+		if err := json.Unmarshal([]byte(src), &s); err != nil {
+			return nil, fmt.Errorf("app: parse json: %w", err)
+		}
+		if err := s.ApplyDefaults(); err != nil {
+			return nil, err
+		}
+		s.IPv4Only = IPv4Only
+		return &s, nil
 	}
 	return Load(src)
 }

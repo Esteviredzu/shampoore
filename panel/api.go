@@ -27,22 +27,20 @@ import (
 var staticFS embed.FS
 
 type API struct {
-	client      *control.Client
-	sup         ServerManager
-	logger      *logging.Logger
-	token       string
-	examplesDir string
-	configsDir  string
+	client     *control.Client
+	sup        ServerManager
+	logger     *logging.Logger
+	token      string
+	configsDir string
 }
 
-func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, examplesDir, configsDir string) *API {
+func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string) *API {
 	return &API{
-		client:      client,
-		sup:         sup,
-		logger:      logger,
-		token:       token,
-		examplesDir: examplesDir,
-		configsDir:  configsDir,
+		client:     client,
+		sup:        sup,
+		logger:     logger,
+		token:      token,
+		configsDir: configsDir,
 	}
 }
 
@@ -323,7 +321,7 @@ func (a *API) statsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) templates(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, LoadTemplates(a.examplesDir))
+	writeJSON(w, 200, LoadTemplates())
 }
 
 func (a *API) list(w http.ResponseWriter, _ *http.Request) {
@@ -522,16 +520,16 @@ func (a *API) update(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, fmt.Errorf("settings required"))
 			return
 		}
-		
+
 		newName := entry.Settings.Name
 		if newName == "" {
 			newName = name
 		}
 		entry.Settings.Name = newName
 		entry.Settings.ApplyDefaults()
-		
+
 		data, _ := json.MarshalIndent(entry.Settings, "", "  ")
-		
+
 		if newName != name {
 			oldPath := path
 			newPath := filepath.Join(a.configsDir, sanitizeName(newName)+".json")
@@ -540,7 +538,7 @@ func (a *API) update(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			os.Remove(oldPath)
-			
+
 			st, _ := manager.LoadState(a.configsDir)
 			if st != nil {
 				wasEnabled := st.IsEnabled(name)
