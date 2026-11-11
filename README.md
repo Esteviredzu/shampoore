@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/Esteviredzu/shampoore/releases"><img src="https://img.shields.io/github/v/release/Esteviredzu/shampoore?style=flat-square" alt="Release"></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go" alt="Go Version"></a>
-  <a href="https://github.com/Esteviredzu/shampoore/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Esteviredzu/shampoore?style=flat-square" alt="License"></a>
+  <a href="https://github.com/Esteviredzu/shampoore/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-GPL-green?style=flat-square" alt="License"></a>
 </p>
 
 ---
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/Esteviredzu/shampoore/releases/latest/download/ins
 
 ### Доступ к панели
 
-По умолчанию панель слушает `127.0.0.1:8080` и недоступна извне. Для безопасного доступа используйте SSH-туннель с вашего локального компьютера:
+По умолчанию панель слушает `127.0.0.1:8080` и недоступна извне. Для безопасного доступа используйте SSH-туннель
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 user@your-server
