@@ -23,8 +23,6 @@ const (
 	maxReorderDistance = 256
 	defaultWindow      = 64
 
-	sendWindowPollInterval = 5 * time.Millisecond
-
 	sendWindowTimeout = 10 * time.Second
 )
 
@@ -72,9 +70,9 @@ type ReliableSession struct {
 	unexpectedRemoteSessions map[string]bool
 
 	sendMu           sync.Mutex
-	sendCond         *sync.Cond
 	pendingPackets   map[int]*pendingPacket
 	nextSendSequence int
+	spaceCh          chan struct{}
 
 	wakeRetry chan struct{}
 
@@ -145,13 +143,13 @@ func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Conf
 		cfg:                      cfg,
 		unexpectedRemoteSessions: make(map[string]bool),
 		pendingPackets:           make(map[int]*pendingPacket),
+		spaceCh:                  make(chan struct{}, 1),
 		incomingChunks:           make(map[int]map[int][]byte),
 		incomingTotals:           make(map[int]int),
 		completedPackets:         make(map[int][]byte),
 		receiveQueue:             make(chan any, 512),
 		wakeRetry:                make(chan struct{}, 1),
 	}
-	s.sendCond = sync.NewCond(&s.sendMu)
 	s.ackCond = sync.NewCond(&s.recvMu)
 
 	if cfg.AckDisabled {
@@ -225,7 +223,6 @@ func (s *ReliableSession) Stop(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
-	s.sendCond.Broadcast()
 	s.sendMu.Unlock()
 
 	s.recvMu.Lock()
@@ -253,25 +250,34 @@ func (s *ReliableSession) Send(ctx context.Context, data []byte) error {
 
 	deadline := time.Now().Add(sendWindowTimeout)
 
-	s.sendMu.Lock()
-	for len(s.pendingPackets) >= s.cfg.Window {
+	for {
+		s.sendMu.Lock()
 		if s.closed {
 			s.sendMu.Unlock()
 			return errors.New("reliable: session closed")
 		}
-		if time.Now().After(deadline) {
-			s.sendMu.Unlock()
-			return errors.New("reliable: send window timeout")
+		if len(s.pendingPackets) < s.cfg.Window {
+			break
 		}
 		s.sendMu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(sendWindowPollInterval):
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return errors.New("reliable: send window timeout")
 		}
-
-		s.sendMu.Lock()
+		timer := time.NewTimer(remain)
+		select {
+		case <-s.spaceCh:
+			timer.Stop()
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-s.ctx.Done():
+			timer.Stop()
+			return errors.New("reliable: session closed")
+		case <-timer.C:
+			return errors.New("reliable: send window timeout")
+		}
 	}
 
 	seq := s.nextSendSequence
@@ -573,8 +579,12 @@ func (s *ReliableSession) processACK(sequence int) {
 			delete(s.pendingPackets, seq)
 		}
 	}
-	s.sendCond.Broadcast()
 	s.sendMu.Unlock()
+
+	select {
+	case s.spaceCh <- struct{}{}:
+	default:
+	}
 
 	for _, keys := range freed {
 		for _, key := range keys {
@@ -712,8 +722,12 @@ func (s *ReliableSession) signalTransportReset(reason string) {
 
 	s.sendMu.Lock()
 	s.pendingPackets = make(map[int]*pendingPacket)
-	s.sendCond.Broadcast()
 	s.sendMu.Unlock()
+
+	select {
+	case s.spaceCh <- struct{}{}:
+	default:
+	}
 
 	s.remoteMu.Lock()
 	s.remoteSessionID = ""

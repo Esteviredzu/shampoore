@@ -42,6 +42,7 @@ type BoardClient struct {
 
 	mu         sync.Mutex
 	ws         *websocket.Conn
+	writeMu    sync.Mutex
 	connected  bool
 	closing    bool
 	generation int
@@ -204,6 +205,8 @@ func (c *BoardClient) sendRaw(ctx context.Context, data string) error {
 	if ws == nil {
 		return errors.New("websocket not connected")
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.logger.Trace(">>> RAW: ", data)
 	return ws.Write(ctx, websocket.MessageText, []byte(data))
 }

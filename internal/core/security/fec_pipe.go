@@ -93,6 +93,10 @@ func (p *FECPipe) SendMessage(ctx context.Context, data []byte, key string) erro
 	p.mu.Lock()
 	seq := p.seq
 	p.seq++
+	if p.seq == 0 {
+		p.mu.Unlock()
+		return errors.New("fec-pipe: sequence overflow; restart session")
+	}
 	p.mu.Unlock()
 
 	total := len(shards)

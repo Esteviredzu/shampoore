@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,10 +20,11 @@ type Template struct {
 }
 
 func LoadTemplates(dir string) []Template {
-	var out []Template
+	out := make([]Template, 0)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		log.Printf("[panel] templates: cannot read %q: %v", dir, err)
+		return out
 	}
 
 	descs := make(map[string]app.Descriptor)
@@ -34,9 +36,9 @@ func LoadTemplates(dir string) []Template {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json.example") {
 			continue
 		}
-
 		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
+			log.Printf("[panel] templates: read %s: %v", e.Name(), err)
 			continue
 		}
 
@@ -44,6 +46,7 @@ func LoadTemplates(dir string) []Template {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
+			log.Printf("[panel] templates: parse %s: %v", e.Name(), err)
 			continue
 		}
 

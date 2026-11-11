@@ -18,7 +18,10 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
-const resetCooldown = 2 * time.Second
+const (
+	resetCooldown    = 2 * time.Second
+	maxPendingOutput = 4096
+)
 
 type Config struct {
 	Conv     uint32
@@ -222,9 +225,14 @@ func (s *Session) output(buf []byte, size int) {
 		key := uuid.NewString()
 		if err := s.pipe.SendMessage(s.ctx, data, key); err != nil {
 			s.outMu.Lock()
-			s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
-			s.outMu.Unlock()
-			s.logger.Debug("kcp: output deferred: ", err)
+			if len(s.pendingOutput) >= maxPendingOutput {
+				s.outMu.Unlock()
+				s.logger.Warn("kcp: pendingOutput overflow; dropping chunk (KCP will retransmit)")
+			} else {
+				s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
+				s.outMu.Unlock()
+				s.logger.Debug("kcp: output deferred: ", err)
+			}
 			continue
 		}
 		s.ctr.NetworkSent.Add(int64(len(data)))

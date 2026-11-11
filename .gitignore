@@ -5,8 +5,8 @@ configs/.state.json
 
 shampoore.aar
 shampoore-sources.jar
-speedtest-all.sh
 
+/dist/
 *.log
 
 .vscode/

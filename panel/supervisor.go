@@ -23,6 +23,7 @@ type ServerManager interface {
 type Supervisor struct {
 	mu         sync.Mutex
 	cmd        *exec.Cmd
+	waitCh     chan struct{}
 	sockPath   string
 	configsDir string
 	logRing    *logbuf.Ring
@@ -63,6 +64,8 @@ func (s *Supervisor) Start() error {
 		return nil
 	}
 
+	_ = os.Remove(s.sockPath)
+
 	bin := "shampoore-server"
 	exe, _ := os.Executable()
 	dir := filepath.Dir(exe)
@@ -95,7 +98,19 @@ func (s *Supervisor) Start() error {
 	}
 	s.cmd = cmd
 
-	for i := 0; i < 50; i++ {
+	waitCh := make(chan struct{})
+	s.waitCh = waitCh
+	go func(c *exec.Cmd, ch chan struct{}) {
+		_ = c.Wait()
+		close(ch)
+		s.mu.Lock()
+		if s.cmd == c {
+			s.cmd = nil
+		}
+		s.mu.Unlock()
+	}(cmd, waitCh)
+
+	for i := 0; i < 100; i++ {
 		if _, err := os.Stat(s.sockPath); err == nil {
 			return nil
 		}
@@ -106,23 +121,40 @@ func (s *Supervisor) Start() error {
 
 func (s *Supervisor) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	cmd := s.cmd
+	waitCh := s.waitCh
+	s.mu.Unlock()
 
-	if s.isRunningLocked() {
+	if s.IsRunning() {
 		c := control.NewClient(s.sockPath)
 		_ = c.Shutdown()
-		for i := 0; i < 30; i++ {
-			if !s.isRunningLocked() {
+		for i := 0; i < 50; i++ {
+			if !s.IsRunning() {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Signal(syscall.SIGKILL)
-		s.cmd = nil
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if waitCh != nil {
+			select {
+			case <-waitCh:
+			case <-time.After(3 * time.Second):
+				_ = cmd.Process.Signal(syscall.SIGKILL)
+				select {
+				case <-waitCh:
+				case <-time.After(time.Second):
+				}
+			}
+		}
 	}
+
+	s.mu.Lock()
+	s.cmd = nil
+	s.waitCh = nil
+	s.mu.Unlock()
 
 	_ = os.Remove(s.sockPath)
 	return nil

@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -66,12 +67,18 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/configs/{name}/restart", a.restart)
 	mux.HandleFunc("GET /api/configs/{name}/logs", a.logs)
 
-	sub, _ := fs.Sub(staticFS, "static")
+	sub, err := fs.Sub(staticFS, "static")
+	if err != nil {
+
+		a.logger.Warn("panel: static dir missing from embed: ", err)
+		sub = staticFS
+	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.token != "" && strings.HasPrefix(r.URL.Path, "/api/") {
-			if r.Header.Get("X-Panel-Token") != a.token {
+			got := r.Header.Get("X-Panel-Token")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -394,8 +401,16 @@ func (a *API) add(w http.ResponseWriter, r *http.Request) {
 
 		safe := sanitizeName(req.Name)
 		path := filepath.Join(a.configsDir, safe+".json")
+
+		cleanBase := filepath.Clean(a.configsDir) + string(os.PathSeparator)
+		cleanPath := filepath.Clean(path)
+		if !strings.HasPrefix(cleanPath, cleanBase) {
+			writeErr(w, 400, fmt.Errorf("invalid name"))
+			return
+		}
+
 		data, _ := json.MarshalIndent(settings, "", "  ")
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(cleanPath, data, 0644); err != nil {
 			writeErr(w, 500, err)
 			return
 		}

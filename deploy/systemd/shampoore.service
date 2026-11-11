@@ -1,0 +1,37 @@
+[Unit]
+Description=Shampoore panel and VPN server
+Documentation=https://github.com/Esteviredzu/shampoore-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shampoore
+Group=shampoore
+WorkingDirectory=/var/lib/shampoore
+
+EnvironmentFile=/etc/shampoore/panel.env
+
+ExecStart=/opt/shampoore/bin/shampoore-panel \
+    --listen=${PANEL_LISTEN} \
+    --socket=/run/shampoore/shampoore.sock \
+    --configs-dir=/var/lib/shampoore/configs \
+    --examples=/var/lib/shampoore/examples \
+    --token=${PANEL_TOKEN} \
+    --auto-start-server
+
+Restart=on-failure
+RestartSec=3s
+
+RuntimeDirectory=shampoore
+RuntimeDirectoryMode=0750
+StateDirectory=shampoore
+StateDirectoryMode=0755
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

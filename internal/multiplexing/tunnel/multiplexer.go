@@ -15,6 +15,8 @@ import (
 	"github.com/Esteviredzu/shampoore-core/internal/transport"
 )
 
+const maxOutboundBuf = 64 * 1024 * 1024
+
 type Config struct {
 	FlushThreshold int
 	FlushInterval  time.Duration
@@ -228,6 +230,12 @@ func (m *TunnelMultiplexer) enqueueFrame(ctx context.Context, f *TunnelFrame) er
 	}
 
 	m.outboundMu.Lock()
+	if len(m.outboundBuf)+len(encoded) > maxOutboundBuf {
+		bufLen := len(m.outboundBuf)
+		m.outboundMu.Unlock()
+		return fmt.Errorf("tunnel: outbound buffer overflow (%d + %d > %d)",
+			bufLen, len(encoded), maxOutboundBuf)
+	}
 	m.outboundBuf = append(m.outboundBuf, encoded...)
 	size := len(m.outboundBuf)
 	m.outboundMu.Unlock()

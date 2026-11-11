@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -15,8 +16,9 @@ import (
 )
 
 const (
-	maxValueSize  = 15000
-	statsInterval = 5 * time.Second
+	maxValueSize     = 15000
+	maxOutboundBatch = 8192
+	statsInterval    = 5 * time.Second
 )
 
 type PipeConfig struct {
@@ -148,6 +150,10 @@ func (p *YandexPipe) SendMessage(ctx context.Context, data []byte, key string) e
 
 	p.outboundMu.Lock()
 	if _, exists := p.outboundBuf[objectID]; !exists {
+		if len(p.outboundBuf) >= maxOutboundBatch {
+			p.outboundMu.Unlock()
+			return errors.New("yandex-pipe: outbound batch overflow")
+		}
 		p.outboundOrder = append(p.outboundOrder, objectID)
 	}
 	p.outboundBuf[objectID] = value
