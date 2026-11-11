@@ -33,6 +33,8 @@ print_banner
 
 cd "$(dirname "$0")"
 
+REPO="Esteviredzu/shampoore"
+
 VERSION_RAW="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 VERSION="${VERSION_RAW#v}"
 if [ -z "$VERSION" ]; then
@@ -99,7 +101,6 @@ chmod +x "$DIST/install.sh" "$DIST/uninstall.sh"
 # --- Android AAR (optional, gracefully skipped) ---------------------------
 AAR_BUILT=0
 
-# auto-discover Android SDK if not in env
 if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ]; then
     for d in "$HOME/Android/Sdk" "$HOME/Android/sdk" "$HOME/android-sdk" "/opt/android-sdk" "/usr/lib/android-sdk"; do
         if [ -d "$d/cmdline-tools" ] || [ -d "$d/platform-tools" ]; then
@@ -109,7 +110,6 @@ if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ]; then
     done
 fi
 
-# auto-discover NDK if not in env
 if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
     NDK_LATEST="$(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | sort -V | tail -n1 || true)"
     if [ -n "$NDK_LATEST" ]; then
@@ -144,7 +144,6 @@ else
     log "  ANDROID_NDK_HOME: ${ANDROID_NDK_HOME:-<unset>}"
 fi
 
-# --- checksums ------------------------------------------------------------
 log "generating SHA256SUMS"
 (
     cd "$DIST"
