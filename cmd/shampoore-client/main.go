@@ -21,6 +21,7 @@ import (
 	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_raw"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_squares"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/silo"
 )
 
 func main() {
