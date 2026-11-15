@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
+	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -32,14 +35,31 @@ type Pipe struct {
 	sendCh chan []byte
 	recvCh chan []byte
 
+	lastKeyMu sync.Mutex
+	lastKey   string
+
 	ctr transport.Counters
 	wg  sync.WaitGroup
 }
 
 func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	cl, err := minio.New(cfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseSSL,
+		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure:    cfg.UseSSL,
+		Transport: tr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("silo: create client: %w", err)
@@ -148,10 +168,6 @@ func (p *Pipe) sendLoop() {
 		if len(buffer) == 0 {
 			return
 		}
-		if p.cfg.JitterMs > 0 {
-			j := time.Duration(rand.Intn(p.cfg.JitterMs)) * time.Millisecond
-			time.Sleep(j)
-		}
 		p.upload(buffer)
 		buffer = buffer[:0]
 		targetSize = rand.Intn(maxB-minB+1) + minB
@@ -200,7 +216,7 @@ func (p *Pipe) upload(buf []byte) {
 
 func (p *Pipe) receiveLoop() {
 	defer p.wg.Done()
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(time.Duration(p.cfg.PollIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -214,55 +230,88 @@ func (p *Pipe) receiveLoop() {
 }
 
 func (p *Pipe) pollOnce() {
-	objectCh := p.client.ListObjects(p.ctx, p.cfg.Bucket, minio.ListObjectsOptions{
+	p.lastKeyMu.Lock()
+	startAfter := p.lastKey
+	p.lastKeyMu.Unlock()
+
+	opts := minio.ListObjectsOptions{
 		Prefix:    p.readPrefix,
 		Recursive: true,
-	})
+	}
+	if startAfter != "" {
+		opts.StartAfter = startAfter
+	}
+
+	var keys []string
+	objectCh := p.client.ListObjects(p.ctx, p.cfg.Bucket, opts)
 
 	for object := range objectCh {
 		if object.Err != nil {
 			continue
 		}
-
-		objReader, err := p.client.GetObject(p.ctx, p.cfg.Bucket, object.Key, minio.GetObjectOptions{})
-		if err != nil {
+		if time.Since(object.LastModified) > 30*time.Second {
+			_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, object.Key, minio.RemoveObjectOptions{})
 			continue
 		}
+		keys = append(keys, object.Key)
+	}
 
-		data, err := io.ReadAll(objReader)
-		objReader.Close()
+	if len(keys) == 0 {
+		return
+	}
 
-		_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, object.Key, minio.RemoveObjectOptions{})
+	sort.Strings(keys)
 
-		if err != nil || len(data) == 0 {
-			continue
+	for _, key := range keys {
+		p.processFile(key)
+
+		p.lastKeyMu.Lock()
+		if key > p.lastKey {
+			p.lastKey = key
+		}
+		p.lastKeyMu.Unlock()
+	}
+}
+
+func (p *Pipe) processFile(key string) {
+	objReader, err := p.client.GetObject(p.ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{})
+		return
+	}
+	data, err := io.ReadAll(objReader)
+	objReader.Close()
+
+	_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{})
+
+	if err != nil || len(data) == 0 {
+		return
+	}
+
+	p.ctr.NetworkRecv.Add(int64(len(data)))
+
+	offset := 0
+	for offset+4 <= len(data) {
+		msgLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		offset += 4
+
+		if offset+msgLen > len(data) {
+			break
 		}
 
-		p.ctr.NetworkRecv.Add(int64(len(data)))
+		msgData := data[offset : offset+msgLen]
+		offset += msgLen
 
-		offset := 0
-		for offset+4 <= len(data) {
-			msgLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-			offset += 4
+		out := make([]byte, len(msgData))
+		copy(out, msgData)
 
-			if offset+msgLen > len(data) {
-				break
-			}
+		p.ctr.UsefulRecv.Add(int64(len(out)))
+		p.ctr.MessagesRecv.Add(1)
 
-			msgData := data[offset : offset+msgLen]
-			offset += msgLen
-
-			out := make([]byte, len(msgData))
-			copy(out, msgData)
-
-			p.ctr.UsefulRecv.Add(int64(len(out)))
-			p.ctr.MessagesRecv.Add(1)
-
-			select {
-			case p.recvCh <- out:
-			case <-p.ctx.Done():
-				return
-			}
+		select {
+		case p.recvCh <- out:
+		case <-p.ctx.Done():
+			return
 		}
 	}
 }

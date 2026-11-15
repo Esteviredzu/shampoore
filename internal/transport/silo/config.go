@@ -13,22 +13,22 @@ type Config struct {
 	UseSSL    bool   `json:"use_ssl"`
 	TunnelID  string `json:"tunnel_id"`
 
-	MinFileSizeKB int `json:"min_file_size_kb"`
-	MaxFileSizeKB int `json:"max_file_size_kb"`
-	FlushMs       int `json:"flush_ms"`
-	JitterMs      int `json:"jitter_ms"`
+	MinFileSizeKB  int `json:"min_file_size_kb"`
+	MaxFileSizeKB  int `json:"max_file_size_kb"`
+	FlushMs        int `json:"flush_ms"`
+	PollIntervalMs int `json:"poll_interval_ms"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Endpoint:      "s3.kakaobaobab.casa",
-		Bucket:        "shampoore-tunnel",
-		UseSSL:        true,
-		TunnelID:      "default",
-		MinFileSizeKB: 10,
-		MaxFileSizeKB: 500,
-		FlushMs:       100,
-		JitterMs:      20,
+		Endpoint:       "s3.kakaobaobab.casa",
+		Bucket:         "shampoore-tunnel",
+		UseSSL:         true,
+		TunnelID:       "default",
+		MinFileSizeKB:  256,
+		MaxFileSizeKB:  512,
+		FlushMs:        50,
+		PollIntervalMs: 10,
 	}
 }
 
@@ -49,7 +49,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("silo: invalid file size bounds (min=%d KB, max=%d KB)", c.MinFileSizeKB, c.MaxFileSizeKB)
 	}
 	if c.FlushMs <= 0 {
-		c.FlushMs = 100
+		c.FlushMs = 50
+	}
+	if c.PollIntervalMs <= 0 {
+		c.PollIntervalMs = 10
 	}
 	return nil
 }
