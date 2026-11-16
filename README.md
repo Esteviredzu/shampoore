@@ -123,10 +123,6 @@ if (err.isNotEmpty()) {
 val statsJson = Mobile.getStats()
 ```
 
-## Лицензия
-
-Проект распространяется под [GNU AGPL v3](LICENSE).
-
 ---
 
-<sub>Вдохновился [olcrtc](https://github.com/openlibrecommunity/olcrtc) и [OpenFlux](https://github.com/p1neapplexpress/OpenFlux) и захотел наколхозить что-то своё.</sub>
+<sub> Я вдохновился [olcrtc](https://github.com/openlibrecommunity/olcrtc) и [OpenFlux](https://github.com/p1neapplexpress/OpenFlux) и захотел наколхозить что-то своё.</sub>
