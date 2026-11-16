@@ -11,41 +11,33 @@
 <p align="center">
   <a href="https://github.com/Esteviredzu/shampoore/releases"><img src="https://img.shields.io/github/v/release/Esteviredzu/shampoore?style=flat-square" alt="Release"></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go" alt="Go Version"></a>
-  <a href="https://github.com/Esteviredzu/shampoore/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-GPL-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/Esteviredzu/shampoore/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--v3-green?style=flat-square" alt="License"></a>
 </p>
+
+> **Дисклеймер:** проект предоставляется «как есть» для исследовательских и образовательных целей. Автор не несёт ответственности за использование в нарушение законодательства или условий сторонних сервисов. Используя код, вы берёте ответственность на себя.
 
 ---
 
 ## Обзор
 
-**shampoore** - это исследовательский инструмент для инкапсуляции трафика в запросы к публичным API (Yandex, LiveKit и др.)
+**shampoore** - это исследовательский инструмент для инкапсуляции трафика в запросы к публичным API.
 
-Проект включает в себя:
-- **shampoore-server** - демон, который принимает туннелированный трафик и перенаправляет его в интернет.
-- **shampoore-panel** - встроенная веб-панель для управления сервером и конфигурациями.
-- **shampoore-client** - CLI-клиент для локального проксирования (SOCKS5 или TUN).
-- **Mobile SDK** - готовый AAR для интеграции в Android-приложения.
+В состав входят: `shampoore-server` (демон), `shampoore-panel` (веб-панель), `shampoore-client` (CLI, SOCKS5/TUN) и Mobile SDK (AAR для Android).
 
 ## Возможности
 
-- **Множество транспортов**:
-  - `yandex` (Yandex Board)
-  - `yandex_telemost_raw` (Telemost + raw VP8)
-  - `yandex_telemost_squares` (Telemost + framing)
-  - `livekit_datachannel` (LiveKit Reliable DataChannel)
-  - `multi` (MultiPipe: агрегация нескольких транспортов через `flowmux` или `bond`)
-- **Безопасность**: Шифрование XChaCha20-Poly1305, FEC (Reed-Solomon) и надежный транспорт на базе KCP.
-- **Веб-панель**: Современный UI в стиле Material 3, управление конфигами, QR-коды для экспорта, мониторинг CPU/RAM.
-- **Режимы клиента**: Локальный SOCKS5-прокси или полноценный VPN (TUN).
+- **Транспорты**: `yandex`, `yandex_telemost_raw`, `yandex_telemost_squares`, `livekit_datachannel`, `silo`, `multi` (агрегация через `flowmux` или `bond`).
+- **Безопасность**: XChaCha20-Poly1305.
+- **Панель**: Material 3 дизайн, управление конфигами, QR-экспорт, мониторинг CPU/RAM.
+- **Клиент**: локальный SOCKS5 или полноценный TUN.
 
 ## Архитектура
 
-Веб-панель не содержит логики туннелирования. Она общается с `shampoore-server` через Unix-сокет.
 ```text
-[ Клиент ] -> [ shampoore-server ] -> [ Публичный сервис (Yandex/LiveKit) ]
-                      ^
-                      | Unix Socket
-                [ shampoore-panel ]
+[ Клиент ] -> [ shampoore-client ] -> [ Кастомный транспорт ] -> [ shampoore-server ] -> [ Интернет ]
+                                                                          ^
+                                                                          | Unix Socket
+                                                                  [ shampoore-panel ]
 ```
 
 ## Установка
@@ -64,7 +56,7 @@ curl -fsSL https://github.com/Esteviredzu/shampoore/releases/latest/download/ins
 
 ### Доступ к панели
 
-По умолчанию панель слушает `127.0.0.1:8080` и недоступна извне. Для безопасного доступа используйте SSH-туннель
+По умолчанию панель слушает `127.0.0.1:8080` и недоступна извне. Для безопасного доступа используйте SSH-туннель:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 user@your-server
@@ -82,7 +74,7 @@ sudo /opt/shampoore/uninstall.sh --purge
 
 ## Использование клиента
 
-Клиент может принимать JSON-файл или URL формата `shampoore://`.
+Клиент может принимать JSON-файл или URL формата `shampoore://`. Конфиг создаётся в панели (вкладка Configs) или экспортируется оттуда как `shampoore://`-ссылка.
 
 ```bash
 # Режим SOCKS5-прокси (по умолчанию на 127.0.0.1:1080)
@@ -109,7 +101,7 @@ go build -o bin/ ./cmd/...
 
 ## Android SDK
 
-Для мобильных приложений доступна скомпилированная библиотека AAR. Скачать её можно из раздела Releases.
+Для мобильных приложений доступна скомпилированная библиотека AAR. Скачайте `shampoore.aar` из раздела Releases и положите в `app/libs/`.
 
 ```kotlin
 // app/build.gradle.kts
@@ -117,6 +109,7 @@ implementation(files("libs/shampoore.aar"))
 ```
 
 Пример инициализации в Kotlin:
+
 ```kotlin
 import mobile.Mobile
 
@@ -130,6 +123,10 @@ if (err.isNotEmpty()) {
 val statsJson = Mobile.getStats()
 ```
 
+## Лицензия
+
+Проект распространяется под [GNU AGPL v3](LICENSE).
+
 ---
 
-Я вдохновился [olcrtc](https://github.com/openlibrecommunity/olcrtc) и [OpenFlux](https://github.com/p1neapplexpress/OpenFlux) и захотел наколхозить что-то своё.
+<sub>Вдохновился [olcrtc](https://github.com/openlibrecommunity/olcrtc) и [OpenFlux](https://github.com/p1neapplexpress/OpenFlux) и захотел наколхозить что-то своё.</sub>
