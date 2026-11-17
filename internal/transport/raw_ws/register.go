@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/logging"
@@ -41,6 +42,20 @@ func init() {
 				Type:     app.FieldTypePassword,
 				Required: true,
 			},
+			{
+				Key:      "batch",
+				Label:    "Batching",
+				Type:     app.FieldTypeBool,
+				Required: false,
+				Hint:     "Combine small messages into larger frames",
+			},
+			{
+				Key:      "padding",
+				Label:    "Padding",
+				Type:     app.FieldTypeBool,
+				Required: false,
+				Hint:     "Add random padding to hide message sizes",
+			},
 		},
 		Defaults:  defaults,
 		DecodeURL: decodeURL,
@@ -56,6 +71,8 @@ type Config struct {
 	ServerURL string `json:"server_url"`
 	Room      string `json:"room"`
 	Password  string `json:"password"`
+	Batch     bool   `json:"batch,omitempty"`
+	Padding   bool   `json:"padding,omitempty"`
 }
 
 func decodeURL(q url.Values) (json.RawMessage, error) {
@@ -65,7 +82,15 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	if serverURL == "" || room == "" || password == "" {
 		return nil, errors.New("raw_ws: server_url, room and password are required")
 	}
-	return json.Marshal(Config{ServerURL: serverURL, Room: room, Password: password})
+	batch, _ := strconv.ParseBool(q.Get("batch"))
+	padding, _ := strconv.ParseBool(q.Get("padding"))
+	return json.Marshal(Config{
+		ServerURL: serverURL,
+		Room:      room,
+		Password:  password,
+		Batch:     batch,
+		Padding:   padding,
+	})
 }
 
 func encodeURL(raw json.RawMessage, q url.Values) error {
@@ -83,6 +108,12 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if cfg.Password != "" {
 		q.Set("password", cfg.Password)
+	}
+	if cfg.Batch {
+		q.Set("batch", "1")
+	}
+	if cfg.Padding {
+		q.Set("padding", "1")
 	}
 	return nil
 }
@@ -111,7 +142,8 @@ func build(
 	}
 
 	t := newTransport(cfg, logger)
-	logger.Info("raw_ws: ready (url=", wsURL, " max_msg=", t.MaxMessageSize(), ")")
+	logger.Info("raw_ws: ready (url=", wsURL, " max_msg=", t.MaxMessageSize(),
+		" batch=", cfg.Batch, " padding=", cfg.Padding, ")")
 
 	bypass := []string{}
 	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Host != "" {
