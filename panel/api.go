@@ -19,6 +19,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
@@ -32,15 +33,19 @@ type API struct {
 	logger     *logging.Logger
 	token      string
 	configsDir string
+	filter     *geofilter.Filter
+	rulesDir   string
 }
 
-func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string) *API {
+func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string, filter *geofilter.Filter, rulesDir string) *API {
 	return &API{
 		client:     client,
 		sup:        sup,
 		logger:     logger,
 		token:      token,
 		configsDir: configsDir,
+		filter:     filter,
+		rulesDir:   rulesDir,
 	}
 }
 
@@ -71,6 +76,13 @@ func (a *API) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/backup", a.backup)
 
+	mux.HandleFunc("GET /api/rules", a.listRules)
+	mux.HandleFunc("POST /api/rules/{name}/enable", a.enableRule)
+	mux.HandleFunc("POST /api/rules/{name}/disable", a.disableRule)
+	mux.HandleFunc("POST /api/rules", a.addRule)
+	mux.HandleFunc("DELETE /api/rules/{name}", a.deleteRule)
+	mux.HandleFunc("POST /api/rules/apply", a.applyRules)
+
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		a.logger.Warn("panel: static dir missing from embed: ", err)
@@ -88,6 +100,57 @@ func (a *API) Handler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (a *API) listRules(w http.ResponseWriter, _ *http.Request) {
+	if a.filter == nil {
+		writeJSON(w, 200, []geofilter.RuleSet{})
+		return
+	}
+	_ = a.filter.LoadDir(a.rulesDir)
+	writeJSON(w, 200, a.filter.Rules())
+}
+
+func (a *API) enableRule(w http.ResponseWriter, r *http.Request) {
+	if a.filter == nil {
+		writeErr(w, 400, fmt.Errorf("filter not initialized"))
+		return
+	}
+	name := r.PathValue("name")
+	if err := a.filter.SetEnabled(name, true); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (a *API) disableRule(w http.ResponseWriter, r *http.Request) {
+	if a.filter == nil {
+		writeErr(w, 400, fmt.Errorf("filter not initialized"))
+		return
+	}
+	name := r.PathValue("name")
+	if err := a.filter.SetEnabled(name, false); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (a *API) applyRules(w http.ResponseWriter, _ *http.Request) {
+	if !a.sup.IsRunning() {
+		writeJSON(w, 200, map[string]any{"ok": true, "restarted": false})
+		return
+	}
+	if err := a.sup.Stop(); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if err := a.sup.Start(); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "restarted": true})
 }
 
 func (a *API) systemStats(w http.ResponseWriter, _ *http.Request) {
@@ -685,4 +748,63 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]any{"error": err.Error()})
+}
+
+func (a *API) addRule(w http.ResponseWriter, r *http.Request) {
+	if a.rulesDir == "" {
+		writeErr(w, 400, fmt.Errorf("rules dir not set"))
+		return
+	}
+	var req struct {
+		Name  string   `json:"name"`
+		CIDRs []string `json:"cidrs"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeErr(w, 400, fmt.Errorf("name is required"))
+		return
+	}
+	safe := sanitizeName(req.Name)
+	path := filepath.Join(a.rulesDir, safe+".txt")
+
+	cleanBase := filepath.Clean(a.rulesDir) + string(os.PathSeparator)
+	cleanPath := filepath.Clean(path)
+	if !strings.HasPrefix(cleanPath, cleanBase) {
+		writeErr(w, 400, fmt.Errorf("invalid name"))
+		return
+	}
+
+	contentStr := strings.Join(req.CIDRs, "\n")
+	if err := os.WriteFile(cleanPath, []byte(contentStr), 0644); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if a.filter != nil {
+		_ = a.filter.LoadDir(a.rulesDir)
+	}
+	writeJSON(w, 201, map[string]any{"ok": true})
+}
+
+func (a *API) deleteRule(w http.ResponseWriter, r *http.Request) {
+	if a.rulesDir == "" {
+		writeErr(w, 400, fmt.Errorf("rules dir not set"))
+		return
+	}
+	name := r.PathValue("name")
+	safe := sanitizeName(name)
+
+	for _, ext := range []string{".txt", ".json"} {
+		path := filepath.Join(a.rulesDir, safe+ext)
+		if _, err := os.Stat(path); err == nil {
+			_ = os.Remove(path)
+		}
+	}
+	if a.filter != nil {
+		_ = a.filter.LoadDir(a.rulesDir)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }

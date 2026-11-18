@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
@@ -24,19 +25,22 @@ const (
 	atypDomain = 0x03
 	atypIPv6   = 0x04
 
-	repSuccess             = 0x00
-	repGeneralFailure      = 0x01
-	repHostUnreachable     = 0x04
-	repCommandNotSupported = 0x07
-	repAddressNotSupported = 0x08
+	repSuccess              = 0x00
+	repGeneralFailure       = 0x01
+	repConnectionNotAllowed = 0x02
+	repHostUnreachable      = 0x04
+	repCommandNotSupported  = 0x07
+	repAddressNotSupported  = 0x08
 )
 
 type LocalServer struct {
-	listen   string
-	mux      multiplexing.StreamMultiplexer
-	logger   logging.ContextLogger
-	ipv4Only bool
-	ln       net.Listener
+	listen       string
+	mux          multiplexing.StreamMultiplexer
+	logger       logging.ContextLogger
+	ipv4Only     bool
+	filter       *geofilter.Filter
+	blockUnknown bool
+	ln           net.Listener
 }
 
 func NewLocalServer(listen string, m multiplexing.StreamMultiplexer, log logging.ContextLogger, ipv4Only bool) *LocalServer {
@@ -46,6 +50,24 @@ func NewLocalServer(listen string, m multiplexing.StreamMultiplexer, log logging
 		logger:   log,
 		ipv4Only: ipv4Only,
 	}
+}
+
+func (s *LocalServer) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool) {
+	s.filter = filter
+	s.blockUnknown = blockUnknown
+}
+
+func (s *LocalServer) shouldBlock(ip net.IP) bool {
+	if s.filter == nil {
+		return false
+	}
+	if s.filter.Match(ip) {
+		return true
+	}
+	if s.blockUnknown {
+		return true
+	}
+	return false
 }
 
 func (s *LocalServer) ListenAndServe(ctx context.Context) error {
@@ -103,10 +125,28 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 				s.sendReply(conn, repHostUnreachable)
 				return
 			}
+			ip = net.ParseIP(resolved)
 			host = resolved
 		case ip.To4() == nil:
 			s.logger.Warn("socks5: ipv6 destination rejected: ", host)
 			s.sendReply(conn, repAddressNotSupported)
+			return
+		}
+		if ip != nil && s.shouldBlock(ip) {
+			s.logger.Warn("socks5: blocked destination by GeoIP filter: ", host)
+			s.sendReply(conn, repConnectionNotAllowed)
+			return
+		}
+	} else {
+		ip := net.ParseIP(host)
+		if ip == nil {
+			if resolved, err := resolveIPv4(host); err == nil {
+				ip = net.ParseIP(resolved)
+			}
+		}
+		if ip != nil && s.shouldBlock(ip) {
+			s.logger.Warn("socks5: blocked destination by GeoIP filter: ", host)
+			s.sendReply(conn, repConnectionNotAllowed)
 			return
 		}
 	}

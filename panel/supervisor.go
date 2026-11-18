@@ -26,13 +26,15 @@ type Supervisor struct {
 	waitCh     chan struct{}
 	sockPath   string
 	configsDir string
+	rulesDir   string
 	logRing    *logbuf.Ring
 }
 
-func NewSupervisor(sock, configs string) *Supervisor {
+func NewSupervisor(sock, configs, rules string) *Supervisor {
 	return &Supervisor{
 		sockPath:   sock,
 		configsDir: configs,
+		rulesDir:   rules,
 		logRing:    logbuf.New(2000),
 	}
 }
@@ -92,6 +94,7 @@ func (s *Supervisor) Start() error {
 	cmd := exec.Command(s.resolveBinary(),
 		"--configs-dir", s.configsDir,
 		"--control-socket", s.sockPath,
+		"--rules-dir", s.rulesDir,
 	)
 	cmd.Stdout = s.logRing
 	cmd.Stderr = s.logRing

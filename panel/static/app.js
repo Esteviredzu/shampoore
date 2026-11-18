@@ -28,6 +28,7 @@ const state = {
   });
 
   document.getElementById('btn-add').addEventListener('click', openAddDialog);
+  document.getElementById('btn-rules').addEventListener('click', openRulesDialog);
   document.getElementById('btn-refresh').addEventListener('click', () => load());
   document.getElementById('btn-backup').addEventListener('click', () => {
     window.location.href = '/api/backup';
@@ -664,4 +665,129 @@ async function copyToClipboard(text) {
   try { await navigator.clipboard.writeText(text); } catch {
     const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
   }
+}
+async function openRulesDialog() {
+  let rules = [];
+  try {
+    rules = (await api('/api/rules')) || [];
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+
+  function renderRulesBody() {
+    let html = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <span style="color:var(--md-on-surface-variant);">Manage geoip rules and CIDRs</span>
+        <button class="btn btn--filled" type="button" onclick="window.openAddRuleDialog()">
+          <span class="material-symbols-rounded">add</span> Add Rule
+        </button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px;">
+    `;
+
+    if (!rules.length) {
+      html += `<div style="text-align:center; padding:32px; color:var(--md-on-surface-variant);">No rules found.</div>`;
+    } else {
+      rules.forEach(r => {
+        const nameEsc = escAttr(r.name);
+        const isEnabled = r.enabled;
+        const cidrsCount = (r.cidrs || []).length;
+        html += `
+          <div style="background:var(--md-surface-container-highest); padding:16px; border-radius:16px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
+            <div>
+              <div style="font-weight:500; font-size:16px; margin-bottom:4px;">${esc(r.name)}</div>
+              <div style="font-size:13px; color:var(--md-on-surface-variant);">${cidrsCount} CIDRs</div>
+            </div>
+            <div style="display:flex; align-items:center; gap:12px;">
+              <label class="switch">
+                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="window.toggleRule('${nameEsc}', this.checked)">
+                <span class="slider"></span>
+              </label>
+              <button class="icon-btn icon-btn--danger" onclick="window.delRule('${nameEsc}')" title="Delete">
+                <span class="material-symbols-rounded">delete</span>
+              </button>
+            </div>
+          </div>
+        `;
+      });
+    }
+    html += `</div>`;
+    dialog.setBody(html);
+  }
+
+  const dialog = openModal({
+    title: 'Geoip Rules',
+    actions: [
+      { label: 'Apply (Restart Server)', kind: 'filled', onClick: async () => {
+          try {
+            const res = await api('/api/rules/apply', { method: 'POST' });
+            if (res.restarted) toast('Server restarted with new rules');
+            else toast('Server was offline, rules applied');
+            closeModal();
+          } catch (e) { toast(e.message, 'error'); }
+        }
+      },
+      { label: 'Close', kind: 'text', onClick: closeModal }
+    ]
+  });
+
+  window.toggleRule = async (name, enabled) => {
+    try {
+      await api(`/api/rules/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
+      toast(enabled ? 'Rule enabled' : 'Rule disabled');
+      rules = await api('/api/rules');
+      renderRulesBody();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+
+  window.delRule = async (name) => {
+    if (!confirm(`Delete rule "${name}"?`)) return;
+    try {
+      await api(`/api/rules/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      toast('Rule deleted');
+      rules = await api('/api/rules');
+      renderRulesBody();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+
+  window.openAddRuleDialog = () => {
+    let rName = '';
+    let rCidrs = '';
+    const addDlg = openModal({
+      title: 'New Geoip Rule',
+      actions: [
+        { label: 'Cancel', kind: 'text', onClick: openRulesDialog },
+        { label: 'Create', kind: 'filled', onClick: async () => {
+            if (!rName.trim()) return toast('Name is required', 'error');
+            const cidrs = rCidrs.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            try {
+              await api('/api/rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: rName, cidrs })
+              });
+              toast('Rule created successfully');
+              openRulesDialog();
+            } catch (e) { toast(e.message, 'error'); }
+          }
+        }
+      ]
+    });
+    addDlg.setBody(`
+      <div class="form-group">
+        <div class="field">
+          <label>Rule Name</label>
+          <input type="text" id="r-name" placeholder="e.g. custom_bypass" value="${escAttr(rName)}">
+        </div>
+        <div class="field">
+          <label>CIDRs (one per line)</label>
+          <textarea id="r-cidrs" placeholder="192.168.1.0/24&#10;10.0.0.0/8">${esc(rCidrs)}</textarea>
+        </div>
+      </div>
+    `);
+    document.getElementById('r-name').addEventListener('input', e => { rName = e.target.value; });
+    document.getElementById('r-cidrs').addEventListener('input', e => { rCidrs = e.target.value; });
+  };
+
+  renderRulesBody();
 }

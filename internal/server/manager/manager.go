@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -22,9 +24,11 @@ import (
 )
 
 type Manager struct {
-	dir    string
-	logger *logging.Logger
-	state  *State
+	dir          string
+	logger       *logging.Logger
+	filter       *geofilter.Filter
+	blockUnknown bool
+	state        *State
 
 	startAll bool
 
@@ -61,13 +65,28 @@ type ManagedEntry struct {
 	cachedStat EntryStats
 }
 
-func New(dir string, logger *logging.Logger) *Manager {
+func New(dir string, logger *logging.Logger, filter *geofilter.Filter, blockUnknown bool) *Manager {
 	return &Manager{
-		dir:     dir,
-		logger:  logger,
-		entries: map[string]*ManagedEntry{},
-		state:   &State{data: map[string]bool{}},
+		dir:          dir,
+		logger:       logger,
+		filter:       filter,
+		blockUnknown: blockUnknown,
+		entries:      map[string]*ManagedEntry{},
+		state:        &State{data: map[string]bool{}},
 	}
+}
+
+func (m *Manager) shouldBlock(ip net.IP) bool {
+	if m.filter == nil {
+		return false
+	}
+	if m.filter.Match(ip) {
+		return true
+	}
+	if m.blockUnknown {
+		return true
+	}
+	return false
 }
 
 func (m *Manager) SetStartAll(v bool) {
@@ -261,6 +280,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	}
 
 	handler := socks5.NewRemoteHandler(ctx, mux, logger, 8000, app.IPv4Only)
+	handler.SetGeoFilter(m.filter, m.blockUnknown)
 	go func() {
 		if err := handler.Run(); err != nil {
 			logger.Warn("remote handler stopped: ", err)

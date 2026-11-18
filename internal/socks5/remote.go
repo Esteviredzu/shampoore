@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
@@ -22,10 +23,12 @@ func dialTCP(target string, ipv4Only bool) (net.Conn, error) {
 }
 
 type RemoteHandler struct {
-	mux       multiplexing.StreamMultiplexer
-	logger    logging.ContextLogger
-	chunkSize int
-	ipv4Only  bool
+	mux          multiplexing.StreamMultiplexer
+	logger       logging.ContextLogger
+	chunkSize    int
+	ipv4Only     bool
+	filter       *geofilter.Filter
+	blockUnknown bool
 
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
@@ -33,6 +36,24 @@ type RemoteHandler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+func (s *RemoteHandler) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool) {
+	s.filter = filter
+	s.blockUnknown = blockUnknown
+}
+
+func (s *RemoteHandler) shouldBlock(ip net.IP) bool {
+	if s.filter == nil {
+		return false
+	}
+	if s.filter.Match(ip) {
+		return true
+	}
+	if s.blockUnknown {
+		return true
+	}
+	return false
 }
 
 func NewRemoteHandler(
@@ -118,8 +139,20 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		return
 	}
 
+	ip := net.ParseIP(host)
+	if ip == nil {
+		if resolved, err := resolveIPv4(host); err == nil {
+			ip = net.ParseIP(resolved)
+		}
+	}
+	if ip != nil && s.shouldBlock(ip) {
+		s.logger.Warn("remote: ", streamID, " blocked destination by GeoIP filter: ", host)
+		stream.Close()
+		return
+	}
+
 	if s.ipv4Only {
-		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		if ip != nil && ip.To4() == nil {
 			s.logger.Warn("remote: ", streamID, " ipv6 destination rejected: ", host)
 			stream.Close()
 			return

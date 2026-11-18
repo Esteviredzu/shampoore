@@ -12,6 +12,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
 
@@ -37,6 +38,10 @@ func main() {
 		"directory with configs (used in both CLI and panel mode)")
 	controlSock := flag.String("control-socket", "",
 		"unix socket for panel (empty = CLI mode, no state management)")
+	rulesDir := flag.String("rules-dir", "./rules",
+		"directory with geoip rule files (.txt or .json)")
+	blockUnknown := flag.Bool("block-unknown", false,
+		"block traffic that does not match any enabled rule")
 
 	var configFiles stringList
 	flag.Var(&configFiles, "c",
@@ -71,7 +76,26 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	mgr := manager.New(*configsDir, logger)
+	filter := geofilter.NewFilter(geofilter.ActionBlock)
+	if err := filter.LoadDir(*rulesDir); err != nil {
+		logger.Warn("server: rules load: ", err)
+	}
+	hasEnabled := false
+	for _, r := range filter.Rules() {
+		if r.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		filter.EnableAll()
+	}
+
+	for _, r := range filter.Rules() {
+		logger.Info("server: rule loaded: ", r.Name, " cidrs=", len(r.CIDRs), " enabled=", r.Enabled)
+	}
+
+	mgr := manager.New(*configsDir, logger, filter, *blockUnknown)
 
 	cliMode := len(configFiles) > 0 || *controlSock == ""
 	if cliMode {
@@ -108,7 +132,8 @@ func main() {
 	}
 
 	logger.Info("server: ready (", len(mgr.List()), " configs, dir=",
-		*configsDir, ", socket=", *controlSock, ", cli_mode=", cliMode, ")")
+		*configsDir, ", socket=", *controlSock, ", cli_mode=", cliMode,
+		", rules=", len(filter.Rules()), ", block_unknown=", *blockUnknown, ")")
 	<-ctx.Done()
 	logger.Info("server: stopping")
 	mgr.Close()

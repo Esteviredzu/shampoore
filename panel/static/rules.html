@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Geoip Rules</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #222; }
+    h1 { font-size: 1.4rem; }
+    table { border-collapse: collapse; width: 100%; max-width: 720px; }
+    th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #eee; }
+    th { background: #fafafa; }
+    .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .8rem; }
+    .on  { background: #c8f5c8; color: #1b5e20; }
+    .off { background: #f0f0f0; color: #555; }
+    button { cursor: pointer; }
+    #apply { margin-top: 1rem; padding: .5rem 1rem; }
+    .row-msg { color: #555; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>Geoip Rules</h1>
+  <p class="row-msg">Enable a rule to block matching traffic on the server. Click Apply to restart the server and pick up changes.</p>
+  <table>
+    <thead>
+      <tr><th>Name</th><th>CIDRs</th><th>Status</th><th>Actions</th></tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="4">Loading…</td></tr></tbody>
+  </table>
+  <button id="apply">Apply (restart server)</button>
+  <p id="msg" class="row-msg"></p>
+
+<script>
+const token = localStorage.getItem('panel_token') || '';
+const headers = token ? { 'X-Panel-Token': token } : {};
+
+async function load() {
+  const res = await fetch('/api/rules', { headers });
+  const rules = await res.json();
+  const tbody = document.getElementById('rows');
+  if (!rules.length) {
+    tbody.innerHTML = '<tr><td colspan="4">No rules found in rules directory.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  for (const r of rules) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.name}</td>
+      <td>${(r.cidrs || []).length}</td>
+      <td><span class="pill ${r.enabled ? 'on' : 'off'}">${r.enabled ? 'enabled' : 'disabled'}</span></td>
+      <td>
+        <button data-name="${r.name}" data-on="${r.enabled ? '0' : '1'}">${r.enabled ? 'Disable' : 'Enable'}</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll('button').forEach(b => {
+    b.addEventListener('click', async () => {
+      const name = b.dataset.name;
+      const on = b.dataset.on === '1';
+      const url = `/api/rules/${encodeURIComponent(name)}/${on ? 'enable' : 'disable'}`;
+      const r = await fetch(url, { method: 'POST', headers });
+      if (!r.ok) {
+        document.getElementById('msg').textContent = 'Error: ' + (await r.text());
+      }
+      await load();
+    });
+  });
+}
+
+document.getElementById('apply').addEventListener('click', async () => {
+  const r = await fetch('/api/rules/apply', { method: 'POST', headers });
+  const j = await r.json();
+  document.getElementById('msg').textContent = j.ok
+    ? (j.restarted ? 'Server restarted with new rules.' : 'Server was offline, changes will apply on next start.')
+    : ('Error: ' + (j.error || 'unknown'));
+  await load();
+});
+
+load();
+</script>
+</body>
+</html>

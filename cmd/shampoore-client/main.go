@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -29,6 +30,8 @@ func main() {
 	configPath := flag.String("c", "config.json", "config file or shampoore:// URL")
 	modeFlag := flag.String("m", "socks5",
 		"mode: socks5 (local SOCKS5 proxy only) | tun (full VPN)")
+	rulesDir := flag.String("rules-dir", "./rules",
+		"directory with geoip rule files (.txt or .json); matching IPs bypass VPN")
 	flag.Parse()
 
 	mode := app.Mode(*modeFlag)
@@ -45,6 +48,26 @@ func main() {
 
 	debug := app.LogLevel == "debug" || app.LogLevel == "trace"
 	lg := logging.New("client", debug)
+
+	filter := geofilter.NewFilter(geofilter.ActionBypass)
+	if err := filter.LoadDir(*rulesDir); err != nil {
+		lg.Warn("client: rules load: ", err)
+	}
+
+	hasEnabled := false
+	for _, r := range filter.Rules() {
+		if r.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		filter.EnableAll()
+	}
+
+	for _, r := range filter.Rules() {
+		lg.Info("client: rule loaded: ", r.Name, " cidrs=", len(r.CIDRs), " enabled=", r.Enabled)
+	}
 
 	ctx, cancel := signal.NotifyContext(
 		context.Background(), os.Interrupt, syscall.SIGTERM,
@@ -81,6 +104,7 @@ func main() {
 	case app.ModeSOCKS5:
 		listen := eff.String("socks5_listen", "127.0.0.1:1080")
 		srv := socks5.NewLocalServer(listen, mux, lg, app.IPv4Only)
+		srv.SetGeoFilter(filter, false)
 		go func() {
 			if err := srv.ListenAndServe(ctx); err != nil {
 				log.Printf("socks5 stopped: %v", err)

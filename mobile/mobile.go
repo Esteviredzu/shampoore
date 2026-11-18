@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -35,6 +36,43 @@ var (
 	currentMux multiplexing.StreamMultiplexer
 	statsAgg   *transport.StatsAggregator
 )
+
+var (
+	filterMu     sync.Mutex
+	globalFilter *geofilter.Filter
+	rulesDirPath string
+)
+
+func InitRules(dir string) {
+	filterMu.Lock()
+	defer filterMu.Unlock()
+	rulesDirPath = dir
+	globalFilter = geofilter.NewFilter(geofilter.ActionBypass)
+	_ = globalFilter.LoadDir(dir)
+}
+
+func GetRules() string {
+	filterMu.Lock()
+	defer filterMu.Unlock()
+	if globalFilter == nil {
+		return "[]"
+	}
+	_ = globalFilter.LoadDir(rulesDirPath)
+	data, _ := json.Marshal(globalFilter.Rules())
+	return string(data)
+}
+
+func SetRuleEnabled(name string, on bool) string {
+	filterMu.Lock()
+	defer filterMu.Unlock()
+	if globalFilter == nil {
+		return "filter not initialized"
+	}
+	if err := globalFilter.SetEnabled(name, on); err != nil {
+		return err.Error()
+	}
+	return ""
+}
 
 func StartClient(source string) string {
 	mu.Lock()
@@ -77,6 +115,10 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 	}
 	lg := logging.New("mobile", app.LogLevel == "debug")
 
+	filterMu.Lock()
+	filter := globalFilter
+	filterMu.Unlock()
+
 	ctx, cancelFn := context.WithCancel(context.Background())
 
 	rt, err := app.BuildRuntime(ctx, s, "client", lg)
@@ -113,6 +155,7 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 	case runSocks5:
 		listen := s.EffectiveAdvanced().String("socks5_listen", "127.0.0.1:1080")
 		srv := socks5.NewLocalServer(listen, mux, lg, app.IPv4Only)
+		srv.SetGeoFilter(filter, false)
 		go func() { _ = srv.ListenAndServe(ctx) }()
 
 	case runTUN:

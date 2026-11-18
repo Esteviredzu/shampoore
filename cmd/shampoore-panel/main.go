@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/control"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/panel"
 
@@ -27,6 +28,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "panel HTTP listen")
 	token := flag.String("token", "", "optional X-Panel-Token for /api/*")
 	configsDir := flag.String("configs-dir", "./configs", "directory with managed configs")
+	rulesDir := flag.String("rules-dir", "./rules", "directory with geoip rule files")
 	autoStart := flag.Bool("auto-start-server", false,
 		"start shampoore-server automatically on panel launch (useful under systemd)")
 	flag.Parse()
@@ -36,10 +38,15 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	sup := panel.NewSupervisor(*sockPath, *configsDir)
+	filter := geofilter.NewFilter(geofilter.ActionBlock)
+	if err := filter.LoadDir(*rulesDir); err != nil {
+		logger.Warn("panel: rules load: ", err)
+	}
+
+	sup := panel.NewSupervisor(*sockPath, *configsDir, *rulesDir)
 	client := control.NewClient(*sockPath)
 
-	api := panel.New(client, sup, logger, *token, *configsDir)
+	api := panel.New(client, sup, logger, *token, *configsDir, filter, *rulesDir)
 
 	srv := &http.Server{Addr: *listen, Handler: api.Handler()}
 	go func() {

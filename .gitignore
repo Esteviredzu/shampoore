@@ -1,6 +1,7 @@
 bin/
 
 configs/*
+rules/*
 configs/.state.json
 
 shampoore.aar
