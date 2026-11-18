@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 const (
@@ -57,17 +59,20 @@ func (s *LocalServer) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool) 
 	s.blockUnknown = blockUnknown
 }
 
-func (s *LocalServer) shouldBlock(ip net.IP) bool {
+func (s *LocalServer) routeFor(ip net.IP) (bypass bool, block bool) {
 	if s.filter == nil {
-		return false
+		return false, false
 	}
-	if s.filter.Match(ip) {
-		return true
+	if action, ok := s.filter.MatchAction(ip); ok {
+		if action == geofilter.ActionBypass {
+			return true, false
+		}
+		return false, true
 	}
 	if s.blockUnknown {
-		return true
+		return false, true
 	}
-	return false
+	return false, false
 }
 
 func (s *LocalServer) ListenAndServe(ctx context.Context) error {
@@ -115,40 +120,21 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if s.ipv4Only {
-		ip := net.ParseIP(host)
-		switch {
-		case ip == nil:
-			resolved, err := resolveIPv4(host)
-			if err != nil {
-				s.logger.Warn("socks5: resolve ", host, ": ", err)
-				s.sendReply(conn, repHostUnreachable)
-				return
-			}
-			ip = net.ParseIP(resolved)
-			host = resolved
-		case ip.To4() == nil:
-			s.logger.Warn("socks5: ipv6 destination rejected: ", host)
-			s.sendReply(conn, repAddressNotSupported)
-			return
-		}
-		if ip != nil && s.shouldBlock(ip) {
-			s.logger.Warn("socks5: blocked destination by GeoIP filter: ", host)
-			s.sendReply(conn, repConnectionNotAllowed)
-			return
-		}
-	} else {
-		ip := net.ParseIP(host)
-		if ip == nil {
-			if resolved, err := resolveIPv4(host); err == nil {
-				ip = net.ParseIP(resolved)
-			}
-		}
-		if ip != nil && s.shouldBlock(ip) {
-			s.logger.Warn("socks5: blocked destination by GeoIP filter: ", host)
-			s.sendReply(conn, repConnectionNotAllowed)
-			return
-		}
+	ip, host, ok := s.destinationIP(conn, host)
+	if !ok {
+		return
+	}
+
+	bypass, block := s.routeFor(ip)
+	if block {
+		s.logger.Warn("socks5: blocked destination by GeoIP filter: ", host)
+		s.sendReply(conn, repConnectionNotAllowed)
+		return
+	}
+	if bypass {
+		s.logger.Info("socks5: bypassing tunnel for ", host)
+		s.handleDirect(ctx, conn, host, port)
+		return
 	}
 
 	stream, err := s.mux.OpenStream(ctx, map[string]any{
@@ -165,20 +151,73 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 	if err := s.sendReply(conn, repSuccess); err != nil {
 		return
 	}
+	s.pipe(ctx, conn, stream)
+}
+
+func (s *LocalServer) destinationIP(conn net.Conn, host string) (net.IP, string, bool) {
+	ip := net.ParseIP(host)
+	if !s.ipv4Only {
+		if ip == nil {
+			if resolved, err := resolveIPv4(host); err == nil {
+				ip = net.ParseIP(resolved)
+			}
+		}
+		return ip, host, true
+	}
+	switch {
+	case ip == nil:
+		resolved, err := resolveIPv4(host)
+		if err != nil {
+			s.logger.Warn("socks5: resolve ", host, ": ", err)
+			s.sendReply(conn, repHostUnreachable)
+			return nil, host, false
+		}
+		ip = net.ParseIP(resolved)
+		host = resolved
+	case ip.To4() == nil:
+		s.logger.Warn("socks5: ipv6 destination rejected: ", host)
+		s.sendReply(conn, repAddressNotSupported)
+		return nil, host, false
+	}
+	return ip, host, true
+}
+
+func (s *LocalServer) handleDirect(ctx context.Context, conn net.Conn, host string, port int) {
+	network := "tcp"
+	if s.ipv4Only {
+		network = "tcp4"
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+
+	direct, err := netdial.DialContext(ctx, network, target)
+	if err != nil {
+		s.logger.Warn("socks5: direct dial ", target, ": ", err)
+		s.sendReply(conn, repGeneralFailure)
+		return
+	}
+	defer direct.Close()
+
+	if err := s.sendReply(conn, repSuccess); err != nil {
+		return
+	}
+	s.pipe(ctx, conn, direct)
+}
+
+func (s *LocalServer) pipe(ctx context.Context, conn net.Conn, remote net.Conn) {
 	stopWatch := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
 			conn.Close()
-			stream.Close()
+			remote.Close()
 		case <-stopWatch:
 		}
 	}()
 	defer close(stopWatch)
 
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(stream, conn); done <- struct{}{} }()
-	go func() { io.Copy(conn, stream); done <- struct{}{} }()
+	go func() { io.Copy(remote, conn); done <- struct{}{} }()
+	go func() { io.Copy(conn, remote); done <- struct{}{} }()
 	<-done
 }
 

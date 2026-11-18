@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/runtime/muxproxy"
 )
@@ -37,4 +38,12 @@ func DedupStrings(in []string) []string {
 
 func AttachMuxForTUN(mux multiplexing.StreamMultiplexer) {
 	muxproxy.SetMux(mux, app.IPv4Only)
+}
+
+func AttachFilterForTUN(filter *geofilter.Filter) {
+	muxproxy.SetGeoFilter(filter, false)
+}
+
+func DetachMuxForTUN(mux multiplexing.StreamMultiplexer) {
+	muxproxy.ClearIf(mux)
 }

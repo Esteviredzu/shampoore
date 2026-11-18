@@ -155,8 +155,13 @@ func (f *Filter) parseNets(rs *RuleSet) {
 }
 
 func (f *Filter) Match(ip net.IP) bool {
+	_, ok := f.MatchAction(ip)
+	return ok
+}
+
+func (f *Filter) MatchAction(ip net.IP) (Action, bool) {
 	if ip == nil {
-		return false
+		return "", false
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -166,11 +171,15 @@ func (f *Filter) Match(ip net.IP) bool {
 		}
 		for _, n := range f.nets[rs.Name] {
 			if n.Contains(ip) {
-				return true
+				action := rs.Action
+				if action == "" {
+					action = f.action
+				}
+				return action, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 func (f *Filter) Rules() []RuleSet {

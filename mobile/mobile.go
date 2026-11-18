@@ -12,6 +12,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 	"github.com/Esteviredzu/shampoore/internal/runtime"
 	"github.com/Esteviredzu/shampoore/internal/socks5"
 	"github.com/Esteviredzu/shampoore/internal/transport"
@@ -42,6 +43,31 @@ var (
 	globalFilter *geofilter.Filter
 	rulesDirPath string
 )
+
+var (
+	protectorMu      sync.Mutex
+	androidProtector SocketProtector
+)
+
+type SocketProtector interface {
+	Protect(fd int) bool
+}
+
+func SetSocketProtector(p SocketProtector) {
+	protectorMu.Lock()
+	androidProtector = p
+	protectorMu.Unlock()
+
+	if p == nil {
+		netdial.SetProtector(nil)
+		return
+	}
+	netdial.SetProtector(func(fd int) bool { return p.Protect(fd) })
+}
+
+func ClearSocketProtector() {
+	SetSocketProtector(nil)
+}
 
 func InitRules(dir string) {
 	filterMu.Lock()
@@ -164,6 +190,7 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		}
 		tunDone = make(chan struct{})
 		runtime.AttachMuxForTUN(mux)
+		runtime.AttachFilterForTUN(filter)
 		go func() {
 			defer close(tunDone)
 			if err := runtime.StartTUNFD(ctx, vpnFD, vpnMTU); err != nil {
@@ -191,6 +218,7 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		defer cancelStop()
 		_ = rt.Stop(stopCtx)
 		_ = mux.Stop(stopCtx)
+		runtime.DetachMuxForTUN(mux)
 		if tunDone != nil {
 			select {
 			case <-tunDone:

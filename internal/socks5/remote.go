@@ -47,13 +47,10 @@ func (s *RemoteHandler) shouldBlock(ip net.IP) bool {
 	if s.filter == nil {
 		return false
 	}
-	if s.filter.Match(ip) {
-		return true
+	if action, ok := s.filter.MatchAction(ip); ok {
+		return action != geofilter.ActionBypass
 	}
-	if s.blockUnknown {
-		return true
-	}
-	return false
+	return s.blockUnknown
 }
 
 func NewRemoteHandler(
