@@ -74,6 +74,12 @@ for ARCH in "${ARCHES[@]}"; do
     CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
         go build -trimpath -ldflags="$LDFLAGS" \
         -o "$STAGE/shampoore-server" ./cmd/shampoore-server
+    CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
+        go build -trimpath -ldflags="$LDFLAGS" \
+        -o "$STAGE/shampoore-relay" ./cmd/shampoore-relay
+    CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
+        go build -trimpath -ldflags="$LDFLAGS" \
+        -o "$STAGE/shampoore-node-agent" ./cmd/shampoore-node-agent
 
     log "copying install helpers for $ARCH"
     install -m 0755 deploy/systemd/install.sh        "$STAGE/install.sh"

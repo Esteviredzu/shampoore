@@ -15,6 +15,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/socks5"
 
 	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
@@ -59,6 +60,8 @@ func main() {
 		"directory with geoip rule files (.txt or .json)")
 	blockUnknown := flag.Bool("block-unknown", false,
 		"block traffic that does not match any enabled rule")
+	socksListen := flag.String("socks-listen", "",
+		"optional local SOCKS5 listen address for exit-node chaining (e.g. :1080)")
 
 	var configFiles stringList
 	flag.Var(&configFiles, "c",
@@ -136,6 +139,18 @@ func main() {
 		if err := mgr.Load(ctx); err != nil {
 			log.Fatalf("manager load: %v", err)
 		}
+	}
+
+	if *socksListen != "" {
+		socks := socks5.NewLocalServer(*socksListen, nil, logger, app.IPv4Only)
+		socks.SetGeoFilter(filter, *blockUnknown)
+		go func() {
+			logger.Info("server: direct SOCKS5 listening on ", *socksListen)
+			if err := socks.ListenAndServe(ctx); err != nil {
+				logger.Warn("server: socks5: ", err)
+			}
+		}()
+		defer socks.Stop()
 	}
 
 	var ctrl *control.Server

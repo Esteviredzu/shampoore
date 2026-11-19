@@ -102,6 +102,8 @@ func (s *Server) dispatch(req Request) Response {
 		return ok(s.mgr.List())
 	case "stats":
 		return ok(s.mgr.Stats())
+	case "usage":
+		return ok(s.mgr.Usage())
 	case "get":
 		v, found := s.mgr.Get(req.Name)
 		if !found {

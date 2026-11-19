@@ -99,6 +99,13 @@ log "installing binaries to $PREFIX/bin"
 install -d -m 0755 "$PREFIX/bin"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-panel"  "$PREFIX/bin/shampoore-panel"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-server" "$PREFIX/bin/shampoore-server"
+for extra in shampoore-relay shampoore-node-agent; do
+    if [ -x "$SRC_DIR/$extra" ]; then
+        install -o root -g root -m 0755 "$SRC_DIR/$extra" "$PREFIX/bin/$extra"
+    else
+        log "warning: $extra is missing; remote node deployment will require a manual build"
+    fi
+done
 
 log "preparing state directory"
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 0755 "$STATE_DIR/configs"
@@ -125,7 +132,19 @@ if [ ! -f "$CONFIG_DIR/panel.env" ]; then
     cat > "$CONFIG_DIR/panel.env" <<EOF
 PANEL_TOKEN=$TOKEN
 PANEL_LISTEN=$LISTEN
+PANEL_DB=/var/lib/shampoore/panel.db
+PUBLIC_LISTEN=
+PUBLIC_URL=
 EOF
+else
+    # Backward compatible migration of an existing env file.
+    ensure_env() {
+        local key="$1" value="$2"
+        grep -q "^${key}=" "$CONFIG_DIR/panel.env" || printf '%s=%s\n' "$key" "$value" >> "$CONFIG_DIR/panel.env"
+    }
+    ensure_env PANEL_DB /var/lib/shampoore/panel.db
+    ensure_env PUBLIC_LISTEN ""
+    ensure_env PUBLIC_URL ""
 fi
 chown root:"$USER_NAME" "$CONFIG_DIR/panel.env"
 chmod 0640 "$CONFIG_DIR/panel.env"

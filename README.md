@@ -64,6 +64,31 @@ ssh -L 8080:127.0.0.1:8080 user@your-server
 
 Оставьте это окно терминала открытым, затем откройте в браузере: `http://localhost:8080/?token=<ТОКЕН_ИЗ_ВЫВОДА_УСТАНОВЩИКА>`.
 
+### Multiuser control plane (Relay + Exit)
+
+Панель хранит ноды, маршруты и подписчиков в SQLite (`modernc.org/sqlite`, без CGO). Публичный API вынесен на отдельный порт:
+
+```bash
+shampoore-panel \
+  --listen=127.0.0.1:8080 \
+  --db=/var/lib/shampoore/panel.db \
+  --public-listen=:8443 \
+  --public-url=https://panel.example.com
+```
+
+- `127.0.0.1:8080` — админка, админские `/api/*`-ручки, токен + HttpOnly cookie.
+- `:8443` — только `GET /sub/{sub_token}` и `POST /api/node/sync`; статика и админка недоступны.
+- `POST /api/nodes/{id}/deploy` запускает SSH-деплой Relay/Exit-ноды через Docker Compose и возвращает пошаговый лог.
+- Exit-нода запускает `shampoore-node-agent`: он раз в 30 секунд отправляет дельты трафика, получает активных пользователей и обновляет multiuser-конфиги через control socket.
+- Публичный API не содержит TLS. Для внешнего доступа ставьте Caddy/nginx или используйте SSH-туннель.
+- SSH-деплой по умолчанию не проверяет host key (`InsecureIgnoreHostKey`). Для production передайте свой `ssh.HostKeyCallback` через `provisioner.Options` или используйте доверенную сеть.
+
+Сборка вспомогательных бинарников:
+
+```bash
+CGO_ENABLED=0 go build -o bin/ ./cmd/...
+```
+
 ### Удаление
 
 ```bash

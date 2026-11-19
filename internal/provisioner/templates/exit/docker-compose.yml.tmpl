@@ -1,0 +1,45 @@
+services:
+  shampoore-server:
+    image: debian:bookworm-slim
+    restart: unless-stopped
+    command:
+      - /opt/shampoore/bin/shampoore-server
+      - --configs-dir=/opt/shampoore/configs
+      - --control-socket=/run/shampoore/shampoore.sock
+      - --rules-dir=/opt/shampoore/rules
+      - --socks-listen=:{{ .SocksPort }}
+{{- range .ConfigFiles }}
+      - -c
+      - /opt/shampoore/{{ . }}
+{{- end }}
+{{- range .ExitUpstreams }}
+      - --exit-upstream={{ . }}
+{{- end }}
+    volumes:
+      - ./bin/shampoore-server:/opt/shampoore/bin/shampoore-server:ro
+      - ./configs:/opt/shampoore/configs
+      - ./rules:/opt/shampoore/rules:ro
+      - shampoore-run:/run/shampoore
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    ports:
+      - "{{ .SocksPort }}:{{ .SocksPort }}"
+
+  node-agent:
+    image: debian:bookworm-slim
+    restart: unless-stopped
+    command:
+      - /opt/shampoore/bin/shampoore-node-agent
+    env_file:
+      - ./agent.env
+    depends_on:
+      - shampoore-server
+    volumes:
+      - ./bin/shampoore-node-agent:/opt/shampoore/bin/shampoore-node-agent:ro
+      - ./configs:/opt/shampoore/configs
+      - shampoore-run:/run/shampoore
+      - agent_state:/opt/shampoore/state
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+
+volumes:
+  shampoore-run:
+  agent_state:

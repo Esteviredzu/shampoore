@@ -16,6 +16,9 @@ ExecStart=/opt/shampoore/bin/shampoore-panel \
     --listen=${PANEL_LISTEN} \
     --socket=/run/shampoore/shampoore.sock \
     --configs-dir=/var/lib/shampoore/configs \
+    --db=${PANEL_DB} \
+    --public-listen=${PUBLIC_LISTEN} \
+    --public-url=${PUBLIC_URL} \
     --token=${PANEL_TOKEN} \
     --auto-start-server
 

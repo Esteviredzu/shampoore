@@ -16,12 +16,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/control"
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/panelstore"
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
@@ -37,10 +39,16 @@ type API struct {
 	filter     *geofilter.Filter
 	rulesDir   string
 	limiter    *loginLimiter
+
+	store       *panelstore.Store
+	provisioner NodeDeployer
+	publicURL   string
+	deployMu    sync.Mutex
+	deploying   map[int64]struct{}
 }
 
-func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string, filter *geofilter.Filter, rulesDir string) *API {
-	return &API{
+func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string, filter *geofilter.Filter, rulesDir string, opts ...Option) *API {
+	a := &API{
 		client:     client,
 		sup:        sup,
 		logger:     logger,
@@ -49,7 +57,12 @@ func New(client *control.Client, sup ServerManager, logger *logging.Logger, toke
 		filter:     filter,
 		rulesDir:   rulesDir,
 		limiter:    newLoginLimiter(),
+		deploying:  make(map[int64]struct{}),
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 func (a *API) Handler() http.Handler {
@@ -88,6 +101,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rules", a.addRule)
 	mux.HandleFunc("DELETE /api/rules/{name}", a.deleteRule)
 	mux.HandleFunc("POST /api/rules/apply", a.applyRules)
+
+	if a.store != nil {
+		a.registerControlPlane(mux)
+	}
 
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {

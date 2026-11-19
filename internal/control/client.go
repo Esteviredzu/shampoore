@@ -74,6 +74,18 @@ func (c *Client) Stats() ([]manager.EntryStats, error) {
 	return out, nil
 }
 
+func (c *Client) Usage() ([]manager.UsageEntry, error) {
+	r, err := c.call(Request{Cmd: "usage"})
+	if err != nil {
+		return nil, err
+	}
+	var out []manager.UsageEntry
+	if err := json.Unmarshal(r.Data, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *Client) Get(name string) (manager.EntryView, error) {
 	r, err := c.call(Request{Cmd: "get", Name: name})
 	if err != nil {

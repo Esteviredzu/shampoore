@@ -222,6 +222,10 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 		s.handleDirect(ctx, conn, host, port)
 		return
 	}
+	if s.mux == nil {
+		s.handleDirect(ctx, conn, host, port)
+		return
+	}
 
 	stream, err := s.mux.OpenStream(ctx, map[string]any{
 		"host": host,

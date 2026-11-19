@@ -9,6 +9,9 @@ shampoore-sources.jar
 
 /dist/
 *.log
+*.db
+*.db-wal
+*.db-shm
 
 .vscode/
 .idea/
