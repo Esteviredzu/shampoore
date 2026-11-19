@@ -44,8 +44,6 @@ func ensureSecrets(n *Node) error {
 		{"raw_ws_password", func() (string, error) { return randomHex(32) }},
 		{"livekit_api_key", func() (string, error) { return randomHex(8) }},
 		{"livekit_api_secret", func() (string, error) { return randomBase64(32) }},
-		{"livekit_token_secret", func() (string, error) { return randomHex(32) }},
-		{"livekit_token_listen", func() (string, error) { return "127.0.0.1:8099", nil }},
 		{"minio_root_user", func() (string, error) {
 			token, err := randomHex(6)
 			return "shampoore-" + token, err

@@ -9,6 +9,36 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
+type OfflineBundle struct {
+	Name  string   `json:"name"`
+	Links []string `json:"links"`
+}
+
+func (a *API) offlineBundle(r *http.Request, user panelstore.User) (OfflineBundle, error) {
+	settings, err := a.subscriptionSettings(r, user)
+	if err != nil {
+		return OfflineBundle{}, err
+	}
+	bundle := OfflineBundle{
+		Name:  strings.TrimSpace(user.Name),
+		Links: make([]string, 0, len(settings)),
+	}
+	if bundle.Name == "" {
+		bundle.Name = user.ID
+	}
+	for i := range settings {
+		link, err := app.EncodeURL(&settings[i])
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Warn("panel: encode offline bundle link: ", err)
+			}
+			continue
+		}
+		bundle.Links = append(bundle.Links, link)
+	}
+	return bundle, nil
+}
+
 func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app.Settings, error) {
 	routes, err := a.store.ListRoutes(r.Context())
 	if err != nil {
@@ -45,15 +75,12 @@ func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app
 			continue
 		}
 		settings, err := descriptor.BuildSubscriptionConfig(app.RouteParams{
-			RouteID:     route.ID,
-			RouteName:   route.Name,
-			UserID:      user.ID,
-			ExitNodeID:  strconv.FormatInt(exit.ID, 10),
-			Domain:      tr.Domain,
-			Secrets:     entry.GeneratedSecrets,
-			OnDemand:    tr.OnDemand,
-			TokenURL:    strings.TrimSpace(entry.GeneratedSecrets["livekit_token_url"]),
-			TokenSecret: strings.TrimSpace(entry.GeneratedSecrets["livekit_token_secret"]),
+			RouteID:    route.ID,
+			RouteName:  route.Name,
+			UserID:     user.ID,
+			ExitNodeID: strconv.FormatInt(exit.ID, 10),
+			Domain:     tr.Domain,
+			Secrets:    entry.GeneratedSecrets,
 		})
 		if err != nil {
 			continue

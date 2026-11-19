@@ -13,20 +13,16 @@ func DecodeURL(q url.Values) (json.RawMessage, error) {
 	secret := q.Get("api_secret")
 	room := q.Get("room")
 	multiuser, _ := strconv.ParseBool(q.Get("multiuser"))
-	tokenURL := q.Get("token_url")
-	if tokenURL == "" {
-		tokenURL = NormalizeTokenURL(q.Get("token_listen"))
-	}
 	token := q.Get("token")
-	if signal == "" && tokenURL == "" {
+	if signal == "" {
 		return nil, errors.New("livekit: missing signal_url")
 	}
 	if key == "" || secret == "" {
-		if !multiuser && tokenURL == "" && token == "" {
+		if !multiuser && token == "" {
 			return nil, errors.New("livekit: missing api_key or api_secret")
 		}
 	}
-	if room == "" && !multiuser && tokenURL == "" && token == "" {
+	if room == "" && !multiuser && token == "" {
 		return nil, errors.New("livekit: missing room")
 	}
 
@@ -59,15 +55,6 @@ func DecodeURL(q url.Values) (json.RawMessage, error) {
 	}
 	if prefix := q.Get("room_prefix"); prefix != "" {
 		out["room_prefix"] = prefix
-	}
-	if listen := q.Get("token_listen"); listen != "" {
-		out["token_listen"] = listen
-	}
-	if tokenURL != "" {
-		out["token_url"] = tokenURL
-	}
-	if tokenSecret := q.Get("token_secret"); tokenSecret != "" {
-		out["token_secret"] = tokenSecret
 	}
 	if token != "" {
 		out["token"] = token
@@ -114,15 +101,6 @@ func EncodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if cfg.RoomPrefix != "" {
 		q.Set("room_prefix", cfg.RoomPrefix)
-	}
-	if cfg.TokenListen != "" {
-		q.Set("token_listen", cfg.TokenListen)
-	}
-	if cfg.TokenURL != "" {
-		q.Set("token_url", cfg.TokenURL)
-	}
-	if cfg.TokenSecret != "" {
-		q.Set("token_secret", cfg.TokenSecret)
 	}
 	return nil
 }

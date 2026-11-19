@@ -54,12 +54,37 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 	return nil
 }
 
+func (s *Store) routeConflict(ctx context.Context, r Route, excludeID int64) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM routes
+		WHERE entry_node_id = ? AND exit_node_id = ? AND transport_type = ? AND id <> ?
+		LIMIT 1`,
+		r.EntryNodeID, r.ExitNodeID, r.TransportType, excludeID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, wrapDBErr(err, "check route uniqueness")
+	}
+	return id, nil
+}
+
+func routeConflictErr(r Route, existingID int64) error {
+	return fmt.Errorf("%w: route between entry node %d and exit node %d with transport %q already exists (route %d)",
+		ErrConflict, r.EntryNodeID, r.ExitNodeID, r.TransportType, existingID)
+}
+
 func (s *Store) CreateRoute(ctx context.Context, r Route) (Route, error) {
 	if err := s.validateRoute(ctx, &r); err != nil {
 		return Route{}, err
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if existingID, err := s.routeConflict(ctx, r, 0); err != nil {
+		return Route{}, err
+	} else if existingID != 0 {
+		return Route{}, routeConflictErr(r, existingID)
+	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO routes
 		(name, entry_node_id, exit_node_id, transport_type, enabled)
 		VALUES (?, ?, ?, ?, ?)`,
@@ -137,6 +162,11 @@ func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if existingID, err := s.routeConflict(ctx, r, r.ID); err != nil {
+		return Route{}, err
+	} else if existingID != 0 {
+		return Route{}, routeConflictErr(r, existingID)
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE routes SET
 		name = ?, entry_node_id = ?, exit_node_id = ?, transport_type = ?, enabled = ?
 		WHERE id = ?`,

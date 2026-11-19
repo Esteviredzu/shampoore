@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
+	"github.com/Esteviredzu/shampoore/internal/provisioner"
 )
 
 func (a *API) registerControlPlane(mux *http.ServeMux) {
@@ -30,9 +31,21 @@ func (a *API) registerControlPlane(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/users", a.listUsers)
 	mux.HandleFunc("POST /api/users", a.createUser)
 	mux.HandleFunc("GET /api/users/{id}", a.getUser)
+	mux.HandleFunc("GET /api/users/{id}/bundle", a.userBundle)
 	mux.HandleFunc("PUT /api/users/{id}", a.updateUser)
 	mux.HandleFunc("DELETE /api/users/{id}", a.deleteUser)
 	mux.HandleFunc("POST /api/users/{id}/reset-traffic", a.resetUserTraffic)
+
+	mux.HandleFunc("GET /api/settings", a.getSettings)
+	mux.HandleFunc("PUT /api/settings", a.updateSettings)
+	mux.HandleFunc("DELETE /api/settings/domain", a.deleteSettingsDomain)
+	mux.HandleFunc("POST /api/settings/caddy", a.syncCaddy)
+
+	mux.HandleFunc("GET /api/georules", a.listGeoRuleSources)
+	mux.HandleFunc("POST /api/georules/import-url", a.importGeoRule)
+	mux.HandleFunc("POST /api/georules/{name}/refresh", a.refreshGeoRule)
+	mux.HandleFunc("PUT /api/georules/{name}/nodes", a.updateGeoRuleNodes)
+	mux.HandleFunc("DELETE /api/georules/{name}", a.deleteRule)
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
@@ -123,6 +136,7 @@ func (a *API) updateNode(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
+	a.syncLocalCaddy(context.Background())
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -132,11 +146,69 @@ func (a *API) deleteNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	node, err := a.store.GetNode(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	force := false
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("force"))) {
+	case "1", "true", "yes":
+		force = true
+	}
+
+	a.deployMu.Lock()
+	if _, busy := a.deploying[id]; busy {
+		a.deployMu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Errorf("node %d is busy; wait for the current operation to finish", id))
+		return
+	}
+	a.deploying[id] = struct{}{}
+	a.deployMu.Unlock()
+	defer func() {
+		a.deployMu.Lock()
+		delete(a.deploying, id)
+		a.deployMu.Unlock()
+	}()
+
+	var cleanup *provisioner.CleanupResult
+	if a.provisioner != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+		cleanup, err = a.provisioner.CleanupNode(ctx, node)
+		cancel()
+		if err != nil && !force {
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error":   fmt.Sprintf("cleanup failed: %v (retry with ?force=true if the VPS is already gone)", err),
+				"cleanup": cleanup,
+			})
+			return
+		}
+	}
+
+	routes, _ := a.store.ListRoutes(r.Context())
+	affectedExits := make(map[int64]struct{})
+	for _, route := range routes {
+		if route.ExitNodeID != id {
+			affectedExits[route.ExitNodeID] = struct{}{}
+		}
+	}
+
 	if err := a.store.DeleteNode(r.Context(), id); err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	a.syncLocalCaddy(context.Background())
+	for exitID := range affectedExits {
+		a.scheduleRedeployIfDeployed(exitID)
+	}
+	response := map[string]any{"ok": true}
+	if cleanup != nil {
+		response["cleanup"] = cleanup
+	}
+	if err != nil && force {
+		response["warning"] = fmt.Sprintf("server cleanup failed, node removed anyway: %v", err)
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *API) deployNode(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +262,7 @@ func (a *API) deployNode(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
+	a.syncLocalCaddy(context.Background())
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -214,6 +287,7 @@ func (a *API) createRoute(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
+	a.scheduleRedeployIfDeployed(created.ExitNodeID)
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -243,11 +317,16 @@ func (a *API) updateRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	route.ID = id
+	old, oldErr := a.store.GetRoute(r.Context(), id)
 	updated, err := a.store.UpdateRoute(r.Context(), route)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
+	if oldErr == nil && old.ExitNodeID != updated.ExitNodeID {
+		a.scheduleRedeployIfDeployed(old.ExitNodeID)
+	}
+	a.scheduleRedeployIfDeployed(updated.ExitNodeID)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -257,22 +336,32 @@ func (a *API) deleteRoute(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	route, err := a.store.GetRoute(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
 	if err := a.store.DeleteRoute(r.Context(), id); err != nil {
 		writeStoreErr(w, err)
 		return
 	}
+	a.scheduleRedeployIfDeployed(route.ExitNodeID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 type userView struct {
 	panelstore.User
 	SubscriptionURL string `json:"subscription_url,omitempty"`
+	BundleURL       string `json:"bundle_url,omitempty"`
 }
 
 func (a *API) userView(u panelstore.User) userView {
 	view := userView{User: u}
-	if a.publicURL != "" {
-		view.SubscriptionURL = strings.TrimRight(a.publicURL, "/") + "/sub/" + u.SubToken
+	if url := a.currentPublicURL(); url != "" {
+		view.SubscriptionURL = strings.TrimRight(url, "/") + "/sub/" + u.SubToken
+	}
+	if u.ID != "" {
+		view.BundleURL = "/api/users/" + u.ID + "/bundle"
 	}
 	return view
 }
@@ -313,6 +402,20 @@ func (a *API) getUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.userView(user))
 }
 
+func (a *API) userBundle(w http.ResponseWriter, r *http.Request) {
+	user, err := a.store.GetUser(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	bundle, err := a.offlineBundle(r, user)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bundle)
+}
+
 func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 	var user panelstore.User
 	if err := decodeBody(w, r, &user, 1<<20); err != nil {
@@ -342,4 +445,92 @@ func (a *API) resetUserTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *API) scheduleRedeployIfDeployed(nodeID int64) {
+	if nodeID <= 0 || a.provisioner == nil || a.store == nil {
+		return
+	}
+	node, err := a.store.GetNode(context.Background(), nodeID)
+	if err != nil {
+		return
+	}
+	if node.Status != panelstore.NodeStatusDeployed && node.Status != panelstore.NodeStatusOnline {
+		return
+	}
+	a.scheduleDeploy(nodeID, "route configuration changed")
+}
+
+func (a *API) redeployDeployedExits(reason string) {
+	if a.provisioner == nil || a.store == nil {
+		return
+	}
+	nodes, err := a.store.ListNode(context.Background())
+	if err != nil {
+		a.logger.Warn("panel: list nodes for redeploy: ", err)
+		return
+	}
+	for _, node := range nodes {
+		if !node.IsExit {
+			continue
+		}
+		if node.Status != panelstore.NodeStatusDeployed && node.Status != panelstore.NodeStatusOnline {
+			continue
+		}
+		a.scheduleDeploy(node.ID, reason)
+	}
+}
+
+func (a *API) scheduleDeploy(nodeID int64, reason string) {
+	if nodeID <= 0 || a.provisioner == nil || a.store == nil {
+		return
+	}
+	a.deployMu.Lock()
+	if _, busy := a.deploying[nodeID]; busy {
+		a.pending[nodeID] = struct{}{}
+		a.deployMu.Unlock()
+		return
+	}
+	a.deploying[nodeID] = struct{}{}
+	a.deployMu.Unlock()
+	a.logger.Info(fmt.Sprintf("panel: scheduling redeploy of node %d (%s)", nodeID, reason))
+	go a.backgroundDeploy(nodeID)
+}
+
+func (a *API) backgroundDeploy(nodeID int64) {
+	defer func() {
+		a.deployMu.Lock()
+		delete(a.deploying, nodeID)
+		delete(a.pending, nodeID)
+		a.deployMu.Unlock()
+	}()
+	for {
+		node, err := a.store.GetNode(context.Background(), nodeID)
+		if err != nil {
+			a.logger.Warn("panel: background deploy: node disappeared: ", err)
+			return
+		}
+		_ = a.store.SetNodeStatus(context.Background(), nodeID, panelstore.NodeStatusDeploying, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		_, err = a.provisioner.DeployNode(ctx, node)
+		cancel()
+		statusCtx, statusCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err != nil {
+			a.logger.Warn("panel: background deploy failed: ", err)
+			_ = a.store.SetNodeStatus(statusCtx, nodeID, panelstore.NodeStatusError, err.Error())
+		} else {
+			_ = a.store.SetNodeStatus(statusCtx, nodeID, panelstore.NodeStatusDeployed, "")
+			a.syncLocalCaddy(context.Background())
+		}
+		statusCancel()
+
+		a.deployMu.Lock()
+		if _, again := a.pending[nodeID]; again {
+			delete(a.pending, nodeID)
+			a.deployMu.Unlock()
+			continue
+		}
+		a.deployMu.Unlock()
+		return
+	}
 }

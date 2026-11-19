@@ -33,15 +33,21 @@ func main() {
 	configsDir := flag.String("configs-dir", "./configs", "directory with managed configs")
 	rulesDir := flag.String("rules-dir", "./rules", "directory with geoip rule files")
 	dbPath := flag.String("db", "./panel.db", "SQLite database path for the multiuser control plane (empty disables it)")
-	publicListen := flag.String("public-listen", "", "public HTTP listen for /sub/{token} and /api/node/sync (empty disables it)")
-	publicURL := flag.String("public-url", "", "externally reachable panel URL, e.g. https://panel.example.com")
+	publicListen := flag.String("public-listen", "", "public HTTP listen for /sub/{token} and /api/node/sync (empty = settings/default 127.0.0.1:8443, \"off\" disables)")
+	publicURL := flag.String("public-url", "", "externally reachable panel URL override, e.g. https://sub.example.com (empty = use panel settings)")
 	allowPublicAdmin := flag.Bool("allow-public-admin", false,
 		"allow the admin UI to listen on a non-loopback interface (not recommended; use an SSH tunnel)")
 	autoStart := flag.Bool("auto-start-server", false,
 		"start shampoore-server automatically on panel launch (useful under systemd)")
+	cleanupAllNodes := flag.Bool("cleanup-all-nodes", false,
+		"clean up every server stored in the panel database via SSH and exit (used by uninstall --purge)")
 	flag.Parse()
 
 	logger := logging.New("panel", true)
+
+	if *cleanupAllNodes {
+		os.Exit(runCleanupAllNodes(*dbPath, *publicURL, logger))
+	}
 
 	if err := panel.ValidateAdminListen(*listen, *allowPublicAdmin); err != nil {
 		logger.Error(err)
@@ -72,10 +78,8 @@ func main() {
 	client := control.NewClient(*sockPath)
 
 	externalURL := strings.TrimSpace(*publicURL)
-	if externalURL == "" && strings.TrimSpace(*publicListen) != "" {
-		externalURL = guessPublicURL(*publicListen)
-		logger.Warn("panel: -public-url is not set; using ", externalURL, " (remote nodes may not reach this address)")
-	}
+	effectivePublicListen := strings.TrimSpace(*publicListen)
+	publicDisabled := strings.EqualFold(effectivePublicListen, "off") || strings.EqualFold(effectivePublicListen, "none")
 
 	var (
 		store *panelstore.Store
@@ -93,18 +97,49 @@ func main() {
 				logger.Warn("panel: database close: ", err)
 			}
 		}()
+		settings, err := store.GetSettings(ctx)
+		if err != nil {
+			logger.Error("panel: settings: ", err)
+		} else {
+			if effectivePublicListen == "" && !publicDisabled {
+				effectivePublicListen = settings.PublicListen
+			}
+			if externalURL == "" {
+				externalURL = strings.TrimSpace(settings.PublicURL)
+				if externalURL == "" && strings.TrimSpace(settings.PublicDomain) != "" {
+					externalURL = "https://" + strings.TrimSpace(settings.PublicDomain)
+				}
+			}
+		}
+		if effectivePublicListen == "" && !publicDisabled {
+			effectivePublicListen = panelstore.DefaultPublicListen
+		}
+		if externalURL == "" && !publicDisabled {
+			externalURL = guessPublicURL(effectivePublicListen)
+			logger.Warn("panel: public URL is not set; using ", externalURL, " (set the subscription domain in the panel UI)")
+		}
 		prov = provisioner.New(store, provisioner.Options{
-			PanelURL: externalURL,
-			Logger:   logger,
+			PanelURL:   strings.TrimSpace(*publicURL),
+			RulesDir:   *rulesDir,
+			Logger:     logger,
+			LocalHosts: provisioner.LocalHostIPs(),
 		})
 		opts = append(opts,
 			panel.WithStore(store),
 			panel.WithProvisioner(prov),
-			panel.WithPublicURL(externalURL),
+			panel.WithCaddy(panel.NewLocalCaddy()),
+			panel.WithLocalHosts(provisioner.LocalHostIPs()),
 		)
+		if !publicDisabled && effectivePublicListen != "" {
+			opts = append(opts, panel.WithPublicListen(effectivePublicListen))
+		}
+		if strings.TrimSpace(*publicURL) != "" {
+			opts = append(opts, panel.WithPublicURL(*publicURL))
+		}
 	}
 
 	api := panel.New(client, sup, logger, tokenValue, *configsDir, filter, *rulesDir, opts...)
+	api.StartGeoRuleUpdater(ctx)
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -121,20 +156,16 @@ func main() {
 	}()
 
 	var publicSrv *http.Server
-	if strings.TrimSpace(*publicListen) != "" {
-		if store == nil {
-			logger.Error("panel: -public-listen requires a database (-db)")
-			os.Exit(1)
-		}
+	if !publicDisabled && store != nil && strings.TrimSpace(effectivePublicListen) != "" {
 		publicSrv = &http.Server{
-			Addr:              *publicListen,
+			Addr:              effectivePublicListen,
 			Handler:           api.PublicHandler(),
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       60 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
 		go func() {
-			logger.Info("panel: public API listening on http://", *publicListen)
+			logger.Info("panel: public API listening on http://", effectivePublicListen)
 			if err := publicSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Error("panel: public: ", err)
 			}
@@ -168,6 +199,88 @@ func main() {
 		cancelPublic()
 	}
 	logger.Info("panel: stopped")
+}
+
+type nodeCleaner interface {
+	CleanupNode(ctx context.Context, node panelstore.Node) (*provisioner.CleanupResult, error)
+}
+
+func runCleanupAllNodes(dbPath, publicURL string, logger *logging.Logger) int {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
+		logger.Error("panel: --cleanup-all-nodes requires a non-empty --db path")
+		return 1
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		logger.Error("panel: --cleanup-all-nodes: ", err)
+		return 1
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	store, err := panelstore.Open(ctx, dbPath)
+	if err != nil {
+		logger.Error("panel: database: ", err)
+		return 1
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Warn("panel: database close: ", err)
+		}
+	}()
+
+	nodes, err := store.ListNode(ctx)
+	if err != nil {
+		logger.Error("panel: list nodes: ", err)
+		return 1
+	}
+	if len(nodes) == 0 {
+		logger.Info("panel: no servers in the database; nothing to clean up")
+		return 0
+	}
+
+	cleaner := provisioner.New(store, provisioner.Options{
+		PanelURL:   strings.TrimSpace(publicURL),
+		Logger:     logger,
+		LocalHosts: provisioner.LocalHostIPs(),
+	})
+	ok, failed := cleanupNodes(ctx, nodes, cleaner, logger)
+	logger.Info("panel: cleanup finished: ", ok, " ok, ", failed, " failed")
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+func cleanupNodes(ctx context.Context, nodes []panelstore.Node, cleaner nodeCleaner, logger *logging.Logger) (int, int) {
+	ok, failed := 0, 0
+	for _, node := range nodes {
+		logger.Info("panel: cleaning up node ", node.ID, " (", node.Name, ") at ", node.SSHUser, "@", node.SSHHost)
+		nodeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		result, err := cleaner.CleanupNode(nodeCtx, node)
+		cancel()
+		if err != nil {
+			failed++
+			logger.Warn("panel: cleanup of node ", node.ID, " (", node.Name, ") failed: ", err)
+			if result != nil {
+				for _, step := range result.Steps {
+					if step.Error != "" {
+						logger.Warn("panel: node ", node.ID, " step ", step.Name, ": ", step.Error)
+					}
+				}
+			}
+			continue
+		}
+		if result != nil && !result.Success {
+			failed++
+			logger.Warn("panel: cleanup of node ", node.ID, " (", node.Name, ") finished with errors")
+			continue
+		}
+		ok++
+		logger.Info("panel: node ", node.ID, " (", node.Name, ") cleaned up")
+	}
+	return ok, failed
 }
 
 func guessPublicURL(listen string) string {

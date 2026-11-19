@@ -149,6 +149,19 @@ fi
 chown root:"$USER_NAME" "$CONFIG_DIR/panel.env"
 chmod 0640 "$CONFIG_DIR/panel.env"
 
+log "configuring Caddy integration"
+if [ -f /etc/caddy/Caddyfile ]; then
+    install -d -o root -g "$USER_NAME" -m 2775 /etc/caddy/conf.d
+    if ! grep -q 'conf\.d/\*' /etc/caddy/Caddyfile; then
+        cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.shampoore.bak
+        printf '\nimport conf.d/*\n' >> /etc/caddy/Caddyfile
+    fi
+    systemctl reload caddy >/dev/null 2>&1 || true
+    log "Caddy drop-ins enabled in /etc/caddy/conf.d"
+else
+    log "Caddy not found; configure HTTPS for the subscription domain manually"
+fi
+
 log "installing systemd unit"
 install -o root -g root -m 0644 "$SRC_DIR/shampoore.service" /etc/systemd/system/shampoore.service
 

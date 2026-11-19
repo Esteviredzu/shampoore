@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,14 +19,19 @@ type NodeStore interface {
 	ListNode(ctx context.Context) ([]panelstore.Node, error)
 	ListRoutes(ctx context.Context) ([]panelstore.Route, error)
 	ListRoutesForExit(ctx context.Context, exitNodeID int64) ([]panelstore.Route, error)
+	GetSettings(ctx context.Context) (panelstore.Settings, error)
+	ListGeoRuleBindings(ctx context.Context) (map[string][]int64, error)
 }
 
 type Options struct {
 	PanelURL        string
 	LocalBinDir     string
+	RulesDir        string
 	Logger          *logging.Logger
 	Dial            func(ctx context.Context, node panelstore.Node) (Remote, error)
 	HostKeyCallback ssh.HostKeyCallback
+
+	LocalHosts []string
 }
 
 type Provisioner struct {
@@ -63,12 +69,31 @@ func errString(err error) string {
 	return err.Error()
 }
 
+func (p *Provisioner) panelURL(ctx context.Context) (string, error) {
+	if url := strings.TrimSpace(p.opts.PanelURL); url != "" {
+		return url, nil
+	}
+	settings, err := p.store.GetSettings(ctx)
+	if err != nil {
+		return "", fmt.Errorf("provisioner: read panel settings: %w", err)
+	}
+	if url := strings.TrimSpace(settings.PublicURL); url != "" {
+		return url, nil
+	}
+	return "", fmt.Errorf("provisioner: public URL is not configured; set it in the panel settings first")
+}
+
 func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File, error) {
 	if !node.IsRelay && !node.IsExit {
 		return nil, fmt.Errorf("provisioner: node %q has no role", node.Name)
 	}
+	panelURL, err := p.panelURL(ctx)
+	if err != nil && node.IsExit {
+		return nil, err
+	}
+	localRelay := node.IsRelay && IsLocalHost(node.SSHHost, p.opts.LocalHosts)
 	if node.IsRelay && !node.IsExit {
-		return RenderRelay(node, RenderOptions{PanelURL: p.opts.PanelURL})
+		return RenderRelay(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
 	}
 	routes, err := p.store.ListRoutesForExit(ctx, node.ID)
 	if err != nil {
@@ -78,18 +103,103 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File,
 	if err != nil {
 		return nil, err
 	}
-	exitFiles, err := RenderExit(node, routes, nodes, RenderOptions{PanelURL: p.opts.PanelURL})
+	ruleFiles, err := p.exitRuleFiles(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	exitFiles, err := RenderExit(node, routes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
 	if err != nil {
 		return nil, err
 	}
 	if !node.IsRelay {
 		return exitFiles, nil
 	}
-	relayFiles, err := RenderRelay(node, RenderOptions{PanelURL: p.opts.PanelURL})
+	relayFiles, err := RenderRelay(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
 	if err != nil {
 		return nil, err
 	}
 	return mergeRoleFiles(relayFiles, exitFiles)
+}
+
+const exitRuleStateFile = "rules.state.json"
+
+func (p *Provisioner) exitRuleFiles(ctx context.Context, node panelstore.Node) ([]File, error) {
+	keep := File{Name: "rules/.keep", Mode: 0o644}
+	dir := strings.TrimSpace(p.opts.RulesDir)
+	if dir == "" {
+		return []File{keep}, nil
+	}
+
+	state := map[string]bool{}
+	statePath := filepath.Join(dir, exitRuleStateFile)
+	if data, err := os.ReadFile(statePath); err == nil {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return nil, fmt.Errorf("provisioner: parse %s: %w", statePath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("provisioner: read %s: %w", statePath, err)
+	}
+
+	bindings, err := p.store.ListGeoRuleBindings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("provisioner: read geo rule bindings: %w", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []File{keep}, nil
+		}
+		return nil, fmt.Errorf("provisioner: read rules dir %s: %w", dir, err)
+	}
+
+	files := []File{keep}
+	active := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fileName := entry.Name()
+		if strings.HasPrefix(fileName, ".") || fileName == exitRuleStateFile {
+			continue
+		}
+		ext := filepath.Ext(fileName)
+		switch strings.ToLower(ext) {
+		case ".txt", ".json":
+		default:
+			continue
+		}
+		ruleName := strings.TrimSuffix(fileName, ext)
+		if !state[ruleName] {
+			continue
+		}
+		if ids, ok := bindings[ruleName]; ok && len(ids) > 0 && !containsNodeID(ids, node.ID) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, fileName))
+		if err != nil {
+			return nil, fmt.Errorf("provisioner: read rule %q: %w", fileName, err)
+		}
+		active[ruleName] = true
+		files = append(files, File{Name: "rules/" + fileName, Mode: 0o644, Data: data})
+	}
+
+	stateData, err := json.MarshalIndent(active, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("provisioner: encode rule state: %w", err)
+	}
+	stateData = append(stateData, '\n')
+	files = append(files, File{Name: "rules/" + exitRuleStateFile, Mode: 0o600, Data: stateData})
+	return files, nil
+}
+
+func containsNodeID(ids []int64, id int64) bool {
+	for _, candidate := range ids {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Provisioner) binaryFiles(node panelstore.Node) ([]File, error) {
@@ -109,6 +219,9 @@ func (p *Provisioner) binaryFiles(node panelstore.Node) ([]File, error) {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("provisioner: read %s: %w", path, err)
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("provisioner: binary %q is empty", path)
 		}
 		files = append(files, File{Name: "bin/" + name, Mode: 0o755, Data: data})
 	}
@@ -217,6 +330,15 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 		return fail(Step{Name: "prepare directory"}, err)
 	}
 
+	if node.IsExit {
+		cleanRulesCmd := sudo + "rm -rf /opt/shampoore/rules"
+		out, err = remote.Run(ctx, cleanRulesCmd)
+		addStep(Step{Name: "clean rules", Command: cleanRulesCmd, Output: out, Error: errString(err)})
+		if err != nil {
+			return fail(Step{Name: "clean rules", Command: cleanRulesCmd}, err)
+		}
+	}
+
 	if err := remote.Upload(ctx, "/opt/shampoore", files, sudo != ""); err != nil {
 		return fail(Step{Name: "upload files"}, err)
 	}
@@ -233,11 +355,24 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 		return fail(Step{Name: "detect compose", Command: "docker compose version"}, errors.New("docker compose is not available"))
 	}
 
-	upCmd := compose + " -f /opt/shampoore/docker-compose.yml up -d --remove-orphans"
+	upCmd := compose + " -f /opt/shampoore/docker-compose.yml up -d --force-recreate --remove-orphans"
 	out, err = remote.Run(ctx, upCmd)
 	addStep(Step{Name: "compose up", Command: upCmd, Output: out, Error: errString(err)})
 	if err != nil {
 		return fail(Step{Name: "compose up", Command: upCmd}, err)
+	}
+
+	if hasEnabledTransport(node, panelstore.TransportSilo) {
+		bucket := strings.TrimSpace(node.GeneratedSecrets["s3_bucket"])
+		if bucket == "" {
+			return fail(Step{Name: "create silo bucket"}, errors.New("silo transport is enabled but s3_bucket is empty"))
+		}
+		bucketCmd := sudo + "docker exec shampoore-silo mkdir -p " + shellQuote("/data/"+bucket)
+		out, err = remote.Run(ctx, bucketCmd)
+		addStep(Step{Name: "create silo bucket", Command: bucketCmd, Output: out, Error: errString(err)})
+		if err != nil {
+			return fail(Step{Name: "create silo bucket", Command: bucketCmd}, err)
+		}
 	}
 
 	psCmd := compose + " -f /opt/shampoore/docker-compose.yml ps"
@@ -249,5 +384,80 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 
 	result.Success = true
 	p.logf("provisioner: node %d deployed", node.ID)
+	return result, nil
+}
+
+func hasEnabledTransport(node panelstore.Node, kind string) bool {
+	for _, tr := range node.Transports {
+		if tr.Enabled && tr.Type == kind {
+			return true
+		}
+	}
+	return false
+}
+
+type CleanupResult struct {
+	NodeID  int64  `json:"node_id"`
+	Success bool   `json:"success"`
+	Steps   []Step `json:"steps"`
+}
+
+func (p *Provisioner) CleanupNode(ctx context.Context, node panelstore.Node) (*CleanupResult, error) {
+	result := &CleanupResult{NodeID: node.ID}
+	addStep := func(step Step) { result.Steps = append(result.Steps, step) }
+	fail := func(step Step, err error) (*CleanupResult, error) {
+		step.Error = err.Error()
+		addStep(step)
+		result.Success = false
+		return result, err
+	}
+
+	dial := p.opts.Dial
+	if dial == nil {
+		dial = func(ctx context.Context, n panelstore.Node) (Remote, error) {
+			return dialSSH(ctx, n, p.opts.HostKeyCallback)
+		}
+	}
+	remote, err := dial(ctx, node)
+	if err != nil {
+		return fail(Step{Name: "ssh connect", Command: node.SSHHost}, err)
+	}
+	defer remote.Close()
+	addStep(Step{Name: "ssh connect", Output: node.SSHUser + "@" + node.SSHHost})
+
+	sudo := ""
+	if out, err := remote.Run(ctx, "id -u"); err == nil && strings.TrimSpace(out) != "0" {
+		sudo = "sudo -n "
+	}
+
+	if out, err := remote.Run(ctx, sudo+"test -f /opt/shampoore/docker-compose.yml"); err == nil {
+		_ = out
+		compose := ""
+		if out, err := remote.Run(ctx, sudo+"docker compose version"); err == nil {
+			compose = sudo + "docker compose"
+			addStep(Step{Name: "detect compose", Command: sudo + "docker compose version", Output: strings.TrimSpace(out)})
+		} else if out, err := remote.Run(ctx, sudo+"docker-compose version"); err == nil {
+			compose = sudo + "docker-compose"
+			addStep(Step{Name: "detect compose", Command: sudo + "docker-compose version", Output: strings.TrimSpace(out)})
+		}
+		if compose != "" {
+			downCmd := compose + " -f /opt/shampoore/docker-compose.yml down -v --remove-orphans"
+			out, err := remote.Run(ctx, downCmd)
+			addStep(Step{Name: "compose down", Command: downCmd, Output: out, Error: errString(err)})
+			if err != nil {
+				return fail(Step{Name: "compose down", Command: downCmd}, err)
+			}
+		}
+	}
+
+	rmCmd := sudo + "rm -rf /opt/shampoore"
+	out, err := remote.Run(ctx, rmCmd)
+	addStep(Step{Name: "remove files", Command: rmCmd, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "remove files", Command: rmCmd}, err)
+	}
+
+	result.Success = true
+	p.logf("provisioner: node %d cleaned up", node.ID)
 	return result, nil
 }

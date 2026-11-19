@@ -1,7 +1,10 @@
 package provisioner
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,18 +20,16 @@ import (
 
 func secretsFor(name string) map[string]string {
 	return map[string]string{
-		"encryption_password":  "enc-" + name,
-		"raw_ws_password":      "ws-" + name,
-		"livekit_api_key":      "key-" + name,
-		"livekit_api_secret":   "secret-" + name,
-		"livekit_token_secret": "token-secret-" + name,
-		"livekit_token_listen": "127.0.0.1:8099",
-		"minio_root_user":      "minio-" + name,
-		"minio_root_password":  "minio-pass-" + name,
-		"s3_access_key":        "s3-key-" + name,
-		"s3_secret_key":        "s3-secret-" + name,
-		"s3_bucket":            "bucket-" + name,
-		"tunnel_id":            "shampoore",
+		"encryption_password": "enc-" + name,
+		"raw_ws_password":     "ws-" + name,
+		"livekit_api_key":     "key-" + name,
+		"livekit_api_secret":  "secret-" + name,
+		"minio_root_user":     "minio-" + name,
+		"minio_root_password": "minio-pass-" + name,
+		"s3_access_key":       "s3-key-" + name,
+		"s3_secret_key":       "s3-secret-" + name,
+		"s3_bucket":           "bucket-" + name,
+		"tunnel_id":           "shampoore",
 	}
 }
 
@@ -69,7 +70,7 @@ func TestRenderRelay(t *testing.T) {
 			t.Fatalf("Caddyfile missing %s:\n%s", domain, caddy)
 		}
 	}
-	for _, proxy := range []string{"reverse_proxy relay:8787", "reverse_proxy minio:9000", "reverse_proxy livekit:7880"} {
+	for _, proxy := range []string{"reverse_proxy relay:8787", "reverse_proxy silo:9000", "reverse_proxy livekit:7880"} {
 		if !strings.Contains(caddy, proxy) {
 			t.Fatalf("Caddyfile missing %q:\n%s", proxy, caddy)
 		}
@@ -80,10 +81,30 @@ func TestRenderRelay(t *testing.T) {
 		t.Fatalf("compose yaml: %v", err)
 	}
 	services, _ := compose["services"].(map[string]any)
-	for _, name := range []string{"caddy", "relay", "livekit", "minio", "minio-init"} {
+	for _, name := range []string{"caddy", "relay", "livekit", "silo"} {
 		if services[name] == nil {
 			t.Fatalf("compose missing service %q", name)
 		}
+	}
+	for _, name := range []string{"minio", "minio-init"} {
+		if services[name] != nil {
+			t.Fatalf("compose still contains legacy service %q", name)
+		}
+	}
+	relayService, _ := services["relay"].(map[string]any)
+	if relayService["image"] != "debian:bookworm-slim" {
+		t.Fatalf("relay image = %v, want debian:bookworm-slim", relayService["image"])
+	}
+	siloService, _ := services["silo"].(map[string]any)
+	if siloService["image"] != "docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z" {
+		t.Fatalf("silo image = %v", siloService["image"])
+	}
+	siloEnv, _ := siloService["environment"].(map[string]any)
+	if siloEnv["MINIO_SERVER_URL"] != "https://s3.example.com" {
+		t.Fatalf("MINIO_SERVER_URL = %v", siloEnv["MINIO_SERVER_URL"])
+	}
+	if !hasComposeVolume(siloService, "./silo-data:/data") {
+		t.Fatalf("silo volumes = %v", siloService["volumes"])
 	}
 	if strings.Contains(string(m["docker-compose.yml"].Data), "{{") {
 		t.Fatal("unrendered template markers in compose")
@@ -100,6 +121,109 @@ func TestRenderRelay(t *testing.T) {
 	keys, _ := livekit["keys"].(map[string]any)
 	if keys["key-relay"] != "secret-relay" {
 		t.Fatalf("livekit keys = %+v", keys)
+	}
+}
+
+func hasComposeVolume(service map[string]any, want string) bool {
+	volumes, _ := service["volumes"].([]any)
+	for _, volume := range volumes {
+		if volume == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRenderRelayLiveKitOnly(t *testing.T) {
+	node := panelstore.Node{
+		ID:               2,
+		Name:             "relay-livekit",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("livekit"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportLiveKit, Domain: "lk.example.com", Enabled: true},
+		},
+	}
+	files, err := RenderRelay(node, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	var compose map[string]any
+	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &compose); err != nil {
+		t.Fatalf("compose yaml: %v", err)
+	}
+	services, _ := compose["services"].(map[string]any)
+	if len(services) != 2 {
+		t.Fatalf("services = %v, want only caddy and livekit", services)
+	}
+	for _, name := range []string{"caddy", "livekit"} {
+		if services[name] == nil {
+			t.Fatalf("compose missing service %q", name)
+		}
+	}
+	for _, name := range []string{"relay", "silo", "minio", "minio-init"} {
+		if services[name] != nil {
+			t.Fatalf("livekit-only compose contains unexpected service %q", name)
+		}
+	}
+	caddyService, _ := services["caddy"].(map[string]any)
+	deps, _ := caddyService["depends_on"].([]any)
+	if len(deps) != 1 || deps[0] != "livekit" {
+		t.Fatalf("caddy depends_on = %v, want [livekit]", deps)
+	}
+	caddy := string(m["Caddyfile"].Data)
+	if !strings.Contains(caddy, "reverse_proxy livekit:7880") {
+		t.Fatalf("Caddyfile missing livekit upstream:\n%s", caddy)
+	}
+	if strings.Contains(caddy, "relay:8787") || strings.Contains(caddy, "silo:9000") {
+		t.Fatalf("Caddyfile contains disabled upstreams:\n%s", caddy)
+	}
+}
+
+func TestRenderRelaySiloOnly(t *testing.T) {
+	node := panelstore.Node{
+		ID:               3,
+		Name:             "relay-silo",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("silo"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportSilo, Domain: "s3.example.com", Enabled: true},
+		},
+	}
+	files, err := RenderRelay(node, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	var compose map[string]any
+	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &compose); err != nil {
+		t.Fatalf("compose yaml: %v", err)
+	}
+	services, _ := compose["services"].(map[string]any)
+	if len(services) != 2 {
+		t.Fatalf("services = %v, want only caddy and silo", services)
+	}
+	for _, name := range []string{"caddy", "silo"} {
+		if services[name] == nil {
+			t.Fatalf("compose missing service %q", name)
+		}
+	}
+	for _, name := range []string{"relay", "livekit", "minio", "minio-init"} {
+		if services[name] != nil {
+			t.Fatalf("silo-only compose contains unexpected service %q", name)
+		}
+	}
+	siloService, _ := services["silo"].(map[string]any)
+	if siloService["image"] != "docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z" {
+		t.Fatalf("silo image = %v", siloService["image"])
+	}
+	caddy := string(m["Caddyfile"].Data)
+	if !strings.Contains(caddy, "reverse_proxy silo:9000") {
+		t.Fatalf("Caddyfile missing silo upstream:\n%s", caddy)
+	}
+	if strings.Contains(caddy, "minio:9000") || strings.Contains(caddy, "relay:8787") {
+		t.Fatalf("Caddyfile contains unexpected upstreams:\n%s", caddy)
 	}
 }
 
@@ -142,9 +266,14 @@ func TestMergeRoleFilesForDirectNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	services, _ := compose["services"].(map[string]any)
-	for _, name := range []string{"caddy", "relay", "livekit", "minio", "shampoore-server", "node-agent"} {
+	for _, name := range []string{"caddy", "relay", "shampoore-server", "node-agent"} {
 		if services[name] == nil {
 			t.Fatalf("combined compose missing %q", name)
+		}
+	}
+	for _, name := range []string{"livekit", "silo", "minio", "minio-init"} {
+		if services[name] != nil {
+			t.Fatalf("combined compose contains unexpected %q", name)
 		}
 	}
 	if _, ok := m["configs/route-9.json"]; !ok {
@@ -185,7 +314,7 @@ func TestRenderExit(t *testing.T) {
 	}
 	m := fileMap(files)
 	compose := string(m["docker-compose.yml"].Data)
-	for _, want := range []string{"shampoore-server", "node-agent", "socks-listen=:1080", "3=socks5://198.51.100.9:1081", "-c", "/opt/shampoore/configs/route-7.json"} {
+	for _, want := range []string{"shampoore-server", "node-agent", "socks-listen=:1080", "3=socks5://198.51.100.9:1081", "-c", "/opt/shampoore/configs/route-7.json", "./rules:/opt/shampoore/rules:ro", "--rules-dir=/opt/shampoore/rules"} {
 		if !strings.Contains(compose, want) {
 			t.Fatalf("compose missing %q:\n%s", want, compose)
 		}
@@ -236,14 +365,14 @@ func TestRenderExit(t *testing.T) {
 	}
 }
 
-func TestRenderExitLiveKitOnDemandServerConfig(t *testing.T) {
+func TestRenderExitLiveKitSubscriptionServerConfig(t *testing.T) {
 	relay := panelstore.Node{
 		ID:               1,
 		Name:             "relay",
 		IsRelay:          true,
 		GeneratedSecrets: secretsFor("relay"),
 		Transports: []panelstore.Transport{
-			{Type: panelstore.TransportLiveKit, Domain: "lk.example.com", Enabled: true, OnDemand: true},
+			{Type: panelstore.TransportLiveKit, Domain: "lk.example.com", Enabled: true},
 		},
 	}
 	exit := panelstore.Node{
@@ -274,9 +403,6 @@ func TestRenderExitLiveKitOnDemandServerConfig(t *testing.T) {
 	if err := json.Unmarshal(cfgFile.Data, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings.Type != "livekit_datachannel" {
-		t.Fatalf("type = %q", settings.Type)
-	}
 	var tr map[string]any
 	if err := json.Unmarshal(settings.Transport, &tr); err != nil {
 		t.Fatal(err)
@@ -284,19 +410,119 @@ func TestRenderExitLiveKitOnDemandServerConfig(t *testing.T) {
 	if tr["multiuser"] != true {
 		t.Fatalf("multiuser = %v", tr["multiuser"])
 	}
-	if users, ok := tr["users"].([]any); !ok || len(users) != 0 {
-		t.Fatalf("users = %#v, want empty array", tr["users"])
-	}
-	if tr["api_secret"] != "secret-relay" {
-		t.Fatalf("server config api_secret = %v", tr["api_secret"])
-	}
-	if tr["token_secret"] != "token-secret-relay" {
-		t.Fatalf("token_secret = %v", tr["token_secret"])
-	}
-	if tr["token_listen"] != "127.0.0.1:8099" {
-		t.Fatalf("token_listen = %v", tr["token_listen"])
-	}
-	if tr["room_prefix"] != "shampoore-route-9" {
+	if tr["room_prefix"] != "route-9" {
 		t.Fatalf("room_prefix = %v", tr["room_prefix"])
+	}
+	if _, ok := tr["token_listen"]; ok {
+		t.Fatalf("subscription config has token_listen: %v", tr)
+	}
+	if _, ok := tr["token_secret"]; ok {
+		t.Fatalf("subscription config has token_secret: %v", tr)
+	}
+}
+
+func TestRenderRelayLocalOmitsCaddyAndUsesLoopbackPorts(t *testing.T) {
+	node := panelstore.Node{
+		ID:               11,
+		Name:             "panel-host",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("local"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+			{Type: panelstore.TransportSilo, Domain: "s3.example.com", Enabled: true},
+			{Type: panelstore.TransportLiveKit, Domain: "lk.example.com", Enabled: true},
+		},
+	}
+	files, err := RenderRelay(node, RenderOptions{LocalRelay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	var compose map[string]any
+	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &compose); err != nil {
+		t.Fatalf("compose yaml: %v", err)
+	}
+	services, _ := compose["services"].(map[string]any)
+	if services["caddy"] != nil {
+		t.Fatal("local relay must not start a containerized Caddy")
+	}
+	for _, name := range []string{"relay", "livekit", "silo"} {
+		if services[name] == nil {
+			t.Fatalf("compose missing service %q", name)
+		}
+	}
+	raw := string(m["docker-compose.yml"].Data)
+	for _, port := range []string{"127.0.0.1:8787:8787", "127.0.0.1:7880:7880", "127.0.0.1:9000:9000"} {
+		if !strings.Contains(raw, port) {
+			t.Fatalf("local compose missing loopback port %q:\n%s", port, raw)
+		}
+	}
+	if strings.Contains(raw, "80:80") || strings.Contains(raw, "443:443") {
+		t.Fatalf("local compose must not bind 80/443:\n%s", raw)
+	}
+}
+
+func TestExitRuleFilesSelectsAssignedActiveRules(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.txt":        "1.1.1.0/24\n",
+		"b.txt":        "2.2.2.0/24\n",
+		"global.txt":   "3.3.3.0/24\n",
+		"disabled.txt": "4.4.4.0/24\n",
+		"rules.state.json": `{
+  "a": true,
+  "b": true,
+  "global": true,
+  "disabled": false
+}
+`,
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &fakeStore{bindings: map[string][]int64{
+		"a": []int64{2},
+		"b": []int64{3},
+	}}
+	p := New(store, Options{RulesDir: dir})
+	out, err := p.exitRuleFiles(context.Background(), panelstore.Node{ID: 2, Name: "exit", IsExit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(out)
+	for _, want := range []string{"rules/a.txt", "rules/global.txt", "rules/rules.state.json", "rules/.keep"} {
+		if _, ok := m[want]; !ok {
+			t.Fatalf("archive missing %q: %v", want, m)
+		}
+	}
+	for _, unexpected := range []string{"rules/b.txt", "rules/disabled.txt"} {
+		if _, ok := m[unexpected]; ok {
+			t.Fatalf("archive contains %q: %v", unexpected, m)
+		}
+	}
+	var state map[string]bool
+	if err := json.Unmarshal(m["rules/rules.state.json"].Data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state["a"] || !state["global"] || state["b"] || state["disabled"] || len(state) != 2 {
+		t.Fatalf("shipped rule state = %+v", state)
+	}
+}
+
+func TestRenderExitAppendsRuleFiles(t *testing.T) {
+	exit := panelstore.Node{ID: 2, Name: "exit", IsExit: true, SocksPort: 1080}
+	ruleFile := File{Name: "rules/a.txt", Mode: 0o644, Data: []byte("1.1.1.0/24\n")}
+	files, err := RenderExit(exit, nil, []panelstore.Node{exit}, RenderOptions{
+		PanelURL:  "https://panel.example.com",
+		RuleFiles: []File{ruleFile},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := fileMap(files)["rules/a.txt"]
+	if !ok || string(got.Data) != "1.1.1.0/24\n" {
+		t.Fatalf("rule file = %+v, ok=%v", got, ok)
 	}
 }

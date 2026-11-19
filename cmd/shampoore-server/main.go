@@ -164,7 +164,8 @@ func main() {
 
 	logger.Info("server: ready (", len(mgr.List()), " configs, dir=",
 		*configsDir, ", socket=", *controlSock, ", cli_mode=", cliMode,
-		", rules=", len(filter.Rules()), ", block_unknown=", *blockUnknown, ")")
+		", rules=", len(filter.Rules()), ", rules_dir=", *rulesDir,
+		", geo_action=", filter.Action(), ", block_unknown=", *blockUnknown, ")")
 	<-ctx.Done()
 	logger.Info("server: stopping")
 	mgr.Close()

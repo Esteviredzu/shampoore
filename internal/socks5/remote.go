@@ -3,6 +3,7 @@ package socks5
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -14,6 +15,8 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
+
+const remoteResolveTimeout = 10 * time.Second
 
 func dialTCP(ctx context.Context, target string, ipv4Only bool, upstream string) (net.Conn, error) {
 	if upstream != "" {
@@ -57,6 +60,7 @@ type RemoteHandler struct {
 	filter        *geofilter.Filter
 	blockUnknown  bool
 	exitUpstreams map[string]string
+	lookupIP      func(context.Context, string) ([]net.IP, error)
 
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
@@ -138,6 +142,98 @@ func (s *RemoteHandler) shouldBlock(ip net.IP) bool {
 	return blockUnknown
 }
 
+func lookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr.IP == nil {
+			continue
+		}
+		ips = append(ips, addr.IP)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IP addresses for %s", host)
+	}
+	return ips, nil
+}
+
+func (s *RemoteHandler) resolveDestinationIPs(ctx context.Context, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+	lookup := s.lookupIP
+	if lookup == nil {
+		lookup = lookupHostIPs
+	}
+	rctx, cancel := context.WithTimeout(ctx, remoteResolveTimeout)
+	defer cancel()
+	return lookup(rctx, host)
+}
+
+func (s *RemoteHandler) geoActive() bool {
+	s.cfgMu.RLock()
+	filter := s.filter
+	blockUnknown := s.blockUnknown
+	s.cfgMu.RUnlock()
+	if filter == nil {
+		return false
+	}
+	if blockUnknown {
+		return true
+	}
+	for _, rule := range filter.Rules() {
+		if rule.Enabled && len(rule.CIDRs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *RemoteHandler) blockedDestination(ctx context.Context, host string) (net.IP, bool) {
+	if !s.geoActive() {
+		return nil, false
+	}
+	ips, err := s.resolveDestinationIPs(ctx, host)
+	if err != nil {
+		s.logger.Warn("remote: resolve destination ", host, " for GeoIP check: ", err)
+		return nil, true
+	}
+	for _, ip := range ips {
+		if s.shouldBlock(ip) {
+			return ip, true
+		}
+	}
+	return nil, false
+}
+
+func (s *RemoteHandler) blockedConnIP(conn net.Conn) net.IP {
+	if conn == nil {
+		return nil
+	}
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return nil
+	}
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip = a.IP
+	case *net.UDPAddr:
+		ip = a.IP
+	default:
+		if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+			ip = net.ParseIP(host)
+		}
+	}
+	if ip == nil || !s.shouldBlock(ip) {
+		return nil
+	}
+	return ip
+}
+
 func NewRemoteHandler(
 	ctx context.Context,
 	m multiplexing.StreamMultiplexer,
@@ -154,6 +250,7 @@ func NewRemoteHandler(
 		logger:    logger,
 		chunkSize: chunkSize,
 		ipv4Only:  ipv4Only,
+		lookupIP:  lookupHostIPs,
 		streams:   make(map[multiplexing.Stream]struct{}),
 		ctx:       sctx,
 		cancel:    cancel,
@@ -232,20 +329,19 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		return
 	}
 
-	ip := net.ParseIP(host)
-	if ip == nil {
-		if resolved, err := resolveIPv4(host); err == nil {
-			ip = net.ParseIP(resolved)
+	if blockedIP, blocked := s.blockedDestination(s.ctx, host); blocked {
+		if blockedIP != nil {
+			s.logger.Warn("remote: ", streamID, " blocked destination by GeoIP filter: ",
+				host, " (", blockedIP, ")")
+		} else {
+			s.logger.Warn("remote: ", streamID, " blocked destination: GeoIP check failed for ", host)
 		}
-	}
-	if ip != nil && s.shouldBlock(ip) {
-		s.logger.Warn("remote: ", streamID, " blocked destination by GeoIP filter: ", host)
 		s.closeStream(stream)
 		return
 	}
 
 	if s.ipv4Only {
-		if ip != nil && ip.To4() == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
 			s.logger.Warn("remote: ", streamID, " ipv6 destination rejected: ", host)
 			s.closeStream(stream)
 			return
@@ -276,6 +372,15 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		s.logger.Warn("remote: ", streamID, " connect failed: ", err)
 		s.closeStream(stream)
 		return
+	}
+	if upstream == "" {
+		if blockedIP := s.blockedConnIP(conn); blockedIP != nil {
+			s.logger.Warn("remote: ", streamID, " blocked connected IP by GeoIP filter: ",
+				blockedIP, " (", target, ")")
+			_ = conn.Close()
+			s.closeStream(stream)
+			return
+		}
 	}
 
 	s.logger.Debug("remote: ", streamID, " connected")
@@ -362,6 +467,15 @@ func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string,
 		s.logger.Warn("remote udp: ", streamID, " dial ", target, ": ", err)
 		s.closeStream(stream)
 		return
+	}
+	if upstream == "" {
+		if blockedIP := s.blockedConnIP(conn); blockedIP != nil {
+			s.logger.Warn("remote udp: ", streamID, " blocked connected IP by GeoIP filter: ",
+				blockedIP, " (", target, ")")
+			_ = conn.Close()
+			s.closeStream(stream)
+			return
+		}
 	}
 
 	s.logger.Debug("remote udp: ", streamID, " -> ", target)

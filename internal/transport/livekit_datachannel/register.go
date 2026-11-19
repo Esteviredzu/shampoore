@@ -67,14 +67,14 @@ func init() {
 				Label:    "User ID",
 				Type:     app.FieldTypeText,
 				Required: false,
-				Hint:     "Multiuser / on-demand: identifies the user when requesting a session",
+				Hint:     "Multiuser: joins the personal room <room_prefix>-<user_id>",
 			},
 			{
 				Key:      "multiuser",
 				Label:    "Multiuser server",
 				Type:     app.FieldTypeBool,
 				Required: false,
-				Hint:     "Server only: create LiveKit rooms on demand",
+				Hint:     "Server only: run one isolated room per active user",
 			},
 			{
 				Key:         "room_prefix",
@@ -82,28 +82,6 @@ func init() {
 				Type:        app.FieldTypeText,
 				Required:    false,
 				Placeholder: "shampoore",
-			},
-			{
-				Key:         "token_listen",
-				Label:       "Token Listen",
-				Type:        app.FieldTypeText,
-				Required:    false,
-				Placeholder: "127.0.0.1:8099",
-				Hint:        "Server: HTTP address for POST /session (also accepted as the client endpoint)",
-			},
-			{
-				Key:         "token_url",
-				Label:       "Token URL",
-				Type:        app.FieldTypeText,
-				Required:    false,
-				Placeholder: "https://server.example/session",
-			},
-			{
-				Key:      "token_secret",
-				Label:    "Token Secret",
-				Type:     app.FieldTypePassword,
-				Required: false,
-				Hint:     "Optional X-Shampoore-Secret value for the session endpoint",
 			},
 		},
 		Defaults:  defaults,
@@ -150,9 +128,6 @@ func build(
 		s.ExitNodeID = cfg.ExitNodeID
 	}
 	if role != "server" {
-		if strings.TrimSpace(cfg.TokenURL) == "" {
-			cfg.TokenURL = lk.NormalizeTokenURL(cfg.TokenListen)
-		}
 		if strings.TrimSpace(cfg.Identity) == "" && strings.TrimSpace(cfg.UserID) != "" {
 			cfg.Identity = cfg.UserID
 		}
@@ -172,9 +147,8 @@ func build(
 			Registry:       registry,
 		}
 		srv := lk.NewMultiServer(cfg, logger, registry, muxCfg, s.EncryptionPassword)
-		logger.Info("livekit_datachannel: on-demand multiuser server ready (signal_url=",
-			cfg.SignalURL, " token_listen=", cfg.TokenListen,
-			" users=", len(cfg.Users), ")")
+		logger.Info("livekit_datachannel: multiuser server ready (signal_url=", cfg.SignalURL,
+			" room_prefix=", cfg.RoomPrefix, " users=", len(cfg.Users), ")")
 		return &app.BuildResult{
 			SessionServer: srv,
 			UserRegistry:  registry,
@@ -183,7 +157,7 @@ func build(
 	}
 
 	logger.Info("livekit_datachannel: signal_url=", cfg.SignalURL,
-		" room=", cfg.Room, " token_url=", cfg.TokenURL, " user=", cfg.UserID)
+		" room=", cfg.Room, " user=", cfg.UserID)
 
 	provider, err := lk.NewProvider(ctx, cfg, logger)
 	if err != nil {
@@ -242,12 +216,12 @@ func bypassHosts(ctx context.Context, signalURL string) []string {
 
 func routeRoomPrefix(p app.RouteParams) string {
 	if p.RouteID > 0 {
-		return "shampoore-route-" + strconv.FormatInt(p.RouteID, 10)
+		return "route-" + strconv.FormatInt(p.RouteID, 10)
 	}
 	if name := strings.TrimSpace(p.RouteName); name != "" {
-		return "shampoore-" + name
+		return name
 	}
-	return "shampoore-route"
+	return "route"
 }
 
 func buildSubscriptionConfig(p app.RouteParams) (app.Settings, error) {
@@ -258,26 +232,17 @@ func buildSubscriptionConfig(p app.RouteParams) (app.Settings, error) {
 	cfg := lk.Config{
 		SignalURL:  signalURL,
 		APIKey:     p.Secret("livekit_api_key"),
+		APISecret:  p.Secret("livekit_api_secret"),
 		DataTopic:  "shampoore",
 		RoomPrefix: routeRoomPrefix(p),
 		UserID:     p.UserID,
 		ExitNodeID: p.ExitNodeID,
 	}
-	if p.OnDemand {
-
-		cfg.TokenURL = strings.TrimSpace(p.TokenURL)
-		if cfg.TokenURL == "" {
-			cfg.TokenURL = app.NormalizeHTTPSURL(p.Domain) + "/session"
-		}
-		cfg.TokenSecret = strings.TrimSpace(p.TokenSecret)
-	} else {
-		cfg.APISecret = p.Secret("livekit_api_secret")
-		cfg.Room = routeRoomPrefix(p) + "-" + strings.ToLower(p.UserID)
-		if tokenURL := strings.TrimSpace(p.Secret("livekit_token_url")); tokenURL != "" {
-			cfg.TokenURL = tokenURL
-			cfg.TokenSecret = p.Secret("livekit_token_secret")
-		}
+	userID := strings.TrimSpace(p.UserID)
+	if userID == "" {
+		return app.Settings{}, errors.New("livekit: user_id is required for multiuser subscription")
 	}
+	cfg.Room = lk.RoomForUser(cfg.RoomPrefix, userID)
 	if err := cfg.ValidateForRole("client"); err != nil {
 		return app.Settings{}, err
 	}
@@ -289,20 +254,14 @@ func buildServerConfig(p app.RouteParams) (app.Settings, error) {
 	if strings.TrimSpace(signalURL) == "" || signalURL == "wss://" {
 		return app.Settings{}, errors.New("livekit: signal domain is required")
 	}
-	tokenListen := strings.TrimSpace(p.Secret("livekit_token_listen"))
-	if tokenListen == "" {
-		tokenListen = "127.0.0.1:8099"
-	}
 	cfg := lk.Config{
-		SignalURL:   signalURL,
-		APIKey:      p.Secret("livekit_api_key"),
-		APISecret:   p.Secret("livekit_api_secret"),
-		Multiuser:   true,
-		Users:       make([]auth.UserSpec, 0),
-		DataTopic:   "shampoore",
-		RoomPrefix:  routeRoomPrefix(p),
-		TokenListen: tokenListen,
-		TokenSecret: p.Secret("livekit_token_secret"),
+		SignalURL:  signalURL,
+		APIKey:     p.Secret("livekit_api_key"),
+		APISecret:  p.Secret("livekit_api_secret"),
+		Multiuser:  true,
+		Users:      make([]auth.UserSpec, 0),
+		DataTopic:  "shampoore",
+		RoomPrefix: routeRoomPrefix(p),
 	}
 	if err := cfg.ValidateForRole("server"); err != nil {
 		return app.Settings{}, err

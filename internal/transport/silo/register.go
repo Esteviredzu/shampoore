@@ -45,7 +45,7 @@ func init() {
 		Aliases:                 []string{"silo"},
 		BuildSubscriptionConfig: buildSubscriptionConfig,
 		BuildServerConfig:       buildServerConfig,
-		RelayUpstream:           "minio:9000",
+		RelayUpstream:           "silo:9000",
 		RelaySecrets:            []string{"minio_root_user", "minio_root_password", "s3_bucket"},
 	})
 	if err != nil {
@@ -205,8 +205,14 @@ func routeTunnelID(p app.RouteParams) string {
 func routeSiloConfig(p app.RouteParams, server bool) Config {
 	cfg := DefaultConfig()
 	cfg.Endpoint = app.HostOnly(p.Domain)
-	cfg.AccessKey = p.Secret("s3_access_key")
-	cfg.SecretKey = p.Secret("s3_secret_key")
+	cfg.AccessKey = strings.TrimSpace(p.Secret("s3_access_key"))
+	cfg.SecretKey = strings.TrimSpace(p.Secret("s3_secret_key"))
+	if cfg.AccessKey == "" {
+		cfg.AccessKey = p.Secret("minio_root_user")
+	}
+	if cfg.SecretKey == "" {
+		cfg.SecretKey = p.Secret("minio_root_password")
+	}
 	cfg.Bucket = p.Secret("s3_bucket")
 	cfg.UseSSL = !strings.HasPrefix(strings.ToLower(strings.TrimSpace(p.Domain)), "http://")
 	cfg.TunnelID = routeTunnelID(p)

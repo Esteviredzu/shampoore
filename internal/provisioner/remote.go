@@ -3,11 +3,13 @@ package provisioner
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -110,48 +112,26 @@ func (r *sshRemote) Run(ctx context.Context, command string) (string, error) {
 }
 
 func (r *sshRemote) Upload(ctx context.Context, dir string, files []File, sudo bool) error {
+
+	var archive bytes.Buffer
+	if err := writeUploadArchive(&archive, files); err != nil {
+		return fmt.Errorf("provisioner: build upload archive: %w", err)
+	}
+
 	session, err := r.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("provisioner: ssh upload session: %w", err)
 	}
 	defer session.Close()
 
-	pr, pw := io.Pipe()
-	session.Stdin = pr
+	session.Stdin = bytes.NewReader(archive.Bytes())
 	var stderr bytes.Buffer
 	session.Stderr = &stderr
-
-	writeErr := make(chan error, 1)
-	go func() {
-		tw := tar.NewWriter(pw)
-		var err error
-		for _, f := range files {
-			hdr := &tar.Header{
-				Name: f.Name,
-				Mode: f.Mode,
-				Size: int64(len(f.Data)),
-			}
-			if err = tw.WriteHeader(hdr); err != nil {
-				break
-			}
-			if _, err = tw.Write(f.Data); err != nil {
-				break
-			}
-		}
-		if closeErr := tw.Close(); err == nil {
-			err = closeErr
-		}
-		if closeErr := pw.Close(); err == nil {
-			err = closeErr
-		}
-		writeErr <- err
-	}()
 
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = pr.CloseWithError(ctx.Err())
 			_ = session.Close()
 		case <-done:
 		}
@@ -163,17 +143,59 @@ func (r *sshRemote) Upload(ctx context.Context, dir string, files []File, sudo b
 	}
 	cmd := prefix + "mkdir -p " + shellQuote(dir) + " && " + prefix + "tar -xzf - -C " + shellQuote(dir)
 	err = session.Run(cmd)
-	_ = pr.CloseWithError(nil)
 	close(done)
-	werr := <-writeErr
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
 		return fmt.Errorf("provisioner: upload: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
-	if werr != nil && !errors.Is(werr, io.ErrClosedPipe) {
-		return fmt.Errorf("provisioner: upload stream: %w", werr)
+	return nil
+}
+
+func writeUploadArchive(w io.Writer, files []File) error {
+	gz := gzip.NewWriter(w)
+	tw := tar.NewWriter(gz)
+
+	err := func() error {
+		for _, f := range files {
+			if err := validateArchiveName(f.Name); err != nil {
+				return fmt.Errorf("file %q: %w", f.Name, err)
+			}
+			hdr := &tar.Header{
+				Name:     f.Name,
+				Mode:     f.Mode,
+				Size:     int64(len(f.Data)),
+				Typeflag: tar.TypeReg,
+			}
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fmt.Errorf("file %q: write header: %w", f.Name, err)
+			}
+			if _, err := tw.Write(f.Data); err != nil {
+				return fmt.Errorf("file %q: write data: %w", f.Name, err)
+			}
+		}
+		return nil
+	}()
+	if closeErr := tw.Close(); err == nil && closeErr != nil {
+		err = fmt.Errorf("close tar: %w", closeErr)
+	}
+	if closeErr := gz.Close(); err == nil && closeErr != nil {
+		err = fmt.Errorf("close gzip: %w", closeErr)
+	}
+	return err
+}
+
+func validateArchiveName(name string) error {
+	if name == "" {
+		return errors.New("empty name")
+	}
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf("absolute path %q is not allowed", name)
+	}
+	clean := path.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("path %q escapes the upload directory", name)
 	}
 	return nil
 }

@@ -1,13 +1,9 @@
 package livekit
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -23,8 +19,7 @@ import (
 )
 
 const (
-	connectTimeout      = 15 * time.Second
-	tokenRequestTimeout = 20 * time.Second
+	connectTimeout = 15 * time.Second
 )
 
 type Provider struct {
@@ -32,9 +27,6 @@ type Provider struct {
 	logger logging.ContextLogger
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	tokenURL   string
-	httpClient *http.Client
 
 	pipeMu sync.Mutex
 	pipe   *Pipe
@@ -73,8 +65,6 @@ func NewProvider(
 		cfg:          cfg,
 		logger:       logger,
 		identity:     identity,
-		tokenURL:     cfg.tokenEndpoint(),
-		httpClient:   &http.Client{Timeout: tokenRequestTimeout},
 		disconnected: make(chan struct{}, 1),
 	}
 	p.ctx, p.cancel = context.WithCancel(ctx)
@@ -261,17 +251,6 @@ func (p *Provider) connectionToken() (token, signalURL, room string, err error) 
 	signalURL = p.cfg.SignalURL
 	room = p.cfg.Room
 
-	if p.tokenURL != "" {
-		resp, reqErr := p.requestSession()
-		if reqErr != nil {
-			return "", "", "", reqErr
-		}
-		if strings.TrimSpace(resp.URL) != "" {
-			signalURL = resp.URL
-		}
-		return resp.Token, signalURL, resp.Room, nil
-	}
-
 	if strings.TrimSpace(p.cfg.Token) != "" {
 		return p.cfg.Token, signalURL, room, nil
 	}
@@ -281,63 +260,6 @@ func (p *Provider) connectionToken() (token, signalURL, room string, err error) 
 		return "", "", "", fmt.Errorf("livekit: make token: %w", err)
 	}
 	return token, signalURL, room, nil
-}
-
-func (p *Provider) requestSession() (sessionResponse, error) {
-	if p.tokenURL == "" {
-		return sessionResponse{}, errors.New("livekit: token endpoint is not configured")
-	}
-	payload, err := json.Marshal(sessionRequest{
-		UserID:     p.cfg.UserID,
-		ExitNodeID: p.cfg.ExitNodeID,
-	})
-	if err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: encode session request: %w", err)
-	}
-
-	reqCtx := p.ctx
-	if reqCtx == nil {
-		reqCtx = context.Background()
-	}
-	reqCtx, cancel := context.WithTimeout(reqCtx, tokenRequestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.tokenURL, bytes.NewReader(payload))
-	if err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: session request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret := strings.TrimSpace(p.cfg.TokenSecret); secret != "" {
-		req.Header.Set("X-Shampoore-Secret", secret)
-	}
-
-	client := p.httpClient
-	if client == nil {
-		client = &http.Client{Timeout: tokenRequestTimeout}
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: session request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return sessionResponse{}, fmt.Errorf("livekit: session endpoint returned %s: %s",
-			resp.Status, strings.TrimSpace(string(msg)))
-	}
-	var out sessionResponse
-	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<10))
-	if err := dec.Decode(&out); err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: decode session response: %w", err)
-	}
-	if strings.TrimSpace(out.Token) == "" || strings.TrimSpace(out.Room) == "" {
-		return sessionResponse{}, errors.New("livekit: session endpoint returned an empty token or room")
-	}
-	if strings.TrimSpace(out.URL) == "" {
-		out.URL = p.cfg.SignalURL
-	}
-	return out, nil
 }
 
 func makeToken(apiKey, apiSecret, room, identity string) (string, error) {
@@ -412,9 +334,6 @@ func (p *Provider) BypassHosts() []string {
 		}
 	}
 	add(p.cfg.SignalURL)
-	if p.tokenURL != "" {
-		add(p.tokenURL)
-	}
 	return bypass
 }
 

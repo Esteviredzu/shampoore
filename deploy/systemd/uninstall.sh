@@ -54,6 +54,25 @@ rm -f /etc/systemd/system/shampoore.service
 systemctl daemon-reload
 systemctl reset-failed shampoore 2>/dev/null || true
 
+if [ "$PURGE" -eq 1 ]; then
+    PANEL_BIN="/opt/shampoore/bin/shampoore-panel"
+    PANEL_DB_PATH="/var/lib/shampoore/panel.db"
+    if [ -r /etc/shampoore/panel.env ]; then
+        ENV_DB="$(grep -E '^PANEL_DB=' /etc/shampoore/panel.env | tail -n1 | cut -d= -f2- | tr -d '\r' || true)"
+        if [ -n "${ENV_DB:-}" ]; then
+            PANEL_DB_PATH="$ENV_DB"
+        fi
+    fi
+    if [ -x "$PANEL_BIN" ] && [ -f "$PANEL_DB_PATH" ]; then
+        echo "==> cleaning up remote nodes (best effort)"
+        if ! "$PANEL_BIN" --cleanup-all-nodes --db="$PANEL_DB_PATH"; then
+            echo "warning: remote node cleanup finished with errors; continuing with purge" >&2
+        fi
+    else
+        echo "==> skipping remote node cleanup (panel binary or database not found)"
+    fi
+fi
+
 echo "==> removing binaries"
 rm -rf /opt/shampoore
 

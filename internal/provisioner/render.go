@@ -20,7 +20,9 @@ import (
 var templateFS embed.FS
 
 type RenderOptions struct {
-	PanelURL string
+	PanelURL   string
+	LocalRelay bool
+	RuleFiles  []File
 }
 
 type relaySite struct {
@@ -29,9 +31,14 @@ type relaySite struct {
 }
 
 type relayData struct {
-	Node    panelstore.Node
-	Secrets map[string]string
-	Sites   []relaySite
+	Node       panelstore.Node
+	Secrets    map[string]string
+	Sites      []relaySite
+	Domains    map[string]string
+	HasRawWS   bool
+	HasLiveKit bool
+	HasSilo    bool
+	LocalRelay bool
 }
 
 type exitData struct {
@@ -48,8 +55,10 @@ func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
 		return nil, fmt.Errorf("provisioner: node %q is not a relay", node.Name)
 	}
 	data := relayData{
-		Node:    node,
-		Secrets: cloneSecrets(node.GeneratedSecrets),
+		Node:       node,
+		Secrets:    cloneSecrets(node.GeneratedSecrets),
+		Domains:    make(map[string]string),
+		LocalRelay: opts.LocalRelay,
 	}
 	siteIndex := make(map[string]int)
 	for _, tr := range node.Transports {
@@ -65,13 +74,26 @@ func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
 				return nil, fmt.Errorf("provisioner: relay %q has no %s for %s", node.Name, key, tr.Type)
 			}
 		}
+		domain := app.SiteAddress(tr.Domain)
+		if _, ok := data.Domains[descriptor.Kind]; !ok {
+			data.Domains[descriptor.Kind] = domain
+		}
+		switch descriptor.Kind {
+		case panelstore.TransportRawWS:
+			data.HasRawWS = true
+		case "livekit_datachannel":
+
+			data.HasLiveKit = true
+		case panelstore.TransportSilo:
+			data.HasSilo = true
+		}
 		idx, ok := siteIndex[descriptor.RelayUpstream]
 		if !ok {
 			idx = len(data.Sites)
 			siteIndex[descriptor.RelayUpstream] = idx
 			data.Sites = append(data.Sites, relaySite{Upstream: descriptor.RelayUpstream})
 		}
-		data.Sites[idx].Domains = append(data.Sites[idx].Domains, app.SiteAddress(tr.Domain))
+		data.Sites[idx].Domains = append(data.Sites[idx].Domains, domain)
 	}
 	if len(data.Sites) == 0 {
 		return nil, fmt.Errorf("provisioner: relay %q has no enabled transports with domains", node.Name)
@@ -135,7 +157,11 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 	if err != nil {
 		return nil, err
 	}
-	out = append(out, File{Name: "rules/.keep", Mode: 0o644})
+	if len(opts.RuleFiles) == 0 {
+		out = append(out, File{Name: "rules/.keep", Mode: 0o644})
+	} else {
+		out = append(out, opts.RuleFiles...)
+	}
 	out = append(out, configFiles...)
 	return out, nil
 }
@@ -210,14 +236,11 @@ func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (app
 		return app.Settings{}, fmt.Errorf("provisioner: unsupported route transport %q", route.TransportType)
 	}
 	settings, err := descriptor.BuildServerConfig(app.RouteParams{
-		RouteID:     route.ID,
-		RouteName:   route.Name,
-		ExitNodeID:  strconv.FormatInt(node.ID, 10),
-		Domain:      tr.Domain,
-		Secrets:     entry.GeneratedSecrets,
-		OnDemand:    tr.OnDemand,
-		TokenURL:    strings.TrimSpace(entry.GeneratedSecrets["livekit_token_url"]),
-		TokenSecret: strings.TrimSpace(entry.GeneratedSecrets["livekit_token_secret"]),
+		RouteID:    route.ID,
+		RouteName:  route.Name,
+		ExitNodeID: strconv.FormatInt(node.ID, 10),
+		Domain:     tr.Domain,
+		Secrets:    entry.GeneratedSecrets,
 	})
 	if err != nil {
 		return app.Settings{}, fmt.Errorf("provisioner: route %d: %w", route.ID, err)

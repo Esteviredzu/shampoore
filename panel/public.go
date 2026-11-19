@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -126,6 +127,15 @@ func (a *API) subscription(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("multiuser storage is not configured"))
 		return
 	}
+	settings, err := a.store.GetSettings(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !settings.SubscriptionsEnabled || strings.TrimSpace(settings.PublicDomain) == "" {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("subscription not found"))
+		return
+	}
 	token := r.PathValue("sub_token")
 	if !validSubToken(token) {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("subscription not found"))
@@ -144,10 +154,11 @@ func (a *API) subscription(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("subscription is inactive"))
 		return
 	}
-	settings, err := a.subscriptionSettings(r, user)
+	settingsList, err := a.subscriptionSettings(r, user)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	w.Header().Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(user.Name)))
+	writeJSON(w, http.StatusOK, settingsList)
 }

@@ -29,4 +29,5 @@ function lookup(obj, path) {
 function applyLang(root = document) {
   root.querySelectorAll('[data-lang]').forEach(el => el.textContent = t(el.dataset.lang));
   root.querySelectorAll('[data-lang-placeholder]').forEach(el => el.placeholder = t(el.dataset.langPlaceholder));
+  root.querySelectorAll('[data-lang-title]').forEach(el => el.title = t(el.dataset.langTitle));
 }

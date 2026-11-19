@@ -19,48 +19,54 @@ func TestConfigLegacyCompatibility(t *testing.T) {
 
 func TestConfigMultiuserValidation(t *testing.T) {
 	cfg := Config{
-		SignalURL:   "wss://livekit.example",
-		APIKey:      "key",
-		APISecret:   "secret",
-		Multiuser:   true,
-		TokenListen: "127.0.0.1:8099",
+		SignalURL: "wss://livekit.example",
+		APIKey:    "key",
+		APISecret: "secret",
+		Multiuser: true,
 	}
 	if err := cfg.ValidateForRole("server"); err != nil {
 		t.Fatalf("multiuser server config: %v", err)
 	}
 
-	cfg.TokenListen = ""
+	cfg.APISecret = ""
 	if err := cfg.ValidateForRole("server"); err == nil {
-		t.Fatal("expected multiuser config without token_listen to fail")
+		t.Fatal("expected multiuser config without api_secret to fail")
 	}
 }
 
-func TestConfigOnDemandClientValidation(t *testing.T) {
+func TestConfigRequiresSignalURL(t *testing.T) {
 	cfg := Config{
-		SignalURL: "wss://livekit.example",
-		TokenURL:  "https://control.example/session",
-		UserID:    "alice",
+		APIKey:    "key",
+		APISecret: "secret",
+		Room:      "room",
 	}
-	if err := cfg.ValidateForRole("client"); err != nil {
-		t.Fatalf("on-demand client config: %v", err)
-	}
-
-	cfg.UserID = ""
-	if err := cfg.ValidateForRole("client"); err == nil {
-		t.Fatal("expected on-demand config without user_id to fail")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected missing signal_url to fail")
 	}
 }
 
-func TestNormalizeTokenURL(t *testing.T) {
-	cases := map[string]string{
-		"127.0.0.1:8099":                  "http://127.0.0.1:8099/session",
-		"http://127.0.0.1:8099":           "http://127.0.0.1:8099/session",
-		"https://control.example/session": "https://control.example/session",
-		"":                                "",
+func TestConfigStaticToken(t *testing.T) {
+	cfg := Config{SignalURL: "wss://livekit.example", Token: "static-token"}
+	if err := cfg.ValidateForRole("client"); err != nil {
+		t.Fatalf("static token config: %v", err)
 	}
-	for in, want := range cases {
-		if got := NormalizeTokenURL(in); got != want {
-			t.Fatalf("NormalizeTokenURL(%q) = %q, want %q", in, got, want)
-		}
+}
+
+func TestConfigRejectsRemovedTokenEndpointFields(t *testing.T) {
+	cfg := Config{SignalURL: "wss://livekit.example", Room: "room"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected missing api credentials to fail")
+	}
+}
+
+func TestRoomForUser(t *testing.T) {
+	if got := RoomForUser("route-9", "Alice"); got != "route-9-alice" {
+		t.Fatalf("RoomForUser = %q", got)
+	}
+	if got := RoomForUser("", "alice"); got != defaultRoomPrefix+"-alice" {
+		t.Fatalf("default RoomForUser = %q", got)
+	}
+	if got := RoomForUser("route 9", "bad id!"); got != "route_9-bad_id" {
+		t.Fatalf("sanitized RoomForUser = %q", got)
 	}
 }

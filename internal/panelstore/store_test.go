@@ -80,6 +80,22 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestCreateNodeRejectsDuplicateTransportTypes(t *testing.T) {
+	store := newTestStore(t)
+	_, err := store.CreateNode(context.Background(), Node{
+		Name:    "duplicate",
+		SSHHost: "203.0.113.55",
+		IsRelay: true,
+		Transports: []Transport{
+			{Type: TransportRawWS, Domain: "one.example.com", Enabled: true},
+			{Type: TransportRawWS, Domain: "two.example.com", Enabled: true},
+		},
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate transport error = %v, want invalid", err)
+	}
+}
+
 func TestNodeCRUDAndSecrets(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

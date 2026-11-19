@@ -59,6 +59,9 @@ func seedTopology(t *testing.T, store *panelstore.Store) topology {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.UpdateSettings(ctx, panelstore.Settings{PublicDomain: "sub.example.com"}); err != nil {
+		t.Fatalf("enable subscriptions: %v", err)
+	}
 	return topology{relay: relay, exit: exit, routes: routes, user: user}
 }
 

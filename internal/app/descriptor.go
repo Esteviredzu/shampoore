@@ -48,11 +48,6 @@ type RouteParams struct {
 	Domain string
 
 	Secrets map[string]string
-
-	OnDemand bool
-
-	TokenURL    string
-	TokenSecret string
 }
 
 func (p RouteParams) Secret(key string) string {

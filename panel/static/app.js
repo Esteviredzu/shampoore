@@ -4,10 +4,33 @@ const state = {
 };
 
 const fleet = {
-  active: 'configs',
-  nodes: [], routes: [], users: [],
-  loading: { nodes: false, routes: false, users: false }
+  active: 'dashboard',
+  nodes: [], routes: [], users: [], settings: null, caddy: null,
+  domainDraft: null, livePolling: false,
+  loading: { dashboard: false, nodes: false, routes: false, users: false, configs: false }
 };
+
+/* Background refresh must never disturb the user: it is skipped while a modal
+   is open or while focus is inside a form control. */
+let modalOpen = false;
+
+const SYSTEM_STATS_INTERVAL = 5000;
+const FLEET_POLL_INTERVAL = 15000;
+
+function isEditableFocus() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function canAutoRefresh() {
+  const root = document.getElementById('modal-root');
+  // modalOpen can be reset asynchronously by the close animation; also check
+  // that the modal root is really visible so the flag can never get stuck.
+  const modalVisible = modalOpen && !(root && root.classList.contains('hidden'));
+  return !modalVisible && !document.hidden && !isEditableFocus();
+}
 
 (async function boot() {
   const langLabel = document.getElementById('current-lang-label');
@@ -41,12 +64,18 @@ const fleet = {
   });
   document.getElementById('btn-logout').addEventListener('click', logout);
   document.getElementById('search').addEventListener('input', e => { state.search = e.target.value.toLowerCase(); render(); });
+  const menu = document.getElementById('btn-menu');
+  if (menu) menu.addEventListener('click', () => document.getElementById('sidebar').classList.toggle('open'));
   setupFleetTabs();
 
   await load();
   await loadSystemStats();
-  setInterval(load, 5000);
-  setInterval(loadSystemStats, 3000);
+  await loadPanel('dashboard');
+  // No periodic full re-render: data is refreshed on load, on tab switch,
+  // after user actions and via the manual refresh buttons. Only light polls
+  // that update isolated status/traffic widgets are kept.
+  setInterval(() => { if (canAutoRefresh()) loadSystemStats(); }, SYSTEM_STATS_INTERVAL);
+  setInterval(pollFleetLive, FLEET_POLL_INTERVAL);
 })();
 
 function formatBytes(bytes) {
@@ -86,15 +115,15 @@ async function loadSystemStats() {
     upStr += `${m}m`;
 
     el.innerHTML = `
-      <span class="stat-item cpu ${cpuClass}" title="CPU Usage: ${cpuPercent}%">
+      <span class="stat-item cpu ${cpuClass}" title="${esc(t('stats.cpu'))}: ${cpuPercent}%">
         <span class="material-symbols-rounded">speed</span>
         <span class="stat-value">${cpuPercent}%</span>
       </span>
-      <span class="stat-item ram ${ramClass}" title="RAM Usage: ${ramPercent}% (${ramUsedStr} / ${ramTotalStr})">
+      <span class="stat-item ram ${ramClass}" title="${esc(t('stats.ram'))}: ${ramPercent}% (${ramUsedStr} / ${ramTotalStr})">
         <span class="material-symbols-rounded">memory</span>
         <span class="stat-value">${ramUsedStr}</span> <span class="stat-total">/ ${ramTotalStr}</span>
       </span>
-      <span class="stat-item uptime" title="System Uptime">
+      <span class="stat-item uptime" title="${esc(t('stats.uptime'))}">
         <span class="material-symbols-rounded">schedule</span>
         <span class="stat-value">${upStr}</span>
       </span>
@@ -108,11 +137,14 @@ async function loadSystemStats() {
 window.changeLanguage = async (lang) => {
   LANGS.current = lang;
   localStorage.setItem('shampoore_lang', lang);
-  document.getElementById('current-lang-label').textContent = { en: 'English', ru: 'Русский', eo: 'Esperanto' }[lang];
+  const label = document.getElementById('current-lang-label');
+  if (label) label.textContent = { en: 'English', ru: 'Русский', eo: 'Esperanto' }[lang] || lang;
   await loadLang(lang);
   applyLang();
   renderServerBar();
-  render();
+  // Re-render the active view right away from cached data, so switching the
+  // language does not wait for any background refresh.
+  rerenderActivePanel();
 };
 
 window.changeSort = (sort) => {
@@ -150,43 +182,53 @@ async function load() {
     if (!state.templates.length) state.templates = (await api('/api/templates')) || [];
     const sst = await api('/api/server/status');
     state.serverRunning = sst.running;
-    document.getElementById('global-status').className = `status-dot ${state.serverRunning ? 'online' : ''}`;
-    
     state.configs = (await api('/api/configs')) || [];
     renderServerBar();
     render();
   } catch (e) {
-    document.getElementById('global-status').className = 'status-dot';
+    state.serverRunning = false;
+    renderServerBar();
   }
 }
 
 function renderServerBar() {
   const bar = document.getElementById('server-bar');
+  if (!bar) return;
   const running = state.serverRunning;
   const label = running ? t('server.running') : t('server.stopped');
-  
-  const btnLogs = `<button class="btn btn--tonal" onclick="openServerLogs()"><span class="material-symbols-rounded">terminal</span>${t('actions.logs')}</button>`;
-  const btnAction = running 
-    ? `<button class="btn btn--filled btn--danger" onclick="stopServer()"><span class="material-symbols-rounded">stop</span>${t('server.stop')}</button>`
-    : `<button class="btn btn--filled btn--success" onclick="startServer()"><span class="material-symbols-rounded">play_arrow</span>${t('server.start')}</button>`;
-
+  const logsBtn = `<button class="btn btn--tonal btn--compact" type="button" title="${esc(t('server.logs'))}" onclick="openServerLogs()"><span class="material-symbols-rounded">terminal</span><span class="server-control__btn-label">${esc(t('actions.logs'))}</span></button>`;
+  const actionBtn = running
+    ? `<button class="btn btn--danger btn--compact" type="button" title="${esc(t('server.stop'))}" onclick="stopServer()"><span class="material-symbols-rounded">power_settings_new</span><span class="server-control__btn-label">${esc(t('server.stopShort'))}</span></button>`
+    : `<button class="btn btn--success btn--compact" type="button" title="${esc(t('server.start'))}" onclick="startServer()"><span class="material-symbols-rounded">power_settings_new</span><span class="server-control__btn-label">${esc(t('server.startShort'))}</span></button>`;
   bar.innerHTML = `
     <div class="server-control__status">
       <span class="status-dot ${running ? 'online' : ''}"></span>
-      ${label}
+      <span class="server-control__label">${esc(label)}</span>
     </div>
-    <div class="server-control__actions">${btnLogs}${btnAction}</div>
+    <div class="server-control__actions">${logsBtn}${actionBtn}</div>
   `;
 }
 
 async function startServer() {
-  try { await api('/api/server/start', { method: 'POST' }); toast(t('toast.serverStarted')); await load(); }
-  catch (e) { toast(e.message, 'error'); }
+  try {
+    await api('/api/server/start', { method: 'POST' });
+    state.serverRunning = true;
+    renderServerBar();
+    toast(t('toast.serverStarted'));
+    await loadActiveView();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
 }
 async function stopServer() {
   if (!confirm(t('server.confirmStop'))) return;
-  try { await api('/api/server/stop', { method: 'POST' }); toast(t('toast.serverStopped')); await load(); }
-  catch (e) { toast(e.message, 'error'); }
+  try {
+    await api('/api/server/stop', { method: 'POST' });
+    state.serverRunning = false;
+    renderServerBar();
+    toast(t('toast.serverStopped'));
+    await loadActiveView();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
 }
 async function openServerLogs() {
   const d = await api('/api/server/logs?limit=1000');
@@ -237,7 +279,7 @@ function render() {
               <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleCfg('${n}', this.checked)">
               <span class="slider"></span>
             </label>
-            <span>${isEnabled ? 'Enabled' : 'Disabled'}</span>
+            <span>${isEnabled ? t('status.enabled') : t('status.disabled')}</span>
           </div>
           <div class="spacer"></div>
           <button class="btn btn--tonal btn--compact" onclick="exportCfg('${n}')" title="${t('actions.export')}" style="height:32px; font-size:12px; padding:0 12px;">
@@ -255,13 +297,13 @@ async function toggleCfg(name, enabled) {
   try {
     await api(`/api/configs/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
     toast(t(enabled ? 'toast.started' : 'toast.stopped'));
-    await load();
-  } catch (e) { toast(e.message, 'error'); await load(); }
+    await loadActiveView(); render();
+  } catch (e) { toast(e.message, 'error'); await loadActiveView(); render(); }
 }
 
 async function delCfg(name) {
   if (!confirm(t('confirm.deleteConfig'))) return;
-  try { await api(`/api/configs/${encodeURIComponent(name)}`, { method: 'DELETE' }); toast(t('toast.deleted')); await load(); }
+  try { await api(`/api/configs/${encodeURIComponent(name)}`, { method: 'DELETE' }); toast(t('toast.deleted')); await loadActiveView(); render(); }
   catch (e) { toast(e.message, 'error'); }
 }
 
@@ -278,7 +320,7 @@ async function exportCfg(name) {
       qr.make();
       qrHTML = `
         <div class="qr-container">
-          <div>${qr.createImgTag(6, 8)}</div>
+          <div class="qr-box">${qr.createImgTag(6, 8)}</div>
         </div>`;
     } catch (e) { console.error(e); }
   }
@@ -423,14 +465,14 @@ function openConfigDialog(editName = null, initialData = null) {
     if (selectedKind === 'multi') {
       html += `
         <div class="field">
-          <label>Strategy</label>
+          <label>${t('dialog.strategy')}</label>
           <select id="f-strategy" class="input" style="height:56px;">
             <option value="flowmux" ${multiStrategy === 'flowmux' ? 'selected' : ''}>flowmux</option>
             <option value="bond" ${multiStrategy === 'bond' ? 'selected' : ''}>bond</option>
           </select>
         </div>
         <div class="field">
-          <label>Transports (Subflows)</label>
+          <label>${t('dialog.subflows')}</label>
           <div id="multi-transports">
             ${multiSubflows.map((t, i) => `
               <div style="background:var(--md-surface-container-highest); padding:16px; border-radius:16px; margin-bottom:16px;">
@@ -441,11 +483,11 @@ function openConfigDialog(editName = null, initialData = null) {
                   <button type="button" class="icon-btn icon-btn--danger" onclick="window.rmSubflow(${i})"><span class="material-symbols-rounded">delete</span></button>
                 </div>
                 <div class="field" style="margin-bottom:12px;">
-                  <label>Rate limit (KB/s, 0 = unlimited)</label>
+                  <label>${t('dialog.rateLimit')}</label>
                   <input type="number" class="input" style="height:40px;" value="${t.rate_limit_kb || 0}" oninput="window.updateSubflowRate(${i}, this.value)">
                 </div>
                 <div class="field">
-                  <label>Transport Params</label>
+                  <label>${t('dialog.transportParams')}</label>
                   <div id="kv-transports-${i}" class="kv-container">
                     ${renderSubflowFields(i, t)}
                   </div>
@@ -454,14 +496,14 @@ function openConfigDialog(editName = null, initialData = null) {
             `).join('')}
           </div>
           <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="window.addSubflow()">
-            <span class="material-symbols-rounded">add</span> Add Transport
+            <span class="material-symbols-rounded">add</span> ${t('dialog.addTransport')}
           </button>
         </div>
       `;
     } else if (schema && schema.fields) {
       html += `
         <div class="field">
-          <label>Transport Params</label>
+          <label>${t('dialog.transportParams')}</label>
           ${schema.fields.map(f => `
             <div class="field" style="margin-bottom:8px;">
               <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
@@ -486,7 +528,7 @@ function openConfigDialog(editName = null, initialData = null) {
              ${Object.entries(form.advanced || {}).map(([k, v], i) => renderKV(k, v, i)).join('')}
           </div>
           <button type="button" class="btn btn--tonal" style="align-self:flex-start; margin-top:8px;" onclick="window.addKV()">
-            <span class="material-symbols-rounded">add</span> Add parameter
+            <span class="material-symbols-rounded">add</span> ${t('dialog.addParameter')}
           </button>
         </div>
       </div>
@@ -519,8 +561,8 @@ function openConfigDialog(editName = null, initialData = null) {
   function renderKV(k, v, i) {
     return `
       <div class="kv-row">
-        <input type="text" value="${escAttr(k)}" onchange="window.updateKVKey(${i}, this.value)" placeholder="key">
-        <input type="text" value="${escAttr(String(v))}" onchange="window.updateKVVal(${i}, this.value)" placeholder="value">
+        <input type="text" value="${escAttr(k)}" onchange="window.updateKVKey(${i}, this.value)" placeholder="${escAttr(t('dialog.keyPlaceholder'))}">
+        <input type="text" value="${escAttr(String(v))}" onchange="window.updateKVVal(${i}, this.value)" placeholder="${escAttr(t('dialog.valuePlaceholder'))}">
         <button type="button" class="icon-btn icon-btn--danger" onclick="window.rmKV(${i})"><span class="material-symbols-rounded">delete</span></button>
       </div>
     `;
@@ -588,7 +630,7 @@ function openConfigDialog(editName = null, initialData = null) {
     renderBody();
   };
 
-  function submit() {
+  async function submit() {
     let payloadObj = form;
     if (activeTab === 'json') {
       try { payloadObj = JSON.parse(document.getElementById('json-editor').value); }
@@ -601,9 +643,15 @@ function openConfigDialog(editName = null, initialData = null) {
     const method = editName ? 'PUT' : 'POST';
     const body = editName ? JSON.stringify({ settings: payloadObj }) : JSON.stringify({ name: payloadObj.name || '', content: JSON.stringify(payloadObj) });
 
-    api(path, { method, headers: { 'Content-Type': 'application/json' }, body })
-      .then(() => { toast(t('toast.saved')); closeModal(); load(); })
-      .catch(e => toast(e.message, 'error'));
+    try {
+      await api(path, { method, headers: { 'Content-Type': 'application/json' }, body });
+      toast(t('toast.saved'));
+      closeModal();
+      await loadActiveView();
+      render();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
   }
 
   dialog.onTabChange = id => {
@@ -623,7 +671,7 @@ function openConfigDialog(editName = null, initialData = null) {
         }
         selectedKind = parsed.type || 'yandex';
       } catch (e) {
-        toast('Invalid JSON, cannot switch to form', 'error');
+        toast(t('dialog.invalidJson'), 'error');
         return false;
       }
     }
@@ -637,6 +685,7 @@ function openConfigDialog(editName = null, initialData = null) {
 
 function openModal({ title, body = '', actions = [], tabs = [] }) {
   const root = document.getElementById('modal-root');
+  modalOpen = true;
   root.classList.remove('hidden');
   
   const tabsHTML = tabs.length ? `<div class="modal__tabs">${tabs.map((t,i) => `<button class="tab ${i===0?'active':''}" data-tab="${t.id}">${t.label}</button>`).join('')}</div>` : '';
@@ -668,16 +717,17 @@ function openModal({ title, body = '', actions = [], tabs = [] }) {
 
 function closeModal() {
   const root = document.getElementById('modal-root');
+  modalOpen = false;
   root.classList.remove('show');
   setTimeout(() => { root.classList.add('hidden'); root.innerHTML = ''; }, 200);
 }
 
 function toast(msg, type = 'info') {
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = 'toast' + (type && type !== 'info' ? ' ' + type : '');
   el.textContent = msg;
   document.getElementById('toasts').appendChild(el);
-  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3000);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3200);
 }
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -689,105 +739,228 @@ async function copyToClipboard(text) {
 }
 async function openRulesDialog() {
   let rules = [];
+  let sources = [];
+  let exits = [];
+  const sourceByName = new Map();
+
+  function syncSources(list) {
+    sources = list || [];
+    sourceByName.clear();
+    sources.forEach(src => sourceByName.set(src.name, src));
+  }
+
   try {
-    rules = (await api('/api/rules')) || [];
+    const [nextRules, nextSources] = await Promise.all([api('/api/rules'), api('/api/georules')]);
+    rules = nextRules || [];
+    syncSources(nextSources);
   } catch (e) {
     toast(e.message, 'error');
+  }
+  try {
+    const nextNodes = await api('/api/nodes');
+    exits = (nextNodes || []).filter(node => node.is_exit);
+  } catch {
+    exits = [];
+  }
+
+  function geoMetaRow(icon, label, value) {
+    return `<span><span class="material-symbols-rounded">${icon}</span>${esc(label)}: ${esc(value)}</span>`;
+  }
+
+  function exitNodeChecks(selectedIDs, attrName, ruleName) {
+    if (!exits.length) {
+      return `<div class="hint">${esc(t('rules.noExitNodes'))}</div>`;
+    }
+    const selected = new Set((selectedIDs || []).map(Number));
+    const visibleSelected = exits.filter(node => selected.has(Number(node.id)));
+    const all = selected.size === 0 || visibleSelected.length === 0;
+    return `<div class="exit-node-grid">${exits.map(node => `
+      <label class="check-row">
+        <input type="checkbox" ${attrName}="${escAttr(node.id)}" ${ruleName ? `data-rule-name="${escAttr(ruleName)}"` : ''} ${all || selected.has(Number(node.id)) ? 'checked' : ''}>
+        <span>${esc(node.name)}</span>
+      </label>`).join('')}</div>`;
+  }
+
+  function exitNodesBlock(selectedIDs, attrName, ruleName) {
+    return `<div class="geo-rule__nodes">
+      <div class="geo-rule__nodes-label">${esc(t('rules.exitNodes'))}</div>
+      ${exitNodeChecks(selectedIDs, attrName, ruleName)}
+      <span class="hint">${esc(t('rules.exitNodesHint'))}</span>
+    </div>`;
+  }
+
+  function renderGeoSource(source) {
+    const meta = [
+      geoMetaRow('link', t('rules.source'), geoSourceHost(source.url) || source.url),
+      geoMetaRow('schedule', t('rules.lastUpdated'), geoUpdatedLabel(source)),
+      geoMetaRow('autorenew', t('rules.interval'), geoIntervalLabel(source.update_interval_minutes))
+    ].join('');
+    const error = source.last_error
+      ? `<div class="card__warn"><span class="material-symbols-rounded">warning</span>${esc(source.last_error)}</div>`
+      : '';
+    return `
+      <div class="geo-rule__meta">${meta}</div>
+      ${error}
+      <div class="geo-rule__actions">
+        <button class="btn btn--tonal btn--compact geo-rule__refresh" type="button" onclick="window.refreshGeoRule(${escAttr(JSON.stringify(source.name))})">
+          <span class="material-symbols-rounded">refresh</span>${esc(t('rules.refreshNow'))}
+        </button>
+      </div>`;
   }
 
   function renderRulesBody() {
     let html = `
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-        <span style="color:var(--md-on-surface-variant);">Manage geoip rules and CIDRs</span>
-        <button class="btn btn--filled" type="button" onclick="window.openAddRuleDialog()">
-          <span class="material-symbols-rounded">add</span> Add Rule
-        </button>
+      <div class="geo-toolbar">
+        <span class="hint">${esc(t('rules.hint'))}</span>
+        <div class="geo-toolbar__actions">
+          <button class="btn btn--tonal btn--compact" type="button" onclick="window.openAddGeoRuleByURLDialog()">
+            <span class="material-symbols-rounded">link</span>${esc(t('rules.addByUrl'))}
+          </button>
+          <button class="btn btn--filled btn--compact" type="button" onclick="window.openAddRuleDialog()">
+            <span class="material-symbols-rounded">add</span>${esc(t('rules.addManual'))}
+          </button>
+        </div>
       </div>
-      <div style="display:flex; flex-direction:column; gap:12px;">
-    `;
+      <div class="geo-list">`;
 
     if (!rules.length) {
-      html += `<div style="text-align:center; padding:32px; color:var(--md-on-surface-variant);">No rules found.</div>`;
+      html += `<div class="empty"><span class="material-symbols-rounded">public</span><p>${esc(t('rules.empty'))}</p></div>`;
     } else {
-      rules.forEach(r => {
-        const nameEsc = escAttr(r.name);
-        const isEnabled = r.enabled;
-        const cidrsCount = (r.cidrs || []).length;
+      rules.forEach(rule => {
+        const nameArg = escAttr(JSON.stringify(rule.name));
+        const source = sourceByName.get(rule.name);
         html += `
-          <div style="background:var(--md-surface-container-highest); padding:16px; border-radius:16px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
-            <div>
-              <div style="font-weight:500; font-size:16px; margin-bottom:4px;">${esc(r.name)}</div>
-              <div style="font-size:13px; color:var(--md-on-surface-variant);">${cidrsCount} CIDRs</div>
+          <div class="geo-rule">
+            <div class="geo-rule__main">
+              <div>
+                <div class="geo-rule__name">${esc(rule.name)}</div>
+                <div class="hint">${esc(t('rules.cidrCount').replace('{count}', (rule.cidrs || []).length))}</div>
+              </div>
+              <div class="geo-rule__actions">
+                <label class="switch">
+                  <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="window.toggleRule(${nameArg}, this.checked)">
+                  <span class="slider"></span>
+                </label>
+                <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="window.delRule(${nameArg})">
+                  <span class="material-symbols-rounded">delete</span>
+                </button>
+              </div>
             </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-              <label class="switch">
-                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="window.toggleRule('${nameEsc}', this.checked)">
-                <span class="slider"></span>
-              </label>
-              <button class="icon-btn icon-btn--danger" onclick="window.delRule('${nameEsc}')" title="Delete">
-                <span class="material-symbols-rounded">delete</span>
-              </button>
-            </div>
-          </div>
-        `;
+            ${exitNodesBlock(rule.exit_node_ids || [], 'data-rule-node', rule.name)}
+            ${source ? renderGeoSource(source) : ''}
+          </div>`;
       });
     }
-    html += `</div>`;
+    html += '</div>';
     dialog.setBody(html);
+    bindGeoRuleNodeChecks();
   }
 
   const dialog = openModal({
-    title: 'Geoip Rules',
+    title: t('rules.title'),
     actions: [
-      { label: 'Apply (Restart Server)', kind: 'filled', onClick: async () => {
+      { label: t('rules.apply'), kind: 'filled', onClick: async () => {
           try {
             const res = await api('/api/rules/apply', { method: 'POST' });
-            if (res.restarted) toast('Server restarted with new rules');
-            else toast('Server was offline, rules applied');
+            toast(res.restarted ? t('rules.applied') : t('rules.appliedOffline'));
             closeModal();
           } catch (e) { toast(e.message, 'error'); }
         }
       },
-      { label: 'Close', kind: 'text', onClick: closeModal }
+      { label: t('actions.close'), kind: 'text', onClick: closeModal }
     ]
   });
+
+  function bindGeoRuleNodeChecks() {
+    document.querySelectorAll('.modal__body input[data-rule-node]').forEach(cb => {
+      cb.addEventListener('change', () => saveGeoRuleNodes(cb.dataset.ruleName, cb));
+    });
+  }
+
+  async function saveGeoRuleNodes(name, checkbox) {
+    if (!name) return;
+    const card = checkbox.closest('.geo-rule');
+    const checks = card ? Array.from(card.querySelectorAll('input[data-rule-node]')) : [checkbox];
+    const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.ruleNode));
+    if (!selected.length) {
+      checkbox.checked = true;
+      toast(t('rules.exitNodesRequired'), 'error');
+      return;
+    }
+    const payload = selected.length === exits.length ? [] : selected;
+    try {
+      await api(`/api/georules/${encodeURIComponent(name)}/nodes`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exit_node_ids: payload })
+      });
+      const rule = rules.find(item => item.name === name);
+      if (rule) rule.exit_node_ids = payload;
+      toast(t('rules.exitNodesSaved'), 'success');
+    } catch (e) {
+      checkbox.checked = !checkbox.checked;
+      toast(e.message, 'error');
+    }
+  }
+
+  async function reloadRules() {
+    try {
+      const [nextRules, nextSources] = await Promise.all([api('/api/rules'), api('/api/georules')]);
+      rules = nextRules || [];
+      syncSources(nextSources);
+    } catch (e) { toast(e.message, 'error'); }
+    try {
+      const nextNodes = await api('/api/nodes');
+      exits = (nextNodes || []).filter(node => node.is_exit);
+    } catch {
+      exits = [];
+    }
+    renderRulesBody();
+  }
 
   window.toggleRule = async (name, enabled) => {
     try {
       await api(`/api/rules/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
-      toast(enabled ? 'Rule enabled' : 'Rule disabled');
-      rules = await api('/api/rules');
-      renderRulesBody();
+      toast(enabled ? t('rules.enabledToast') : t('rules.disabledToast'));
+      await reloadRules();
     } catch (e) { toast(e.message, 'error'); }
   };
 
   window.delRule = async (name) => {
-    if (!confirm(`Delete rule "${name}"?`)) return;
+    if (!confirm(t('rules.confirmDelete').replace('{name}', name))) return;
     try {
       await api(`/api/rules/${encodeURIComponent(name)}`, { method: 'DELETE' });
-      toast('Rule deleted');
-      rules = await api('/api/rules');
-      renderRulesBody();
+      toast(t('rules.deleted'));
+      await reloadRules();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+
+  window.refreshGeoRule = async (name) => {
+    try {
+      await api(`/api/georules/${encodeURIComponent(name)}/refresh`, { method: 'POST' });
+      toast(t('rules.refreshed'), 'success');
+      await reloadRules();
     } catch (e) { toast(e.message, 'error'); }
   };
 
   window.openAddRuleDialog = () => {
     let rName = '';
     let rCidrs = '';
+    let exitIDs = [];
     const addDlg = openModal({
-      title: 'New Geoip Rule',
+      title: t('rules.newTitle'),
       actions: [
-        { label: 'Cancel', kind: 'text', onClick: openRulesDialog },
-        { label: 'Create', kind: 'filled', onClick: async () => {
-            if (!rName.trim()) return toast('Name is required', 'error');
+        { label: t('actions.cancel'), kind: 'text', onClick: openRulesDialog },
+        { label: t('actions.create'), kind: 'filled', onClick: async () => {
+            if (!rName.trim()) return toast(t('rules.nameRequired'), 'error');
             const cidrs = rCidrs.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
             try {
               await api('/api/rules', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: rName, cidrs })
+                body: JSON.stringify({ name: rName, cidrs, exit_node_ids: exitIDs })
               });
-              toast('Rule created successfully');
+              toast(t('rules.created'), 'success');
               openRulesDialog();
             } catch (e) { toast(e.message, 'error'); }
           }
@@ -797,24 +970,115 @@ async function openRulesDialog() {
     addDlg.setBody(`
       <div class="form-group">
         <div class="field">
-          <label>Rule Name</label>
-          <input type="text" id="r-name" placeholder="e.g. custom_bypass" value="${escAttr(rName)}">
+          <label>${esc(t('rules.name'))}</label>
+          <input type="text" id="r-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(rName)}">
         </div>
         <div class="field">
-          <label>CIDRs (one per line)</label>
-          <textarea id="r-cidrs" placeholder="192.168.1.0/24&#10;10.0.0.0/8">${esc(rCidrs)}</textarea>
+          <label>${esc(t('rules.cidrs'))}</label>
+          <textarea id="r-cidrs" placeholder="${escAttr(t('rules.cidrsPlaceholder'))}">${esc(rCidrs)}</textarea>
         </div>
+        ${exitNodesBlock(exitIDs, 'data-draft-node')}
       </div>
     `);
     document.getElementById('r-name').addEventListener('input', e => { rName = e.target.value; });
     document.getElementById('r-cidrs').addEventListener('input', e => { rCidrs = e.target.value; });
+    bindDraftExitChecks(value => { exitIDs = value; });
   };
+
+  window.openAddGeoRuleByURLDialog = () => {
+    let name = '';
+    let url = '';
+    let interval = 0;
+    let exitIDs = [];
+    const importDlg = openModal({
+      title: t('rules.importTitle'),
+      actions: [
+        { label: t('actions.cancel'), kind: 'text', onClick: openRulesDialog },
+        { label: t('rules.import'), kind: 'filled', onClick: async () => {
+            if (!name.trim()) return toast(t('rules.nameRequired'), 'error');
+            if (!url.trim()) return toast(t('rules.urlRequired'), 'error');
+            try {
+              const res = await api('/api/georules/import-url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name.trim(), url: url.trim(), update_interval_minutes: interval, exit_node_ids: exitIDs })
+              });
+              toast(t('rules.imported').replace('{count}', res.rules || 0), 'success');
+              openRulesDialog();
+            } catch (e) { toast(e.message, 'error'); }
+          }
+        }
+      ]
+    });
+    importDlg.setBody(`
+      <div class="form-group">
+        <div class="field">
+          <label>${esc(t('rules.name'))}</label>
+          <input type="text" id="gr-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(name)}">
+        </div>
+        <div class="field">
+          <label>${esc(t('rules.url'))}</label>
+          <input type="url" id="gr-url" placeholder="${escAttr(t('rules.urlPlaceholder'))}" value="${escAttr(url)}" spellcheck="false" autocomplete="off">
+          <span class="hint">${esc(t('rules.urlHint'))}</span>
+        </div>
+        <div class="field">
+          <label>${esc(t('rules.updateInterval'))}</label>
+          <select id="gr-interval">
+            <option value="0" selected>${esc(t('rules.intervalManual'))}</option>
+            <option value="60">${esc(t('rules.intervalHourly'))}</option>
+            <option value="360">${esc(t('rules.interval6h'))}</option>
+            <option value="1440">${esc(t('rules.interval24h'))}</option>
+          </select>
+        </div>
+        ${exitNodesBlock(exitIDs, 'data-draft-node')}
+      </div>
+    `);
+    document.getElementById('gr-name').addEventListener('input', e => { name = e.target.value; });
+    document.getElementById('gr-url').addEventListener('input', e => { url = e.target.value; });
+    document.getElementById('gr-interval').addEventListener('change', e => { interval = Number(e.target.value) || 0; });
+    bindDraftExitChecks(value => { exitIDs = value; });
+  };
+
+  function bindDraftExitChecks(onChange) {
+    const root = document.querySelector('.modal__body');
+    if (!root) return;
+    const checks = Array.from(root.querySelectorAll('input[data-draft-node]'));
+    checks.forEach(cb => cb.addEventListener('change', () => {
+      const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.draftNode));
+      if (!selected.length) {
+        cb.checked = true;
+        toast(t('rules.exitNodesRequired'), 'error');
+        return;
+      }
+      onChange(selected.length === exits.length ? [] : selected);
+    }));
+  }
 
   renderRulesBody();
 }
 
+function geoIntervalLabel(minutes) {
+  const value = Number(minutes) || 0;
+  if (value === 0) return t('rules.intervalManual');
+  if (value === 60) return t('rules.intervalHourly');
+  if (value === 360) return t('rules.interval6h');
+  if (value === 1440) return t('rules.interval24h');
+  return t('rules.intervalMinutes').replace('{minutes}', value);
+}
+
+function geoSourceHost(url) {
+  try { return new URL(url).hostname; } catch { return ''; }
+}
+
+function geoUpdatedLabel(source) {
+  if (!source || !source.last_updated_at) return t('rules.neverUpdated');
+  const ts = new Date(source.last_updated_at).getTime();
+  if (!Number.isFinite(ts) || new Date(ts).getUTCFullYear() < 1970) return t('rules.neverUpdated');
+  return relativeTime(source.last_updated_at) || t('rules.neverUpdated');
+}
+
 /* ------------------------------------------------------------------ */
-/* Fleet control plane: nodes, routes, users                           */
+/* Fleet control plane: dashboard, nodes, routes, users                */
 /* ------------------------------------------------------------------ */
 
 const TRANSPORT_KINDS = [
@@ -823,44 +1087,73 @@ const TRANSPORT_KINDS = [
   { value: 'livekit', label: 'LiveKit' }
 ];
 
+const PANEL_META = {
+  dashboard: { title: 'nav.dashboard', subtitle: 'app.tagline' },
+  nodes: { title: 'nodes.title', subtitle: 'nodes.subtitle' },
+  routes: { title: 'routes.title', subtitle: 'routes.subtitle' },
+  users: { title: 'users.title', subtitle: 'users.subtitle' },
+  configs: { title: 'config.title', subtitle: 'config.subtitle' }
+};
+
 function setupFleetTabs() {
-  document.querySelectorAll('.panel-tab').forEach(btn => {
+  document.querySelectorAll('.nav-item[data-panel]').forEach(btn => {
     btn.addEventListener('click', () => switchPanel(btn.dataset.panel));
   });
   const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+  bind('btn-dashboard-refresh', () => loadPanel('dashboard'));
   bind('btn-refresh-nodes', () => loadPanel('nodes'));
   bind('btn-refresh-routes', () => loadPanel('routes'));
   bind('btn-refresh-users', () => loadPanel('users'));
-  bind('btn-add-node', () => openNodeModal(null));
+  bind('btn-add-node', () => openNodeModal(null, 'relay'));
   bind('btn-add-route', () => fleetAddRoute());
   bind('btn-add-user', () => openUserModal());
-
-  setInterval(() => {
-    if (fleet.active === 'nodes' || fleet.active === 'routes' || fleet.active === 'users') {
-      loadPanel(fleet.active, true);
-    }
-  }, 6000);
 }
 
 function switchPanel(name) {
   if (!name) return;
   fleet.active = name;
-  document.querySelectorAll('.panel-tab').forEach(btn => {
+  document.querySelectorAll('.nav-item[data-panel]').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.panel === name);
   });
   document.querySelectorAll('.panel-view').forEach(view => {
-    view.classList.toggle('hidden', view.id !== 'panel-' + name);
+    view.classList.toggle('hidden', view.id !== 'view-' + name);
   });
-  if (name === 'configs') render();
+  const meta = PANEL_META[name] || PANEL_META.dashboard;
+  const title = document.getElementById('page-title');
+  const subtitle = document.getElementById('page-subtitle');
+  if (title) { title.dataset.lang = meta.title; title.textContent = t(meta.title); }
+  if (subtitle) { subtitle.dataset.lang = meta.subtitle; subtitle.textContent = t(meta.subtitle); }
+  document.getElementById('sidebar')?.classList.remove('open');
+  if (name === 'configs') load();
   else loadPanel(name);
 }
 
-async function loadPanel(name, silent = false) {
-  if (!name || name === 'configs' || fleet.loading[name]) return;
+async function loadPanel(name, silent = false, force = false) {
+  if (!name) return;
+  if (fleet.loading[name]) {
+    if (!force) return;
+    // An older request is still in flight: wait for it, then fetch fresh data
+    // so the UI never stays stale after a create/update/delete action.
+    const deadline = Date.now() + 10000;
+    while (fleet.loading[name] && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
   fleet.loading[name] = true;
   try {
-    if (name === 'nodes') {
-      fleet.nodes = (await api('/api/nodes')) || [];
+    if (name === 'dashboard') {
+      const [settings, nodes, routes, users] = await Promise.all([
+        api('/api/settings'), api('/api/nodes'), api('/api/routes'), api('/api/users')
+      ]);
+      fleet.settings = settings;
+      fleet.nodes = nodes || [];
+      fleet.routes = routes || [];
+      fleet.users = users || [];
+      renderDashboard();
+    } else if (name === 'nodes') {
+      const [nodes, settings] = await Promise.all([api('/api/nodes'), api('/api/settings')]);
+      fleet.nodes = nodes || [];
+      fleet.settings = settings;
       renderNodes();
     } else if (name === 'routes') {
       const [routes, nodes] = await Promise.all([api('/api/routes'), api('/api/nodes')]);
@@ -868,11 +1161,16 @@ async function loadPanel(name, silent = false) {
       fleet.nodes = nodes || [];
       renderRoutes();
     } else if (name === 'users') {
-      const [users, routes] = await Promise.all([api('/api/users'), api('/api/routes')]);
+      const [users, routes, nodes, settings] = await Promise.all([
+        api('/api/users'), api('/api/routes'), api('/api/nodes'), api('/api/settings')
+      ]);
       fleet.users = users || [];
       fleet.routes = routes || [];
+      fleet.nodes = nodes || [];
+      fleet.settings = settings;
       renderUsers();
     }
+    applyLang();
   } catch (e) {
     if (!silent) toast(e.message, 'error');
   } finally {
@@ -880,16 +1178,315 @@ async function loadPanel(name, silent = false) {
   }
 }
 
-function nodeName(id) {
-  const node = fleet.nodes.find(n => n.id === id);
-  return node ? node.name : '#' + id;
+/* Re-render the current view from already loaded data (used for instant
+   language switching). Never triggers network requests. */
+function rerenderActivePanel() {
+  if (fleet.active === 'configs') { render(); return; }
+  if (fleet.active === 'dashboard') renderDashboard();
+  else if (fleet.active === 'nodes') renderNodes();
+  else if (fleet.active === 'routes') renderRoutes();
+  else if (fleet.active === 'users') renderUsers();
+}
+
+/* Fetch fresh data for the visible page and redraw it. Every create, update
+   and delete action goes through this helper so the active view updates
+   immediately without an extra click. */
+async function loadActiveView() {
+  const name = fleet.active || 'dashboard';
+  if (name === 'configs') {
+    await load();
+    render();
+    return;
+  }
+  await loadPanel(name, false, true);
+}
+
+/* Light background poll: only node statuses (Servers, Dashboard) and user
+   traffic (Users) are refreshed, and only the affected chips/cells are
+   touched. Lists and forms are never rebuilt here. */
+async function pollFleetLive() {
+  if (!canAutoRefresh()) return;
+  const active = fleet.active;
+  if (active !== 'nodes' && active !== 'users' && active !== 'dashboard') return;
+  if (fleet.loading[active] || fleet.livePolling) return;
+  fleet.livePolling = true;
+  try {
+    if (active === 'nodes' || active === 'dashboard') {
+      const nodes = (await api('/api/nodes')) || [];
+      if (fleet.active !== active || !canAutoRefresh()) return;
+      applyNodeLiveStatus(nodes);
+    } else {
+      const users = (await api('/api/users')) || [];
+      if (fleet.active !== 'users' || !canAutoRefresh()) return;
+      applyUserLiveStatus(users);
+    }
+  } catch (e) {
+    // Background refresh stays silent, the manual refresh button reports errors.
+  } finally {
+    fleet.livePolling = false;
+  }
+}
+
+function applyNodeLiveStatus(nodes) {
+  const byId = new Map((nodes || []).map(n => [String(n.id), n]));
+  fleet.nodes = (fleet.nodes || []).map(node => {
+    const live = byId.get(String(node.id));
+    if (!live) return node;
+    return Object.assign({}, node, {
+      status: live.status,
+      updated_at: live.updated_at,
+      last_error: live.last_error
+    });
+  });
+  document.querySelectorAll('[data-node-status]').forEach(el => {
+    const live = byId.get(el.dataset.nodeStatus);
+    if (!live) return;
+    el.className = `status-chip status-chip--${statusClass(live.status)}`;
+    el.textContent = nodeStatusText(live);
+  });
+}
+
+function applyUserLiveStatus(users) {
+  const byId = new Map((users || []).map(u => [String(u.id), u]));
+  fleet.users = (fleet.users || []).map(user => {
+    const live = byId.get(String(user.id));
+    if (!live) return user;
+    return Object.assign({}, user, {
+      enabled: live.enabled,
+      expires_at: live.expires_at,
+      traffic_limit_bytes: live.traffic_limit_bytes,
+      used_upload_bytes: live.used_upload_bytes,
+      used_download_bytes: live.used_download_bytes
+    });
+  });
+
+  const statusEls = new Map();
+  document.querySelectorAll('[data-user-status]').forEach(el => statusEls.set(el.dataset.userStatus, el));
+  const trafficEls = new Map();
+  document.querySelectorAll('[data-user-traffic]').forEach(el => trafficEls.set(el.dataset.userTraffic, el));
+
+  fleet.users.forEach(user => {
+    const id = String(user.id);
+    const active = userActive(user);
+
+    const statusEl = statusEls.get(id);
+    if (statusEl) {
+      statusEl.className = `status-chip ${active ? 'status-chip--online' : 'status-chip--error'}`;
+      statusEl.textContent = active ? t('users.active') : t('users.inactive');
+    }
+
+    const trafficEl = trafficEls.get(id);
+    if (trafficEl) {
+      const used = userUsedBytes(user);
+      const limit = user.traffic_limit_bytes || 0;
+      const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
+      trafficEl.innerHTML = `${formatBytes(used)}${limit > 0 ? ` / ${formatBytes(limit)}<div class="hint">${percent}%</div>` : ''}`;
+    }
+  });
+}
+
+function relativeTime(value) {
+  if (!value) return '';
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return '';
+  const sec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (sec < 60) return sec + ' ' + t('time.secAgo');
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + ' ' + t('time.minAgo');
+  const hours = Math.round(min / 60);
+  if (hours < 24) return hours + ' ' + t('time.hourAgo');
+  return Math.round(hours / 24) + ' ' + t('time.dayAgo');
+}
+
+function nodeStatusText(node) {
+  const status = node.status || 'new';
+  if (status === 'deploying') return t('nodes.statusDeploying');
+  if (status === 'error') return t('nodes.statusError');
+  if (status === 'deployed' || status === 'online') {
+    const rel = relativeTime(node.updated_at);
+    return rel ? `${t('nodes.statusOnline')} · ${t('nodes.updated')} ${rel}` : t('nodes.statusOnline');
+  }
+  return t('nodes.statusNew');
 }
 
 function nodeRoles(node) {
-  if (node.is_relay && node.is_exit) return 'Relay + Exit';
-  if (node.is_relay) return 'Relay';
-  if (node.is_exit) return 'Exit';
+  if (node.is_relay && node.is_exit) return t('roles.both');
+  if (node.is_relay) return t('roles.relay');
+  if (node.is_exit) return t('roles.exit');
   return '—';
+}
+
+function transportLabel(kind) {
+  const found = TRANSPORT_KINDS.find(k => k.value === kind);
+  return found ? found.label : kind;
+}
+
+function emptyState(icon, text, actionLabel, action) {
+  return `<div class="empty"><span class="material-symbols-rounded">${icon}</span><p>${esc(text)}</p>${actionLabel ? `<button class="btn btn--filled" type="button" onclick="${action}">${esc(actionLabel)}</button>` : ''}</div>`;
+}
+
+function renderDashboard() {
+  const settings = fleet.settings || {};
+  const activeEl = document.activeElement;
+  const keepDomainFocus = !!(activeEl && activeEl.id === 'subscription-domain');
+  const nodes = fleet.nodes || [];
+  const relays = nodes.filter(n => n.is_relay);
+  const exits = nodes.filter(n => n.is_exit);
+  const users = fleet.users || [];
+  const routes = fleet.routes || [];
+  const activeUsers = users.filter(userActive).length;
+  const enabledRoutes = routes.filter(r => r.enabled).length;
+  const traffic = users.reduce((sum, user) => sum + userUsedBytes(user), 0);
+  const publicURL = (() => {
+    const override = (settings.public_url || '').trim();
+    if (override) return override;
+    const domain = (settings.public_domain || '').trim();
+    return domain ? 'https://' + domain : '';
+  })();
+
+  const domainInput = document.getElementById('subscription-domain');
+  const domainValue = fleet.domainDraft != null ? fleet.domainDraft : (settings.public_domain || '');
+  if (domainInput) {
+    if (!keepDomainFocus) domainInput.value = domainValue;
+    domainInput.oninput = e => { fleet.domainDraft = e.target.value; };
+  }
+
+  const domainStatus = document.getElementById('dashboard-domain-status');
+  if (domainStatus) {
+    domainStatus.className = 'status-chip ' + (publicURL ? 'status-chip--online' : '');
+    domainStatus.textContent = t(publicURL ? 'dashboard.domainReady' : 'dashboard.domainMissing');
+  }
+
+  const domainMessage = document.getElementById('dashboard-domain-message');
+  if (domainMessage) {
+    const caddyMessage = fleet.caddy && fleet.caddy.message
+      ? fleet.caddy.message
+      : (publicURL ? t('dashboard.caddyOk') : t('dashboard.caddyPending'));
+    const overrideNote = settings.public_url_override ? ' ' + t('dashboard.urlOverride') : '';
+    domainMessage.textContent = (publicURL ? publicURL + ' — ' : '') + caddyMessage + overrideNote;
+  }
+
+  const hasDomain = !!(settings.public_domain || '').trim();
+  const subscriptionsToggle = document.getElementById('subscriptions-enabled');
+  if (subscriptionsToggle) {
+    subscriptionsToggle.checked = !!settings.subscriptions_enabled;
+    subscriptionsToggle.disabled = !hasDomain;
+  }
+  const deleteDomainBtn = document.getElementById('btn-delete-domain');
+  if (deleteDomainBtn) deleteDomainBtn.classList.toggle('hidden', !hasDomain);
+
+  const stats = document.getElementById('dashboard-stats');
+  if (stats) {
+    stats.innerHTML = `
+      <div class="stat-card">
+        <span class="stat-card__label">${esc(t('dashboard.servers'))}</span>
+        <strong>${nodes.length}</strong>
+        <span class="stat-card__hint">${esc(t('dashboard.serversHint').replace('{relays}', relays.length).replace('{exits}', exits.length))}</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-card__label">${esc(t('dashboard.routes'))}</span>
+        <strong>${routes.length}</strong>
+        <span class="stat-card__hint">${esc(t('dashboard.routesHint').replace('{active}', enabledRoutes).replace('{total}', routes.length))}</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-card__label">${esc(t('dashboard.users'))}</span>
+        <strong>${users.length}</strong>
+        <span class="stat-card__hint">${esc(t('dashboard.usersHint').replace('{active}', activeUsers).replace('{total}', users.length))}</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-card__label">${esc(t('dashboard.traffic'))}</span>
+        <strong>${formatBytes(traffic)}</strong>
+        <span class="stat-card__hint">${esc(t('dashboard.trafficHint'))}</span>
+      </div>`;
+  }
+
+  const list = document.getElementById('dashboard-nodes');
+  if (list) {
+    if (!nodes.length) {
+      list.innerHTML = emptyState('dns', t('nodes.empty'), t('nodes.add'), "openNodeModal(null,'relay')");
+    } else {
+      const rows = nodes.map(node => {
+        const transports = (node.transports || [])
+          .filter(tr => tr.enabled && tr.domain)
+          .map(tr => transportLabel(tr.type))
+          .join(', ');
+        const exitOnly = node.is_exit && !node.is_relay;
+        let sub = transports;
+        if (!sub && !exitOnly) sub = t('nodes.noTransports');
+        return `<tr>
+          <td><strong>${esc(node.name)}</strong><div class="table-sub">${esc(sub)}</div></td>
+          <td><span class="role-chip">${esc(nodeRoles(node))}</span></td>
+          <td><span class="card__subtitle">${esc(node.ssh_user || 'root')}@${esc(node.ssh_host || '—')}</span></td>
+          <td><span class="status-chip status-chip--${esc(statusClass(node.status))}" data-node-status="${escAttr(node.id)}">${esc(nodeStatusText(node))}</span></td>
+        </tr>`;
+      }).join('');
+      list.innerHTML = `<div class="table-wrap"><table class="data-table">
+        <thead><tr><th>${esc(t('nodes.name'))}</th><th>${esc(t('roles.title'))}</th><th>${esc(t('nodes.host'))}</th><th>${esc(t('users.status'))}</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+    }
+  }
+}
+
+async function saveSubscriptionDomain() {
+  const input = document.getElementById('subscription-domain');
+  if (!input) return;
+  const domain = input.value.trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/.*$/, '')
+    .replace(/\.$/, '');
+  if (!domain) return toast(t('dashboard.domainRequired'), 'error');
+  try {
+    const res = await api('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ public_domain: domain })
+    });
+    fleet.settings = res.settings || fleet.settings;
+    fleet.caddy = res.caddy || null;
+    fleet.domainDraft = null;
+    const message = res.caddy && res.caddy.message ? res.caddy.message : t('toast.saved');
+    toast(message, res.caddy && res.caddy.applied ? 'success' : 'info');
+    await loadActiveView();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function toggleSubscriptions(enabled) {
+  try {
+    const res = await api('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscriptions_enabled: enabled })
+    });
+    fleet.settings = res.settings || fleet.settings;
+    fleet.caddy = res.caddy || null;
+    if (enabled && fleet.settings && !fleet.settings.subscriptions_enabled) {
+      toast(t('dashboard.domainRequired'), 'error');
+    } else {
+      toast(res.caddy && res.caddy.message ? res.caddy.message : t('toast.saved'), res.caddy && res.caddy.applied ? 'success' : 'info');
+    }
+    await loadActiveView();
+  } catch (e) {
+    toast(e.message, 'error');
+    await loadActiveView();
+  }
+}
+
+async function deleteSubscriptionDomain() {
+  if (!confirm(t('dashboard.confirmDeleteDomain'))) return;
+  try {
+    const res = await api('/api/settings/domain', { method: 'DELETE' });
+    fleet.settings = res.settings || fleet.settings;
+    fleet.caddy = res.caddy || null;
+    fleet.domainDraft = null;
+    toast(t('dashboard.domainDeleted'), 'success');
+    await loadActiveView();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function networkSubscriptionsEnabled() {
+  const settings = fleet.settings || {};
+  return !!(settings.subscriptions_enabled && (settings.public_domain || '').trim());
 }
 
 function statusClass(status) {
@@ -900,71 +1497,90 @@ function renderNodes() {
   const root = document.getElementById('nodes-list');
   if (!root) return;
   if (!fleet.nodes.length) {
-    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">dns</span><p>No servers yet. Add your first node.</p></div>`;
+    root.innerHTML = emptyState('dns', t('nodes.empty'), t('nodes.add'), "openNodeModal(null,'relay')");
     return;
   }
   root.innerHTML = fleet.nodes.map(node => {
-    const transports = (node.transports || []).map(tr => {
-      const flags = [tr.enabled ? 'enabled' : 'disabled'];
-      if (tr.on_demand) flags.push('on-demand');
-      return `<span class="transport-chip ${tr.enabled ? '' : 'muted'}">${esc(tr.type)}${tr.domain ? ' · ' + esc(tr.domain) : ''} <em>${esc(flags.join(', '))}</em></span>`;
-    }).join('') || `<span class="transport-chip muted">no transports</span>`;
+    const exitOnly = node.is_exit && !node.is_relay;
+    const transportChips = (node.transports || []).map(tr =>
+      `<span class="transport-chip ${tr.enabled ? '' : 'muted'}">${esc(transportLabel(tr.type))}${tr.domain ? ' · ' + esc(tr.domain) : ''}</span>`
+    ).join('');
+    const transports = exitOnly ? '' : (transportChips || `<span class="transport-chip muted">${esc(t('nodes.noTransports'))}</span>`);
+    const deployed = node.status === 'deployed' || node.status === 'online';
     return `
-      <div class="node-card">
+      <article class="node-card" data-node-id="${escAttr(node.id)}">
         <div class="node-card__header">
           <div>
             <h3 class="card__title">${esc(node.name)}</h3>
             <span class="card__subtitle">${esc(node.ssh_user || 'root')}@${esc(node.ssh_host || '—')}:${esc(node.ssh_port || 22)}</span>
           </div>
-          <span class="status-chip status-chip--${statusClass(node.status)}">${esc(node.status || 'new')}</span>
+          <span class="status-chip status-chip--${esc(statusClass(node.status))}" data-node-status="${escAttr(node.id)}">${esc(nodeStatusText(node))}</span>
         </div>
         <div class="node-card__meta">
           <span class="role-chip">${esc(nodeRoles(node))}</span>
-          ${node.socks_port ? `<span class="meta-chip">SOCKS :${esc(node.socks_port)}</span>` : ''}
         </div>
-        <div class="transport-list">${transports}</div>
+        ${exitOnly ? '' : `<div class="transport-list">${transports}</div>`}
         ${node.last_error ? `<div class="card__error">${esc(node.last_error)}</div>` : ''}
         <div class="node-card__footer">
           <button class="btn btn--filled btn--compact" type="button" onclick="fleetDeployNode(${node.id})">
-            <span class="material-symbols-rounded">rocket_launch</span> Deploy
+            <span class="material-symbols-rounded">rocket_launch</span>${esc(deployed ? t('nodes.redeploy') : t('nodes.deploy'))}
           </button>
           <button class="btn btn--tonal btn--compact" type="button" onclick="fleetEditNode(${node.id})">
-            <span class="material-symbols-rounded">edit</span> Edit
+            <span class="material-symbols-rounded">edit</span>${esc(t('actions.edit'))}
           </button>
-          <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteNode(${node.id})">
+          <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteNode(${node.id})">
             <span class="material-symbols-rounded">delete</span>
           </button>
         </div>
-      </div>`;
+      </article>`;
   }).join('');
 }
 
 async function fleetDeleteNode(id) {
   const node = fleet.nodes.find(n => n.id === id);
-  if (!confirm(`Delete node "${node ? node.name : id}"?`)) return;
+  const name = node ? node.name : String(id);
+  const dialog = openModal({
+    title: t('nodes.deleteTitle'),
+    body: `<p>${esc(t('nodes.deleteBody').replace('{name}', name))}</p>`,
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: t('nodes.deleteClean'), kind: 'danger', onClick: () => removeNode(dialog, id, false) },
+      { label: t('nodes.deleteForce'), kind: 'text', onClick: () => removeNode(dialog, id, true) }
+    ]
+  });
+}
+
+async function removeNode(dialog, id, force) {
+  dialog.setBody(`<div class="deploy-log"><div class="deploy-step">${esc(t('nodes.cleaning'))}</div></div>`);
   try {
-    await api(`/api/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    toast('Node deleted');
-    await loadPanel('nodes');
-  } catch (e) { toast(e.message, 'error'); }
+    const res = await api(`/api/nodes/${encodeURIComponent(id)}${force ? '?force=true' : ''}`, { method: 'DELETE' });
+    if (res.cleanup) renderDeployResult(dialog, res.cleanup);
+    else dialog.setBody(`<div class="deploy-summary is-ok"><span class="material-symbols-rounded">check_circle</span>${esc(t('toast.deleted'))}</div>`);
+    toast(t('toast.deleted'), 'success');
+    await loadActiveView();
+  } catch (e) {
+    if (e.payload && e.payload.cleanup) renderDeployResult(dialog, e.payload.cleanup);
+    else dialog.setBody(`<div class="deploy-log"><div class="deploy-step is-error">${esc(e.message)}</div></div>`);
+    toast(e.message, 'error');
+  }
 }
 
 async function fleetDeployNode(id) {
   const node = fleet.nodes.find(n => n.id === id);
   const dialog = openModal({
-    title: `Deploy: ${node ? node.name : id}`,
-    body: `<div class="deploy-log"><div class="deploy-step">Connecting to the node…</div></div>`
+    title: `${t('nodes.deploy')}: ${node ? node.name : id}`,
+    body: `<div class="deploy-log"><div class="deploy-step">${esc(t('nodes.connecting'))}</div></div>`
   });
   try {
     const result = await api(`/api/nodes/${encodeURIComponent(id)}/deploy`, { method: 'POST' });
     renderDeployResult(dialog, result);
-    toast('Deploy finished');
+    toast(t('nodes.deployDone'), 'success');
   } catch (e) {
     if (e.payload && e.payload.deployment) renderDeployResult(dialog, e.payload.deployment);
     else dialog.setBody(`<div class="deploy-log"><div class="deploy-step is-error">${esc(e.message)}</div></div>`);
     toast(e.message, 'error');
   }
-  loadPanel('nodes', true);
+  await loadActiveView();
 }
 
 function renderDeployResult(dialog, result) {
@@ -972,9 +1588,9 @@ function renderDeployResult(dialog, result) {
   const success = !!(result && result.success);
   let html = `<div class="deploy-summary ${success ? 'is-ok' : 'is-error'}">
     <span class="material-symbols-rounded">${success ? 'check_circle' : 'error'}</span>
-    ${success ? 'Deployment succeeded' : 'Deployment failed'}
+    ${esc(success ? t('nodes.deploySucceeded') : t('nodes.deployFailed'))}
   </div><div class="deploy-log">`;
-  if (!steps.length) html += `<div class="deploy-step">No steps returned.</div>`;
+  if (!steps.length) html += `<div class="deploy-step">${esc(t('nodes.noSteps'))}</div>`;
   steps.forEach(step => {
     html += `<div class="deploy-step ${step.error ? 'is-error' : 'is-ok'}">
       <div class="deploy-step__name">${step.error ? '✗' : '✓'} ${esc(step.name)}</div>
@@ -989,18 +1605,19 @@ function renderDeployResult(dialog, result) {
   if (body) body.scrollTop = body.scrollHeight;
 }
 
-
-function emptyNodeDraft() {
+function emptyNodeDraft(role) {
+  const relay = role === 'relay' || role === 'both';
+  const exit = role === 'exit' || role === 'both';
   return {
     name: '', ssh_host: '', ssh_port: 22, ssh_user: 'root',
-    ssh_private_key: '', ssh_password: '',
-    is_relay: true, is_exit: false, socks_port: 1080,
-    transports: []
+    ssh_private_key: '', ssh_password: '', authMode: 'key',
+    is_relay: relay, is_exit: exit, socks_port: 1080,
+    transports: relay ? [{ type: 'raw_ws', domain: '', enabled: true }] : []
   };
 }
 
 function nodeDraftFrom(node) {
-  const draft = emptyNodeDraft();
+  const draft = emptyNodeDraft('relay');
   if (!node) return draft;
   Object.assign(draft, {
     name: node.name || '',
@@ -1012,11 +1629,9 @@ function nodeDraftFrom(node) {
     is_relay: !!node.is_relay,
     is_exit: !!node.is_exit,
     socks_port: node.socks_port || 1080,
-    transports: (node.transports || []).map(tr => ({
-      type: tr.type, domain: tr.domain || '',
-      enabled: !!tr.enabled, on_demand: !!tr.on_demand
-    }))
+    transports: (node.transports || []).map(tr => ({ type: tr.type, domain: tr.domain || '', enabled: !!tr.enabled }))
   });
+  draft.authMode = draft.ssh_private_key ? 'key' : (draft.ssh_password ? 'password' : 'key');
   return draft;
 }
 
@@ -1026,13 +1641,13 @@ async function fleetEditNode(id) {
   openNodeModal(node || null);
 }
 
-function openNodeModal(node) {
-  const draft = nodeDraftFrom(node);
+function openNodeModal(node, role) {
+  const draft = node ? nodeDraftFrom(node) : emptyNodeDraft(role || 'relay');
   const editID = node ? node.id : null;
   fleet.nodeDraft = draft;
 
   const dialog = openModal({
-    title: editID ? `Edit: ${node.name}` : 'Add server',
+    title: editID ? `${t('actions.edit')}: ${node.name}` : t('nodes.add'),
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
       { label: editID ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitNode }
@@ -1040,60 +1655,77 @@ function openNodeModal(node) {
   });
 
   function transportRow(tr, i) {
-    const options = TRANSPORT_KINDS.map(k =>
-      `<option value="${escAttr(k.value)}" ${k.value === tr.type ? 'selected' : ''}>${esc(k.label)}</option>`
-    ).join('');
+    const usedByOthers = new Set(draft.transports.filter((_, idx) => idx !== i).map(item => item.type));
+    const options = TRANSPORT_KINDS.map(k => {
+      const used = usedByOthers.has(k.value);
+      const label = used ? `${k.label} (${t('nodes.transportAlreadyAdded')})` : k.label;
+      return `<option value="${escAttr(k.value)}" ${k.value === tr.type ? 'selected' : ''} ${used ? 'disabled' : ''}>${esc(label)}</option>`;
+    }).join('');
     return `<div class="transport-row">
       <select class="input" onchange="fleetNodeChangeTransportType(${i}, this.value)">${options}</select>
       <input type="text" class="input" value="${escAttr(tr.domain)}" placeholder="domain.example.com"
              oninput="fleetNodeSetTransport(${i}, 'domain', this.value)">
       <label class="check-row"><input type="checkbox" ${tr.enabled ? 'checked' : ''}
-        onchange="fleetNodeSetTransport(${i}, 'enabled', this.checked)"> enabled</label>
-      ${tr.type === 'livekit' ? `<label class="check-row" title="Clients get short-lived JWT via /session"><input type="checkbox" ${tr.on_demand ? 'checked' : ''}
-        onchange="fleetNodeSetTransport(${i}, 'on_demand', this.checked)"> on-demand</label>` : ''}
-      <button type="button" class="icon-btn icon-btn--danger" title="Remove"
+        onchange="fleetNodeSetTransport(${i}, 'enabled', this.checked)"> ${esc(t('nodes.enabled'))}</label>
+      <button type="button" class="icon-btn icon-btn--danger" title="${esc(t('actions.remove'))}"
         onclick="fleetNodeRemoveTransport(${i})"><span class="material-symbols-rounded">delete</span></button>
     </div>`;
   }
 
   function renderNodeBody() {
     const transports = draft.transports.map(transportRow).join('') ||
-      `<div class="hint">No transports yet. A relay node needs at least one enabled transport.</div>`;
+      `<div class="hint">${esc(t('nodes.noTransports'))}</div>`;
+    const authField = draft.authMode === 'password'
+      ? `<input type="password" id="n-pass" value="${escAttr(draft.ssh_password)}" placeholder="${escAttr(t('nodes.passwordPlaceholder'))}" autocomplete="new-password">`
+      : `<textarea id="n-key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${esc(draft.ssh_private_key)}</textarea>`;
+    const usedTransportTypes = new Set(draft.transports.map(tr => tr.type));
+    const canAddTransport = usedTransportTypes.size < TRANSPORT_KINDS.length;
+    const addTransportButton = canAddTransport
+      ? `<button type="button" class="btn btn--tonal btn--compact" style="align-self:flex-start;margin-top:8px"
+            onclick="fleetNodeAddTransport()"><span class="material-symbols-rounded">add</span>${esc(t('nodes.addTransport'))}</button>`
+      : '';
+    const transportSection = draft.is_relay
+      ? `<div class="field">
+          <label>${esc(t('nodes.transports'))}</label>
+          <div class="transport-rows">${transports}</div>
+          ${addTransportButton}
+        </div>`
+      : '';
     dialog.setBody(`
       <div class="form-group">
         <div class="field">
-          <label>Name</label>
-          <input type="text" id="n-name" value="${escAttr(draft.name)}" placeholder="relay-de">
-        </div>
-        <div class="form-row">
-          <div class="field"><label>SSH host</label><input type="text" id="n-host" value="${escAttr(draft.ssh_host)}" placeholder="203.0.113.10"></div>
-          <div class="field field--small"><label>Port</label><input type="number" id="n-port" value="${escAttr(draft.ssh_port)}" min="1" max="65535"></div>
-        </div>
-        <div class="form-row">
-          <div class="field"><label>SSH user</label><input type="text" id="n-user" value="${escAttr(draft.ssh_user)}" placeholder="root"></div>
-          <div class="field field--small"><label>SOCKS port (exit)</label><input type="number" id="n-socks" value="${escAttr(draft.socks_port)}" min="0" max="65535"></div>
-        </div>
-        <div class="field">
-          <label>SSH private key</label>
-          <textarea id="n-key" class="compact-textarea" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${esc(draft.ssh_private_key)}</textarea>
-        </div>
-        <div class="field">
-          <label>SSH password (optional)</label>
-          <input type="password" id="n-pass" value="${escAttr(draft.ssh_password)}">
-        </div>
-        <div class="field">
-          <label>Roles</label>
+          <label>${esc(t('roles.title'))}</label>
           <div class="role-row">
-            <label class="check-row"><input type="checkbox" id="n-relay" ${draft.is_relay ? 'checked' : ''}> Relay</label>
-            <label class="check-row"><input type="checkbox" id="n-exit" ${draft.is_exit ? 'checked' : ''}> Exit</label>
+            <label class="role-option">
+              <input type="checkbox" class="role-option__input" id="n-relay" ${draft.is_relay ? 'checked' : ''}>
+              <span class="role-option__box"><span class="material-symbols-rounded">check</span></span>
+              <span class="role-option__text"><strong>${esc(t('roles.relay'))}</strong><span>${esc(t('roles.relayHint'))}</span></span>
+            </label>
+            <label class="role-option">
+              <input type="checkbox" class="role-option__input" id="n-exit" ${draft.is_exit ? 'checked' : ''}>
+              <span class="role-option__box"><span class="material-symbols-rounded">check</span></span>
+              <span class="role-option__text"><strong>${esc(t('roles.exit'))}</strong><span>${esc(t('roles.exitHint'))}</span></span>
+            </label>
           </div>
         </div>
-        <div class="field">
-          <label>Transports &amp; domains</label>
-          <div class="transport-rows">${transports}</div>
-          <button type="button" class="btn btn--tonal" style="align-self:flex-start;margin-top:8px"
-            onclick="fleetNodeAddTransport()"><span class="material-symbols-rounded">add</span> Add transport</button>
+        <div class="form-row">
+          <div class="field"><label>${esc(t('nodes.name'))}</label><input type="text" id="n-name" value="${escAttr(draft.name)}" placeholder="helsinki-1"></div>
+          <div class="field"><label>${esc(t('nodes.host'))}</label><input type="text" id="n-host" value="${escAttr(draft.ssh_host)}" placeholder="203.0.113.10" autocomplete="off" spellcheck="false"></div>
         </div>
+        <div class="form-row">
+          <div class="field"><label>${esc(t('nodes.user'))}</label><input type="text" id="n-user" value="${escAttr(draft.ssh_user)}" placeholder="root" autocomplete="off"></div>
+          <div class="field field--small"><label>${esc(t('nodes.sshPort'))}</label><input type="number" id="n-port" value="${escAttr(draft.ssh_port)}" min="1"></div>
+        </div>
+        <div class="field">
+          <label>${esc(t('nodes.sshAuth'))}</label>
+          <div class="segmented" role="group" aria-label="${escAttr(t('nodes.sshAuth'))}">
+            <button type="button" class="segmented__btn ${draft.authMode === 'password' ? '' : 'active'}" onclick="fleetNodeSetAuth('key')">${esc(t('nodes.authKey'))}</button>
+            <button type="button" class="segmented__btn ${draft.authMode === 'password' ? 'active' : ''}" onclick="fleetNodeSetAuth('password')">${esc(t('nodes.authPassword'))}</button>
+          </div>
+          <div class="hint">${esc(t('nodes.authHint'))}</div>
+          ${authField}
+        </div>
+        ${transportSection}
       </div>`);
     bindNodeForm();
   }
@@ -1109,29 +1741,59 @@ function openNodeModal(node) {
     bindInput('n-host', 'ssh_host');
     bindInput('n-port', 'ssh_port', true);
     bindInput('n-user', 'ssh_user');
-    bindInput('n-socks', 'socks_port', true);
     bindInput('n-key', 'ssh_private_key');
     bindInput('n-pass', 'ssh_password');
     const relay = document.getElementById('n-relay');
-    if (relay) relay.addEventListener('change', e => { draft.is_relay = e.target.checked; });
+    if (relay) relay.addEventListener('change', e => {
+      draft.is_relay = e.target.checked;
+      if (draft.is_relay && !draft.transports.length) {
+        draft.transports.push({ type: 'raw_ws', domain: '', enabled: true });
+      }
+      renderNodeBody();
+    });
     const exit = document.getElementById('n-exit');
     if (exit) exit.addEventListener('change', e => { draft.is_exit = e.target.checked; });
   }
 
-  function submitNode() {
-    if (!draft.name.trim()) return toast('Name is required', 'error');
-    if (!draft.ssh_host.trim()) return toast('SSH host is required', 'error');
-    if (!draft.is_relay && !draft.is_exit) return toast('Choose Relay and/or Exit role', 'error');
+  async function submitNode() {
+    const name = draft.name.trim();
+    const host = draft.ssh_host.trim();
+    if (!name) return toast(t('nodes.nameRequired'), 'error');
+    if (!host) return toast(t('nodes.hostRequired'), 'error');
+    if (!draft.is_relay && !draft.is_exit) return toast(t('nodes.roleRequired'), 'error');
+    if (draft.is_relay) {
+      const types = draft.transports.map(tr => tr.type);
+      if (new Set(types).size !== types.length) return toast(t('nodes.duplicateTransport'), 'error');
+      const enabled = draft.transports.filter(tr => tr.enabled);
+      if (!enabled.length) return toast(t('nodes.transportRequired'), 'error');
+      if (enabled.some(tr => !tr.domain.trim())) return toast(t('nodes.domainRequired'), 'error');
+    }
+    if (draft.is_exit && !draft.socks_port) draft.socks_port = 1080;
+    const payload = {
+      name,
+      ssh_host: host,
+      ssh_port: draft.ssh_port,
+      ssh_user: draft.ssh_user.trim() || 'root',
+      ssh_private_key: draft.ssh_private_key,
+      ssh_password: draft.ssh_password,
+      is_relay: draft.is_relay,
+      is_exit: draft.is_exit,
+      socks_port: draft.socks_port,
+      transports: draft.is_relay ? draft.transports : []
+    };
     const path = editID ? `/api/nodes/${encodeURIComponent(editID)}` : '/api/nodes';
-    api(path, {
-      method: editID ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft)
-    }).then(() => {
-      toast(editID ? 'Node saved' : 'Node created');
+    try {
+      await api(path, {
+        method: editID ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      toast(editID ? t('toast.saved') : t('toast.created'), 'success');
       closeModal();
-      loadPanel('nodes');
-    }).catch(e => toast(e.message, 'error'));
+      await loadActiveView();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
   }
 
   fleet.renderNodeBody = renderNodeBody;
@@ -1147,15 +1809,31 @@ function fleetNodeSetTransport(index, key, value) {
 function fleetNodeChangeTransportType(index, value) {
   const draft = fleet.nodeDraft;
   if (!draft || !draft.transports[index]) return;
+  if (draft.transports.some((tr, idx) => idx !== index && tr.type === value)) {
+    toast(t('nodes.duplicateTransport'), 'error');
+    if (fleet.renderNodeBody) fleet.renderNodeBody();
+    return;
+  }
   draft.transports[index].type = value;
-  if (value !== 'livekit') draft.transports[index].on_demand = false;
+  if (fleet.renderNodeBody) fleet.renderNodeBody();
+}
+
+function fleetNodeSetAuth(mode) {
+  const draft = fleet.nodeDraft;
+  if (!draft) return;
+  draft.authMode = mode === 'password' ? 'password' : 'key';
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
 function fleetNodeAddTransport() {
   const draft = fleet.nodeDraft;
   if (!draft) return;
-  draft.transports.push({ type: 'raw_ws', domain: '', enabled: true, on_demand: false });
+  const next = TRANSPORT_KINDS.find(kind => !draft.transports.some(tr => tr.type === kind.value));
+  if (!next) {
+    toast(t('nodes.allTransportsAdded'), 'info');
+    return;
+  }
+  draft.transports.push({ type: next.value, domain: '', enabled: true });
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
@@ -1166,17 +1844,16 @@ function fleetNodeRemoveTransport(index) {
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
-
-function transportLabel(kind) {
-  const found = TRANSPORT_KINDS.find(k => k.value === kind);
-  return found ? found.label : kind;
+function nodeName(id) {
+  const node = fleet.nodes.find(n => n.id === id);
+  return node ? node.name : '#' + id;
 }
 
 function renderRoutes() {
   const root = document.getElementById('routes-list');
   if (!root) return;
   if (!fleet.routes.length) {
-    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">alt_route</span><p>No routes yet. Create an Entry → Exit chain.</p></div>`;
+    root.innerHTML = emptyState('alt_route', t('routes.empty'), t('routes.add'), 'fleetAddRoute()');
     return;
   }
   const rows = fleet.routes.map(route => `
@@ -1191,12 +1868,12 @@ function renderRoutes() {
         </label>
       </td>
       <td class="table-actions">
-        <button class="icon-btn" type="button" title="Edit" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
-        <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
+        <button class="icon-btn" type="button" title="${esc(t('actions.edit'))}" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
+        <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
       </td>
     </tr>`).join('');
   root.innerHTML = `<div class="table-wrap"><table class="data-table">
-    <thead><tr><th>Name</th><th>Entry → Exit</th><th>Transport</th><th>Enabled</th><th></th></tr></thead>
+    <thead><tr><th>${esc(t('routes.name'))}</th><th>${esc(t('routes.path'))}</th><th>${esc(t('routes.transport'))}</th><th>${esc(t('routes.enabled'))}</th><th></th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
@@ -1217,23 +1894,23 @@ async function fleetToggleRoute(id, enabled) {
       })
     });
     route.enabled = enabled;
-    toast(enabled ? 'Route enabled' : 'Route disabled');
+    toast(enabled ? t('routes.enabledToast') : t('routes.disabledToast'), 'success');
+    await loadActiveView();
   } catch (e) {
     toast(e.message, 'error');
-    loadPanel('routes', true);
+    await loadActiveView();
   }
 }
 
 async function fleetDeleteRoute(id) {
   const route = fleet.routes.find(r => r.id === id);
-  if (!confirm(`Delete route "${route ? route.name : id}"?`)) return;
+  if (!confirm(t('routes.confirmDelete').replace('{name}', route ? route.name : String(id)))) return;
   try {
     await api(`/api/routes/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    toast('Route deleted');
-    await loadPanel('routes');
+    toast(t('toast.deleted'), 'success');
+    await loadActiveView();
   } catch (e) { toast(e.message, 'error'); }
 }
-
 
 async function fleetEditRoute(id) {
   const route = fleet.routes.find(r => r.id === id) || null;
@@ -1262,281 +1939,401 @@ function openRouteModal(route) {
     enabled: route ? !!route.enabled : true
   };
 
-  function selectOptions(nodes, selected) {
-    if (!nodes.length) return `<option value="0">No nodes available</option>`;
+  function takenTransports(entryID, exitID) {
+    const taken = new Set();
+    for (const r of fleet.routes || []) {
+      if (editID && r.id === editID) continue;
+      if (r.entry_node_id === entryID && r.exit_node_id === exitID) {
+        taken.add(r.transport_type);
+      }
+    }
+    return taken;
+  }
+
+  function transportOptions() {
+    const taken = takenTransports(draft.entry_node_id, draft.exit_node_id);
+    return TRANSPORT_KINDS.map(k => {
+      const disabled = taken.has(k.value);
+      const label = disabled ? `${k.label} (${t('routes.transportTaken')})` : k.label;
+      return `<option value="${escAttr(k.value)}" ${k.value === draft.transport_type ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${esc(label)}</option>`;
+    }).join('');
+  }
+
+  function refreshTransportOptions() {
+    const taken = takenTransports(draft.entry_node_id, draft.exit_node_id);
+    if (taken.has(draft.transport_type)) {
+      const next = TRANSPORT_KINDS.find(k => !taken.has(k.value));
+      if (next) draft.transport_type = next.value;
+    }
+    typeEl.innerHTML = transportOptions();
+    typeEl.value = draft.transport_type;
+  }
+
+  function selectOptions(nodes, selected, emptyLabel) {
+    if (!nodes.length) return `<option value="0">${esc(emptyLabel)}</option>`;
     return nodes.map(n => `<option value="${n.id}" ${n.id === selected ? 'selected' : ''}>${esc(n.name)}</option>`).join('');
   }
 
-  openModal({
-    title: editID ? `Edit route: ${route.name}` : 'Add route',
+  const dialog = openModal({
+    title: editID ? `${t('actions.edit')}: ${route.name}` : t('routes.add'),
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
       { label: editID ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitRoute }
     ],
     body: `
       <div class="form-group">
-        <div class="field"><label>Name</label><input type="text" id="r-name" value="${escAttr(draft.name)}" placeholder="de-fr"></div>
-        <div class="field"><label>Entry node (relay)</label><select id="r-entry" class="input">${selectOptions(relays, entryID)}</select></div>
-        <div class="field"><label>Exit node</label><select id="r-exit" class="input">${selectOptions(exits, exitID)}</select></div>
-        <div class="field"><label>Transport</label><select id="r-transport" class="input">
-          ${TRANSPORT_KINDS.map(k => `<option value="${escAttr(k.value)}" ${k.value === transport ? 'selected' : ''}>${esc(k.label)}</option>`).join('')}
+        <div class="field"><label>${esc(t('routes.name'))}</label><input type="text" id="r-name" value="${escAttr(draft.name)}" placeholder="helsinki-frankfurt"></div>
+        <div class="form-row">
+          <div class="field"><label>${esc(t('routes.from'))}</label><select id="r-entry">${selectOptions(relays, entryID, t('routes.noRelays'))}</select></div>
+          <div class="field"><label>${esc(t('routes.to'))}</label><select id="r-exit">${selectOptions(exits, exitID, t('routes.noExits'))}</select></div>
+        </div>
+        <div class="field"><label>${esc(t('routes.transport'))}</label><select id="r-transport">
+          ${transportOptions()}
         </select></div>
-        <label class="check-row"><input type="checkbox" id="r-enabled" ${draft.enabled ? 'checked' : ''}> Enabled</label>
+        <label class="check-row"><input type="checkbox" id="r-enabled" ${draft.enabled ? 'checked' : ''}> ${esc(t('routes.enabled'))}</label>
+        <div class="hint">${esc(t('routes.hint'))}</div>
       </div>`
   });
 
-  document.getElementById('r-name').addEventListener('input', e => { draft.name = e.target.value; });
-  document.getElementById('r-entry').addEventListener('change', e => { draft.entry_node_id = Number(e.target.value) || 0; });
-  document.getElementById('r-exit').addEventListener('change', e => { draft.exit_node_id = Number(e.target.value) || 0; });
-  document.getElementById('r-transport').addEventListener('change', e => { draft.transport_type = e.target.value; });
-  document.getElementById('r-enabled').addEventListener('change', e => { draft.enabled = e.target.checked; });
+  const nameEl = document.getElementById('r-name');
+  const entryEl = document.getElementById('r-entry');
+  const exitEl = document.getElementById('r-exit');
+  const typeEl = document.getElementById('r-transport');
+  const enabledEl = document.getElementById('r-enabled');
+  nameEl.addEventListener('input', e => { draft.name = e.target.value; });
+  entryEl.addEventListener('change', e => {
+    draft.entry_node_id = Number(e.target.value) || 0;
+    refreshTransportOptions();
+  });
+  exitEl.addEventListener('change', e => {
+    draft.exit_node_id = Number(e.target.value) || 0;
+    refreshTransportOptions();
+  });
+  typeEl.addEventListener('change', e => { draft.transport_type = e.target.value; });
+  enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
 
-  function submitRoute() {
-    if (!draft.name.trim()) return toast('Name is required', 'error');
-    if (!draft.entry_node_id || !draft.exit_node_id) return toast('Choose entry and exit nodes', 'error');
+  async function submitRoute() {
+    if (!draft.entry_node_id || !draft.exit_node_id) return toast(t('routes.nodesRequired'), 'error');
+    if (takenTransports(draft.entry_node_id, draft.exit_node_id).has(draft.transport_type)) {
+      return toast(t('routes.transportTaken'), 'error');
+    }
+    if (!draft.name.trim()) {
+      draft.name = `${nodeName(draft.entry_node_id)}-${nodeName(draft.exit_node_id)}`.toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+    }
     const path = editID ? `/api/routes/${encodeURIComponent(editID)}` : '/api/routes';
-    api(path, {
-      method: editID ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft)
-    }).then(() => {
-      toast(editID ? 'Route saved' : 'Route created');
+    try {
+      await api(path, {
+        method: editID ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(draft)
+      });
+      toast(editID ? t('toast.saved') : t('toast.created'), 'success');
       closeModal();
-      loadPanel('routes');
-    }).catch(e => toast(e.message, 'error'));
+      await loadActiveView();
+    } catch (e) {
+      toast(e.status === 409 ? t('routes.transportTaken') : e.message, 'error');
+    }
   }
+  dialog.setFocus?.('r-name');
 }
 
-
 function userUsedBytes(user) {
-  return (Number(user.used_upload_bytes) || 0) + (Number(user.used_download_bytes) || 0);
+  return (user.used_upload_bytes || 0) + (user.used_download_bytes || 0);
+}
+
+function expiryTime(value) {
+  if (!value) return null;
+  const ts = new Date(value).getTime();
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  // The Go API serialises a zero time.Time as 0001-01-01T00:00:00Z, which is
+  // how "no expiry" reaches the browser. Treat anything before 1970 as unset.
+  if (new Date(ts).getUTCFullYear() < 1970) return null;
+  return ts;
+}
+
+function userActive(user) {
+  if (!user.enabled) return false;
+  const expires = expiryTime(user.expires_at);
+  if (expires && expires <= Date.now()) return false;
+  if (user.traffic_limit_bytes > 0 && userUsedBytes(user) >= user.traffic_limit_bytes) return false;
+  return true;
 }
 
 function formatExpiry(value) {
-  if (!value) return 'Unlimited';
-  const date = new Date(value);
-  if (isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return 'Unlimited';
-  return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function userExpired(value) {
-  if (!value) return false;
-  const date = new Date(value);
-  if (isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return false;
-  return date.getTime() <= Date.now();
+  const ts = expiryTime(value);
+  return ts ? new Date(ts).toLocaleDateString() : t('users.never');
 }
 
 function routeNames(ids) {
-  if (!ids || !ids.length) return 'All routes';
-  return ids.map(id => nodeRouteName(id)).join(', ');
-}
-
-function nodeRouteName(id) {
-  const route = fleet.routes.find(r => r.id === id);
-  return route ? route.name : '#' + id;
+  if (!ids || !ids.length) return t('users.allRoutes');
+  return ids.map(id => {
+    const route = fleet.routes.find(r => r.id === id);
+    return route ? route.name : '#' + id;
+  }).join(', ');
 }
 
 function renderUsers() {
   const root = document.getElementById('users-list');
   if (!root) return;
   if (!fleet.users.length) {
-    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">group</span><p>No users yet.</p></div>`;
+    root.innerHTML = emptyState('group', t('users.empty'), t('users.add'), 'openUserModal()');
     return;
   }
-  root.innerHTML = fleet.users.map((user, index) => {
+  const canNetwork = networkSubscriptionsEnabled();
+  const rows = fleet.users.map(user => {
     const used = userUsedBytes(user);
-    const limit = Number(user.traffic_limit_bytes) || 0;
+    const limit = user.traffic_limit_bytes || 0;
     const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
-    const progressClass = limit <= 0 ? 'unlimited' : (percent >= 90 ? 'danger' : percent >= 70 ? 'warn' : 'good');
-    const active = user.enabled && !userExpired(user.expires_at) &&
-      (limit <= 0 || used < limit);
-    return `
-      <div class="user-card">
-        <div class="user-card__header">
-          <div>
-            <h3 class="card__title">${esc(user.name || user.id)}</h3>
-            <span class="card__subtitle">${esc(user.id)}</span>
-          </div>
-          <span class="status-chip status-chip--${active ? 'online' : 'error'}">${active ? 'active' : 'inactive'}</span>
-        </div>
-        <div class="user-card__meta">
-          <span class="meta-chip">Expires: ${esc(formatExpiry(user.expires_at))}</span>
-          <span class="meta-chip">${esc(routeNames(user.allowed_route_ids))}</span>
-        </div>
-        <div class="traffic">
-          <div class="traffic__labels">
-            <span>↓ ${formatBytes(Number(user.used_download_bytes) || 0)}</span>
-            <span>↑ ${formatBytes(Number(user.used_upload_bytes) || 0)}</span>
-            <span>${limit > 0 ? formatBytes(used) + ' / ' + formatBytes(limit) : formatBytes(used) + ' / unlimited'}</span>
-          </div>
-          <div class="progress progress--${progressClass}">
-            <div class="progress__bar" style="width:${limit > 0 ? percent : Math.min(100, Math.round(used / (1024 * 1024 * 1024) * 100))}%"></div>
-          </div>
-        </div>
-        <div class="user-card__footer">
-          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetCopySubscription(${index})">
-            <span class="material-symbols-rounded">link</span> Copy subscription
-          </button>
-          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetResetUserTraffic(${index})">
-            <span class="material-symbols-rounded">restart_alt</span> Reset traffic
-          </button>
-          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetToggleUser(${index})">
-            <span class="material-symbols-rounded">${user.enabled ? 'block' : 'lock_open'}</span> ${user.enabled ? 'Block' : 'Unblock'}
-          </button>
-          <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteUser(${index})">
-            <span class="material-symbols-rounded">delete</span>
-          </button>
-        </div>
-      </div>`;
+    const active = userActive(user);
+    const subActions = canNetwork
+      ? `<button class="icon-btn" type="button" title="${esc(t('users.qr'))}" onclick="openSubscriptionDialog('${escAttr(user.id)}')"><span class="material-symbols-rounded">qr_code_2</span></button>
+        <button class="icon-btn" type="button" title="${esc(t('users.copy'))}" onclick="fleetCopySubscription('${escAttr(user.id)}')"><span class="material-symbols-rounded">content_copy</span></button>`
+      : `<button class="icon-btn" type="button" title="${esc(t('users.offline'))}" onclick="openSubscriptionDialog('${escAttr(user.id)}')"><span class="material-symbols-rounded">description</span></button>`;
+    return `<tr data-user-id="${escAttr(user.id)}">
+      <td><strong>${esc(user.name || user.id)}</strong><div class="table-sub">${esc(user.id)}</div></td>
+      <td><span class="status-chip ${active ? 'status-chip--online' : 'status-chip--error'}" data-user-status="${escAttr(user.id)}">${esc(active ? t('users.active') : t('users.inactive'))}</span></td>
+      <td>${esc(formatExpiry(user.expires_at))}</td>
+      <td data-user-traffic="${escAttr(user.id)}">${formatBytes(used)}${limit > 0 ? ` / ${formatBytes(limit)}<div class="hint">${percent}%</div>` : ''}</td>
+      <td>${esc(routeNames(user.allowed_route_ids))}</td>
+      <td class="table-actions">
+        ${subActions}
+        <button class="icon-btn" type="button" title="${esc(t('users.resetTraffic'))}" onclick="fleetResetUserTraffic('${escAttr(user.id)}')"><span class="material-symbols-rounded">restart_alt</span></button>
+        <button class="icon-btn" type="button" title="${esc(t('actions.enable'))}" onclick="fleetToggleUser('${escAttr(user.id)}', ${active ? 'false' : 'true'})"><span class="material-symbols-rounded">${active ? 'toggle_on' : 'toggle_off'}</span></button>
+        <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteUser('${escAttr(user.id)}')"><span class="material-symbols-rounded">delete</span></button>
+      </td>
+    </tr>`;
   }).join('');
+  root.innerHTML = `<div class="table-wrap"><table class="data-table">
+    <thead><tr><th>${esc(t('users.name'))}</th><th>${esc(t('users.status'))}</th><th>${esc(t('users.expires'))}</th><th>${esc(t('users.traffic'))}</th><th>${esc(t('users.routes'))}</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
 }
 
-async function fleetCopySubscription(index) {
-  const user = fleet.users[index];
+function networkSubscriptionURL(user) {
+  if (!networkSubscriptionsEnabled()) return '';
+  return user.subscription_url || '';
+}
+
+async function fleetCopySubscription(id) {
+  const user = fleet.users.find(u => u.id === id);
   if (!user) return;
-  const url = user.subscription_url || (location.origin + '/sub/' + encodeURIComponent(user.sub_token));
-  await copyToClipboard(url);
-  toast('Subscription link copied');
+  const url = networkSubscriptionURL(user);
+  if (!url) return toast(t('users.noPublicURL'), 'error');
+  try { await copyToClipboard(url); toast(t('toast.copied'), 'success'); }
+  catch { toast(t('toast.copyFailed'), 'error'); }
 }
 
-async function fleetResetUserTraffic(index) {
-  const user = fleet.users[index];
-  if (!user || !confirm(`Reset traffic for "${user.name || user.id}"?`)) return;
+async function fetchUserBundle(user) {
+  const res = await api(`/api/users/${encodeURIComponent(user.id)}/bundle`);
+  return JSON.stringify(res, null, 2);
+}
+
+function bundleFileName(user) {
+  const base = String(user.name || user.id || 'shampoore')
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `shampoore-${base || 'user'}.json`;
+}
+
+async function copyUserBundle(id) {
+  const user = fleet.users.find(u => u.id === id);
+  if (!user) return;
   try {
-    await api(`/api/users/${encodeURIComponent(user.id)}/reset-traffic`, { method: 'POST' });
-    toast('Traffic reset');
-    await loadPanel('users');
+    const json = await fetchUserBundle(user);
+    await copyToClipboard(json);
+    toast(t('users.bundleCopied'), 'success');
   } catch (e) { toast(e.message, 'error'); }
 }
 
-async function fleetToggleUser(index) {
-  const user = fleet.users[index];
+async function downloadUserBundle(id) {
+  const user = fleet.users.find(u => u.id === id);
   if (!user) return;
   try {
-    await api(`/api/users/${encodeURIComponent(user.id)}`, {
+    const json = await fetchUserBundle(user);
+    const blob = new Blob([json], { type: 'application/json' });
+    const objectURL = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectURL;
+    link.download = bundleFileName(user);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectURL), 1000);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function renderQR(container, text) {
+  if (!container) return;
+  if (!text) {
+    container.innerHTML = `<div class="hint">${esc(t('users.noPublicURL'))}</div>`;
+    return;
+  }
+  if (typeof qrcode !== 'function') {
+    container.innerHTML = `<div class="hint">QR: ${esc(text)}</div>`;
+    return;
+  }
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    container.innerHTML = qr.createImgTag(5, 8);
+  } catch (e) {
+    container.innerHTML = `<div class="hint">${esc(text)}</div>`;
+  }
+}
+
+function openSubscriptionDialog(id) {
+  const user = fleet.users.find(u => u.id === id);
+  if (!user) return;
+  const url = networkSubscriptionURL(user);
+  const showNetwork = !!url;
+  const dialog = openModal({
+    title: `${t('users.subscription')}: ${user.name || user.id}`,
+    actions: [{ label: t('actions.close'), kind: 'text', onClick: closeModal }]
+  });
+  const networkBlock = showNetwork ? `
+    <section class="sub-section">
+      <div class="sub-section__title"><span class="material-symbols-rounded">qr_code_2</span>${esc(t('users.networkSubscription'))}</div>
+      <div class="qr-card">
+        <div class="qr-box" id="user-qr"></div>
+        <div class="qr-card__info">
+          <div class="sub-link" id="user-sub-link">${esc(url)}</div>
+          <p class="hint" style="margin-top:10px">${esc(t('users.qrHint'))}</p>
+        </div>
+      </div>
+      <div class="sub-section__actions">
+        <button class="btn btn--tonal btn--compact" type="button" onclick="fleetCopySubscription('${escAttr(user.id)}')">
+          <span class="material-symbols-rounded">content_copy</span>${esc(t('actions.copy'))}
+        </button>
+      </div>
+    </section>` : '';
+  const offlineBlock = `
+    <section class="sub-section">
+      <div class="sub-section__title"><span class="material-symbols-rounded">description</span>${esc(t('users.offlineTitle'))}</div>
+      <p class="hint">${esc(showNetwork ? t('users.offlineHint') : t('users.offlineOnly'))}</p>
+      <textarea class="sub-json" id="user-bundle" readonly spellcheck="false"></textarea>
+      <p class="hint hidden" id="user-bundle-empty">${esc(t('users.bundleEmpty'))}</p>
+      <div class="sub-section__actions">
+        <button class="btn btn--tonal btn--compact" type="button" onclick="copyUserBundle('${escAttr(user.id)}')">
+          <span class="material-symbols-rounded">content_copy</span>${esc(t('users.copyJson'))}
+        </button>
+        <button class="btn btn--filled btn--compact" type="button" onclick="downloadUserBundle('${escAttr(user.id)}')">
+          <span class="material-symbols-rounded">download</span>${esc(t('users.downloadJson'))}
+        </button>
+      </div>
+    </section>`;
+  dialog.setBody(`${networkBlock}${offlineBlock}`);
+  if (showNetwork) renderQR(document.getElementById('user-qr'), url);
+  const bundleEl = document.getElementById('user-bundle');
+  if (!bundleEl) return dialog;
+  fetchUserBundle(user).then(json => {
+    bundleEl.value = json;
+    const emptyEl = document.getElementById('user-bundle-empty');
+    try {
+      const parsed = JSON.parse(json);
+      if (emptyEl && (!parsed.links || !parsed.links.length)) emptyEl.classList.remove('hidden');
+    } catch { /* keep the raw text */ }
+  }).catch(e => {
+    bundleEl.value = e.message;
+    toast(e.message, 'error');
+  });
+  return dialog;
+}
+
+async function fleetResetUserTraffic(id) {
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}/reset-traffic`, { method: 'POST' });
+    toast(t('users.trafficReset'), 'success');
+    await loadActiveView();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function fleetToggleUser(id, enabled) {
+  const user = fleet.users.find(u => u.id === id);
+  if (!user) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: user.name,
         sub_token: user.sub_token,
-        enabled: !user.enabled,
-        expires_at: user.expires_at,
-        traffic_limit_bytes: user.traffic_limit_bytes,
+        enabled: enabled,
+        expires_at: expiryTime(user.expires_at) ? user.expires_at : null,
+        traffic_limit_bytes: user.traffic_limit_bytes || 0,
         allowed_route_ids: user.allowed_route_ids || []
       })
     });
-    toast(user.enabled ? 'User blocked' : 'User unblocked');
-    await loadPanel('users');
+    toast(enabled ? t('users.enabledToast') : t('users.disabledToast'), 'success');
+    await loadActiveView();
   } catch (e) { toast(e.message, 'error'); }
 }
 
-async function fleetDeleteUser(index) {
-  const user = fleet.users[index];
-  if (!user || !confirm(`Delete user "${user.name || user.id}"?`)) return;
+async function fleetDeleteUser(id) {
+  const user = fleet.users.find(u => u.id === id);
+  if (!confirm(t('users.confirmDelete').replace('{name}', user ? (user.name || user.id) : id))) return;
   try {
-    await api(`/api/users/${encodeURIComponent(user.id)}`, { method: 'DELETE' });
-    toast('User deleted');
-    await loadPanel('users');
+    await api(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast(t('toast.deleted'), 'success');
+    await loadActiveView();
   } catch (e) { toast(e.message, 'error'); }
 }
-
 
 function openUserModal() {
-  if (!fleet.routes.length) loadPanel('users', true).then(() => openUserModalNow());
-  else openUserModalNow();
-}
-
-function openUserModalNow() {
-  if (!fleet.routes.length) loadPanel('users', true);
-  const draft = {
-    name: '',
-    enabled: true,
-    expiryMode: 'days',
-    days: 30,
-    trafficMode: 'limited',
-    gb: 100,
-    routeIDs: []
-  };
-
+  const draft = { name: '', enabled: true, expiryMode: 'never', days: 30, trafficMode: 'unlimited', gb: 100, routeIDs: [] };
   const routeOptions = fleet.routes.length
-    ? fleet.routes.map(route => `<label class="check-row">
-        <input type="checkbox" id="u-route-${route.id}" data-route-id="${route.id}"
-          onchange="fleetUserToggleRoute(${route.id}, this.checked)">
-        ${esc(route.name)} <span class="hint">(${esc(transportLabel(route.transport_type))})</span>
-      </label>`).join('')
-    : `<div class="hint">No routes yet. The user will get access to all routes created later.</div>`;
+    ? fleet.routes.map(route => `<label class="check-row"><input type="checkbox" data-route-id="${route.id}"
+          onchange="fleetUserToggleRoute(${route.id}, this.checked)"> ${esc(route.name)} <span class="hint">(${esc(transportLabel(route.transport_type))})</span></label>`).join('')
+    : `<div class="hint">${esc(t('users.noRoutes'))}</div>`;
 
   openModal({
-    title: 'Add user',
+    title: t('users.add'),
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
       { label: t('actions.create'), kind: 'filled', onClick: submitUser }
     ],
     body: `
       <div class="form-group">
-        <div class="field"><label>Name</label><input type="text" id="u-name" placeholder="Alice"></div>
-        <label class="check-row"><input type="checkbox" id="u-enabled" checked> Enabled</label>
+        <div class="field"><label>${esc(t('users.name'))}</label><input type="text" id="u-name" placeholder="Alice"></div>
+        <label class="check-row"><input type="checkbox" id="u-enabled" checked> ${esc(t('users.enabled'))}</label>
         <div class="form-row">
-          <div class="field"><label>Expires</label><select id="u-expiry-mode" class="input">
-            <option value="days">In N days</option>
-            <option value="never">Never</option>
-          </select></div>
-          <div class="field field--small"><label>Days</label><input type="number" id="u-days" value="30" min="1"></div>
+          <div class="field"><label>${esc(t('users.expiry'))}</label><select id="u-expiry-mode"><option value="never" selected>${esc(t('users.never'))}</option><option value="days">${esc(t('users.inDays'))}</option></select></div>
+          <div class="field field--small"><label>${esc(t('users.days'))}</label><input type="number" id="u-days" value="30" min="1" disabled></div>
         </div>
         <div class="form-row">
-          <div class="field"><label>Traffic limit</label><select id="u-traffic-mode" class="input">
-            <option value="limited">Limited</option>
-            <option value="unlimited">Unlimited</option>
-          </select></div>
-          <div class="field field--small"><label>GB</label><input type="number" id="u-gb" value="100" min="1"></div>
+          <div class="field"><label>${esc(t('users.trafficLimit'))}</label><select id="u-traffic-mode"><option value="unlimited" selected>${esc(t('users.unlimited'))}</option><option value="limited">${esc(t('users.limited'))}</option></select></div>
+          <div class="field field--small"><label>GB</label><input type="number" id="u-gb" value="100" min="1" disabled></div>
         </div>
-        <div class="field"><label>Allowed routes (empty = all)</label><div class="check-list">${routeOptions}</div></div>
+        <div class="field"><label>${esc(t('users.routes'))}</label><div class="check-list">${routeOptions}</div></div>
       </div>`
   });
 
   fleet.userDraft = draft;
-
   const nameEl = document.getElementById('u-name');
   const enabledEl = document.getElementById('u-enabled');
   const expiryEl = document.getElementById('u-expiry-mode');
   const daysEl = document.getElementById('u-days');
   const trafficEl = document.getElementById('u-traffic-mode');
   const gbEl = document.getElementById('u-gb');
-
   nameEl.addEventListener('input', e => { draft.name = e.target.value; });
   enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
-  expiryEl.addEventListener('change', e => {
-    draft.expiryMode = e.target.value;
-    daysEl.disabled = draft.expiryMode === 'never';
-  });
+  expiryEl.addEventListener('change', e => { draft.expiryMode = e.target.value; daysEl.disabled = draft.expiryMode === 'never'; });
   daysEl.addEventListener('input', e => { draft.days = Number(e.target.value) || 0; });
-  trafficEl.addEventListener('change', e => {
-    draft.trafficMode = e.target.value;
-    gbEl.disabled = draft.trafficMode === 'unlimited';
-  });
+  trafficEl.addEventListener('change', e => { draft.trafficMode = e.target.value; gbEl.disabled = draft.trafficMode === 'unlimited'; });
   gbEl.addEventListener('input', e => { draft.gb = Number(e.target.value) || 0; });
 
-  function submitUser() {
-    const payload = {
-      name: draft.name.trim(),
-      enabled: draft.enabled,
-      allowed_route_ids: draft.routeIDs
-    };
-    if (draft.expiryMode === 'days' && draft.days > 0) {
-      payload.expires_at = new Date(Date.now() + draft.days * 86400000).toISOString();
-    }
-    if (draft.trafficMode === 'limited' && draft.gb > 0) {
-      payload.traffic_limit_bytes = Math.round(draft.gb * 1024 * 1024 * 1024);
-    }
-    api('/api/users', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    }).then(() => {
-      toast('User created');
+  async function submitUser() {
+    const payload = { name: draft.name.trim(), enabled: draft.enabled, allowed_route_ids: draft.routeIDs };
+    if (draft.expiryMode === 'days' && draft.days > 0) payload.expires_at = new Date(Date.now() + draft.days * 86400000).toISOString();
+    if (draft.trafficMode === 'limited' && draft.gb > 0) payload.traffic_limit_bytes = Math.round(draft.gb * 1024 * 1024 * 1024);
+    try {
+      const created = await api('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      toast(t('toast.created'), 'success');
       closeModal();
-      loadPanel('users');
-    }).catch(e => toast(e.message, 'error'));
+      await loadActiveView();
+      if (!fleet.users.some(u => String(u.id) === String(created.id))) fleet.users.unshift(created);
+      openSubscriptionDialog(created.id);
+    } catch (e) { toast(e.message, 'error'); }
   }
 }
 
@@ -1544,8 +2341,6 @@ function fleetUserToggleRoute(id, checked) {
   const draft = fleet.userDraft;
   if (!draft) return;
   const set = new Set(draft.routeIDs);
-  if (checked) set.add(id);
-  else set.delete(id);
+  if (checked) set.add(id); else set.delete(id);
   draft.routeIDs = Array.from(set).sort((a, b) => a - b);
 }
-

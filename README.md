@@ -66,22 +66,29 @@ ssh -L 8080:127.0.0.1:8080 user@your-server
 
 ### Multiuser control plane (Relay + Exit)
 
-Панель хранит ноды, маршруты и подписчиков в SQLite (`modernc.org/sqlite`, без CGO). Публичный API вынесен на отдельный порт:
+Панель хранит ноды, маршруты, подписчиков и настройки в SQLite (`modernc.org/sqlite`, без CGO). Публичный API для подписок включён по умолчанию и слушает только loopback:
 
 ```bash
 shampoore-panel \
   --listen=127.0.0.1:8080 \
-  --db=/var/lib/shampoore/panel.db \
-  --public-listen=:8443 \
-  --public-url=https://panel.example.com
+  --db=/var/lib/shampoore/panel.db
 ```
 
-- `127.0.0.1:8080` — админка, админские `/api/*`-ручки, токен + HttpOnly cookie.
-- `:8443` — только `GET /sub/{sub_token}` и `POST /api/node/sync`; статика и админка недоступны.
-- `POST /api/nodes/{id}/deploy` запускает SSH-деплой Relay/Exit-ноды через Docker Compose и возвращает пошаговый лог.
+- `127.0.0.1:8080` — админка, админские `/api/*`-ручки, токен + HttpOnly cookie. Доступ — через SSH-туннель.
+- `127.0.0.1:8443` — только `GET /sub/{sub_token}` и `POST /api/node/sync`; статика и админка недоступны. Адрес можно изменить в настройках панели (`public_listen`).
+- `--public-listen=off` полностью отключает публичный API. Явно заданный `--public-listen` имеет приоритет над настройками.
+- `--public-url` — необязательный override. Если не указан, панель берёт адрес из настроек (`public_url` / `public_domain`), поэтому домен подписок можно менять прямо в UI без перезапуска systemd.
+- `--cleanup-all-nodes` — служебный режим: открывает `--db`, проходит по всем нодам из SQLite и вызывает `Provisioner.CleanupNode` на каждой (`docker compose down -v` + удаление `/opt/shampoore` по SSH), затем завершается. Используется `uninstall.sh --purge` перед удалением `panel.db`.
+- `PUT /api/settings` сохраняет домен подписок и автоматически пишет reverse-proxy в локальный Caddy (`/etc/caddy/conf.d/shampoore-sub.caddy` при наличии `import conf.d/*`, иначе — управляемый блок в `Caddyfile`) и перезагружает его.
+- Панель пишет drop-in напрямую (`ReadWritePaths=-/etc/caddy` в systemd-юните) и перезагружает Caddy через `systemctl`, `sudo -n` или loopback admin API `127.0.0.1:2019`. Если Caddy не установлен, настройки сохраняются, а UI показывает предупреждение.
+- `POST /api/nodes/{id}/deploy` запускает SSH-деплой Relay/Exit-ноды через Docker Compose (`up -d --force-recreate --remove-orphans`) и возвращает пошаговый лог. Для Silo бакет создаётся автоматически.
+- `DELETE /api/nodes/{id}` сначала очищает сервер (`docker compose down -v --remove-orphans` + `rm -rf /opt/shampoore`). Если VPS уже удалён, используйте `?force=true`.
+- Любое изменение маршрута автоматически переразворачивает затронутую Exit-ноду в фоне.
 - Exit-нода запускает `shampoore-node-agent`: он раз в 30 секунд отправляет дельты трафика, получает активных пользователей и обновляет multiuser-конфиги через control socket.
-- Публичный API не содержит TLS. Для внешнего доступа ставьте Caddy/nginx или используйте SSH-туннель.
+- Режим LiveKit `on-demand` (`/session`, `token_url`, `token_listen`, `token_secret`) удалён. Все транспорты (`raw_ws`, `silo`, `livekit`) работают в едином multiuser-режиме: клиент сразу получает параметры своей изолированной комнаты (`route-<id>-<user_id>` / `users/<user_id>/`).
+- Если панель и Relay установлены на одном сервере, Relay автоматически разворачивается без контейнерного Caddy: 80/443 остаются у системного Caddy панели, а домены транспортов проксируются на loopback-порты.
 - SSH-деплой по умолчанию не проверяет host key (`InsecureIgnoreHostKey`). Для production передайте свой `ssh.HostKeyCallback` через `provisioner.Options` или используйте доверенную сеть.
+
 
 Сборка вспомогательных бинарников:
 
@@ -95,7 +102,7 @@ CGO_ENABLED=0 go build -o bin/ ./cmd/...
 sudo /opt/shampoore/uninstall.sh --purge
 ```
 
-Флаг `--purge` удаляет бинарники, systemd-сервис, конфигурации, состояние и системного пользователя. Если вы хотите сохранить конфигурации, запустите скрипт без флага: `sudo /opt/shampoore/uninstall.sh`.
+Флаг `--purge` удаляет бинарники, systemd-сервис, конфигурации, состояние и системного пользователя. Перед удалением `panel.db` скрипт пытается очистить все ноды из базы через SSH (`--cleanup-all-nodes`, best effort: недоступная VPS не блокирует purge). Если вы хотите сохранить конфигурации, запустите скрипт без флага: `sudo /opt/shampoore/uninstall.sh`.
 
 ## Использование клиента
 

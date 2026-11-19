@@ -16,12 +16,28 @@ import (
 )
 
 type fakeDeployer struct {
-	mu      sync.Mutex
-	calls   int
-	started chan struct{}
-	block   chan struct{}
-	once    sync.Once
-	err     error
+	mu           sync.Mutex
+	calls        int
+	cleanupCalls int
+	started      chan struct{}
+	block        chan struct{}
+	once         sync.Once
+	err          error
+	cleanupErr   error
+}
+
+func (f *fakeDeployer) CleanupNode(_ context.Context, node panelstore.Node) (*provisioner.CleanupResult, error) {
+	f.mu.Lock()
+	f.cleanupCalls++
+	err := f.cleanupErr
+	f.mu.Unlock()
+	result := &provisioner.CleanupResult{NodeID: node.ID, Success: err == nil}
+	if err != nil {
+		result.Steps = []provisioner.Step{{Name: "cleanup", Error: err.Error()}}
+		return result, err
+	}
+	result.Steps = []provisioner.Step{{Name: "cleanup", Output: "ok"}}
+	return result, nil
 }
 
 func (f *fakeDeployer) DeployNode(_ context.Context, node panelstore.Node) (*provisioner.DeployResult, error) {
@@ -192,4 +208,18 @@ func TestDeployNodeAndConflict(t *testing.T) {
 	}
 	close(blocking.block)
 	<-done
+}
+
+func TestControlPlaneRejectsDuplicateTransportTypes(t *testing.T) {
+	api, _, _, _ := newControlTestAPI(t)
+	rec := perform(api.Handler(), http.MethodPost, "/api/nodes", `{
+		"name":"relay-dup","ssh_host":"203.0.113.44","is_relay":true,
+		"transports":[
+			{"type":"livekit","domain":"lk-one.example.com","enabled":true},
+			{"type":"livekit","domain":"lk-two.example.com","enabled":true}
+		]
+	}`, authRequest())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate transports = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -28,10 +27,26 @@ var (
 )
 
 type Transport struct {
-	Type     string `json:"type"`
-	Domain   string `json:"domain"`
-	Enabled  bool   `json:"enabled"`
-	OnDemand bool   `json:"on_demand,omitempty"`
+	Type    string `json:"type"`
+	Domain  string `json:"domain"`
+	Enabled bool   `json:"enabled"`
+}
+
+func normalizeNodeIDs(in []int64) ([]int64, error) {
+	out := make([]int64, 0, len(in))
+	seen := make(map[int64]struct{}, len(in))
+	for _, id := range in {
+		if id <= 0 {
+			return nil, invalidf("invalid node id %d", id)
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 type Node struct {
@@ -137,12 +152,11 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 		if tr.Enabled && domain == "" {
 			return nil, invalidf("transport %q requires a domain", kind)
 		}
-		key := kind + "\x00" + domain + "\x00" + strconv.FormatBool(tr.OnDemand)
-		if _, ok := seen[key]; ok {
-			continue
+		if _, ok := seen[kind]; ok {
+			return nil, invalidf("duplicate transport type %q", kind)
 		}
-		seen[key] = struct{}{}
-		out = append(out, Transport{Type: kind, Domain: domain, Enabled: tr.Enabled, OnDemand: tr.OnDemand})
+		seen[kind] = struct{}{}
+		out = append(out, Transport{Type: kind, Domain: domain, Enabled: tr.Enabled})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Type == out[j].Type {

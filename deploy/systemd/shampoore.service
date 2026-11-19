@@ -34,6 +34,8 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
+# The panel writes Caddy drop-ins for the subscription domain and local relay.
+ReadWritePaths=-/etc/caddy
 
 [Install]
 WantedBy=multi-user.target

@@ -2,8 +2,10 @@ package panel
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,15 +88,7 @@ func TestSubscriptionModularTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range relay.Transports {
-		if relay.Transports[i].Type == panelstore.TransportLiveKit {
-			relay.Transports[i].OnDemand = true
-		}
-	}
-	relay, err = store.UpdateNode(context.Background(), relay)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_ = relay
 
 	rec := perform(api.PublicHandler(), http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
 	if rec.Code != http.StatusOK {
@@ -156,22 +150,185 @@ func TestSubscriptionModularTransports(t *testing.T) {
 	if lkTransport["signal_url"] != "wss://lk.example.com" {
 		t.Fatalf("livekit signal_url = %v", lkTransport["signal_url"])
 	}
-	if _, leaked := lkTransport["api_secret"]; leaked {
-		t.Fatalf("livekit on-demand subscription leaked api_secret: %v", lkTransport)
+	if _, leaked := lkTransport["api_secret"]; !leaked {
+		t.Fatalf("livekit subscription is missing api_secret: %v", lkTransport)
 	}
 	if lkTransport["api_key"] != relay.GeneratedSecrets["livekit_api_key"] {
 		t.Fatalf("livekit api_key = %v", lkTransport["api_key"])
 	}
-	if lkTransport["token_url"] != "https://lk.example.com/session" {
-		t.Fatalf("livekit token_url = %v", lkTransport["token_url"])
-	}
-	if lkTransport["token_secret"] != relay.GeneratedSecrets["livekit_token_secret"] {
-		t.Fatalf("livekit token_secret = %v", lkTransport["token_secret"])
+	for _, removed := range []string{"token_url", "token_secret", "token_listen"} {
+		if _, ok := lkTransport[removed]; ok {
+			t.Fatalf("livekit subscription leaked removed field %s: %v", removed, lkTransport)
+		}
 	}
 	if lkTransport["user_id"] != topo.user.ID {
 		t.Fatalf("livekit user_id = %v", lkTransport["user_id"])
 	}
-	if lkTransport["room_prefix"] != "shampoore-route-"+routeID(panelstore.TransportLiveKit) {
+	if lkTransport["room_prefix"] != "route-"+routeID(panelstore.TransportLiveKit) {
 		t.Fatalf("livekit room_prefix = %v", lkTransport["room_prefix"])
+	}
+}
+
+func TestSubscriptionLiveKitMultiuserMode(t *testing.T) {
+	api, store, _, _ := newControlTestAPI(t)
+	topo := seedTopology(t, store)
+
+	rec := perform(api.PublicHandler(), http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscription = %d: %s", rec.Code, rec.Body.String())
+	}
+	var settings []app.Settings
+	if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	var livekit *app.Settings
+	for i := range settings {
+		if settings[i].Type == "livekit_datachannel" {
+			livekit = &settings[i]
+			break
+		}
+	}
+	if livekit == nil {
+		t.Fatal("livekit subscription settings not found")
+	}
+	var tr map[string]any
+	if err := json.Unmarshal(livekit.Transport, &tr); err != nil {
+		t.Fatal(err)
+	}
+	relay, err := store.GetNode(context.Background(), topo.relay.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeID := ""
+	for _, route := range topo.routes {
+		if route.TransportType == panelstore.TransportLiveKit {
+			routeID = itoa(route.ID)
+			break
+		}
+	}
+	if routeID == "" {
+		t.Fatal("livekit route not found")
+	}
+	if tr["room"] != "route-"+routeID+"-"+topo.user.ID {
+		t.Fatalf("livekit room = %v", tr["room"])
+	}
+	if tr["room_prefix"] != "route-"+routeID {
+		t.Fatalf("livekit room_prefix = %v", tr["room_prefix"])
+	}
+	if tr["api_secret"] != relay.GeneratedSecrets["livekit_api_secret"] {
+		t.Fatalf("livekit api_secret = %v", tr["api_secret"])
+	}
+	if _, ok := tr["token_url"]; ok {
+		t.Fatalf("livekit subscription leaked token_url: %v", tr)
+	}
+	if _, ok := tr["token_secret"]; ok {
+		t.Fatalf("livekit subscription leaked token_secret: %v", tr)
+	}
+}
+
+func TestSubscriptionToggleAndProfileTitle(t *testing.T) {
+	api, store, _, _ := newControlTestAPI(t)
+	topo := seedTopology(t, store)
+	public := api.PublicHandler()
+	h := api.Handler()
+
+	rec := perform(public, http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscription = %d: %s", rec.Code, rec.Body.String())
+	}
+	wantTitle := "base64:" + base64.StdEncoding.EncodeToString([]byte(topo.user.Name))
+	if got := rec.Header().Get("Profile-Title"); got != wantTitle {
+		t.Fatalf("Profile-Title = %q, want %q", got, wantTitle)
+	}
+
+	rec = perform(h, http.MethodPut, "/api/settings", `{"subscriptions_enabled":false}`, authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable subscriptions = %d: %s", rec.Code, rec.Body.String())
+	}
+	settings, err := store.GetSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.SubscriptionsEnabled {
+		t.Fatal("subscriptions were not disabled")
+	}
+	if settings.PublicDomain != "sub.example.com" {
+		t.Fatalf("public domain = %q, want it preserved", settings.PublicDomain)
+	}
+	rec = perform(public, http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled subscription = %d, want 404", rec.Code)
+	}
+
+	rec = perform(h, http.MethodPut, "/api/settings",
+		`{"public_domain":"sub.example.com","subscriptions_enabled":true}`, authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable subscriptions = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = perform(public, http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enabled subscription = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = perform(h, http.MethodDelete, "/api/settings/domain", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete domain = %d: %s", rec.Code, rec.Body.String())
+	}
+	settings, err = store.GetSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.PublicDomain != "" || settings.SubscriptionsEnabled {
+		t.Fatalf("settings after domain delete = %+v", settings)
+	}
+	rec = perform(public, http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("subscription without domain = %d, want 404", rec.Code)
+	}
+}
+
+func TestUserOfflineBundle(t *testing.T) {
+	api, store, _, _ := newControlTestAPI(t)
+	topo := seedTopology(t, store)
+	h := api.Handler()
+
+	rec := perform(h, http.MethodGet, "/api/users/"+topo.user.ID+"/bundle", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bundle = %d: %s", rec.Code, rec.Body.String())
+	}
+	var bundle OfflineBundle
+	if err := json.Unmarshal(rec.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Name != topo.user.Name {
+		t.Fatalf("bundle name = %q, want %q", bundle.Name, topo.user.Name)
+	}
+	if len(bundle.Links) != len(topo.routes) {
+		t.Fatalf("bundle links = %d, want %d: %+v", len(bundle.Links), len(topo.routes), bundle)
+	}
+	for _, link := range bundle.Links {
+		if !strings.HasPrefix(link, "shampoore://") {
+			t.Fatalf("bundle link %q is not a shampoore:// URL", link)
+		}
+		parsed, err := app.ParseURL(link)
+		if err != nil {
+			t.Fatalf("parse bundle link %q: %v", link, err)
+		}
+		if parsed.UserID != topo.user.ID || parsed.ExitNodeID != itoa(topo.exit.ID) {
+			t.Fatalf("bundle link identity = %q/%q", parsed.UserID, parsed.ExitNodeID)
+		}
+	}
+
+	topo.user.AllowedRouteIDs = []int64{topo.routes[0].ID}
+	if _, err := store.UpdateUser(context.Background(), topo.user); err != nil {
+		t.Fatal(err)
+	}
+	rec = perform(h, http.MethodGet, "/api/users/"+topo.user.ID+"/bundle", "", authRequest())
+	var limited OfflineBundle
+	if err := json.Unmarshal(rec.Body.Bytes(), &limited); err != nil {
+		t.Fatal(err)
+	}
+	if len(limited.Links) != 1 {
+		t.Fatalf("restricted bundle links = %d, want 1", len(limited.Links))
 	}
 }

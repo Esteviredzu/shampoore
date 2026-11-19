@@ -1,7 +1,12 @@
 package provisioner
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +16,9 @@ import (
 )
 
 type fakeStore struct {
-	nodes  []panelstore.Node
-	routes []panelstore.Route
+	nodes    []panelstore.Node
+	routes   []panelstore.Route
+	bindings map[string][]int64
 }
 
 func (f *fakeStore) GetNode(_ context.Context, id int64) (panelstore.Node, error) {
@@ -36,6 +42,14 @@ func (f *fakeStore) ListRoutesForExit(_ context.Context, exitNodeID int64) ([]pa
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeStore) GetSettings(context.Context) (panelstore.Settings, error) {
+	return panelstore.DefaultSettings(), nil
+}
+
+func (f *fakeStore) ListGeoRuleBindings(context.Context) (map[string][]int64, error) {
+	return f.bindings, nil
 }
 
 type fakeRemote struct {
@@ -145,13 +159,76 @@ func TestDeployNodeOverFakeSSH(t *testing.T) {
 		}
 	}
 	foundUp := false
+	forceRecreate := false
 	for _, cmd := range remote.commands {
 		if strings.Contains(cmd, "up -d") {
 			foundUp = true
+			if strings.Contains(cmd, "--force-recreate") && strings.Contains(cmd, "--remove-orphans") {
+				forceRecreate = true
+			}
 		}
 	}
 	if !foundUp {
 		t.Fatalf("compose up was not executed: %v", remote.commands)
+	}
+	if !forceRecreate {
+		t.Fatalf("compose up did not force recreation: %v", remote.commands)
+	}
+}
+
+func TestDeployNodeCreatesSiloBucket(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               1,
+		Name:             "relay-silo",
+		SSHHost:          "203.0.113.1",
+		SSHUser:          "root",
+		SSHPort:          22,
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("silo"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportSilo, Domain: "s3.example.com", Enabled: true},
+		},
+	}
+	store := &fakeStore{nodes: []panelstore.Node{relay}}
+	remote := &fakeRemote{}
+	p := New(store, Options{
+		LocalBinDir: writeFakeBinaries(t),
+		Dial:        func(context.Context, panelstore.Node) (Remote, error) { return remote, nil },
+	})
+	if _, err := p.DeployNode(context.Background(), relay); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	bucket := relay.GeneratedSecrets["s3_bucket"]
+	want := "docker exec shampoore-silo mkdir -p '/data/" + bucket + "'"
+	found := false
+	for _, cmd := range remote.commands {
+		if strings.Contains(cmd, want) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("silo bucket command %q not executed: %v", want, remote.commands)
+	}
+}
+
+func TestCleanupNodeRemovesContainersAndFiles(t *testing.T) {
+	relay, _, _ := exitFixture()
+	remote := &fakeRemote{}
+	p := New(&fakeStore{nodes: []panelstore.Node{relay}}, Options{
+		Dial: func(context.Context, panelstore.Node) (Remote, error) { return remote, nil },
+	})
+	result, err := p.CleanupNode(context.Background(), relay)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("cleanup failed: %+v", result)
+	}
+	joined := strings.Join(remote.commands, "\n")
+	for _, want := range []string{"down -v --remove-orphans", "rm -rf /opt/shampoore"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cleanup did not run %q:\n%s", want, joined)
+		}
 	}
 }
 
@@ -189,5 +266,87 @@ func TestDeployNodeInstallsDocker(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("docker installer was not executed: %v", remote.commands)
+	}
+}
+
+func TestUploadArchiveRoundTrip(t *testing.T) {
+	files := []File{
+		{Name: "docker-compose.yml", Mode: 0o600, Data: []byte("services:\n  relay:\n    image: example\n")},
+		{Name: "bin/shampoore-relay", Mode: 0o755, Data: []byte("relay-binary-data")},
+	}
+	var archive bytes.Buffer
+	if err := writeUploadArchive(&archive, files); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(archive.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip reader (stream is not gzip): %v", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	got := make(map[string]File, len(files))
+	var order []string
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("tar read %q: %v", hdr.Name, err)
+		}
+		got[hdr.Name] = File{Name: hdr.Name, Mode: hdr.Mode, Data: data}
+		order = append(order, hdr.Name)
+	}
+	if len(order) != len(files) {
+		t.Fatalf("archive entries = %v, want %d files", order, len(files))
+	}
+	for i, want := range files {
+		if order[i] != want.Name {
+			t.Fatalf("entry %d = %q, want %q", i, order[i], want.Name)
+		}
+		entry := got[want.Name]
+		if entry.Mode != want.Mode {
+			t.Errorf("%s mode = %o, want %o", want.Name, entry.Mode, want.Mode)
+		}
+		if !bytes.Equal(entry.Data, want.Data) {
+			t.Errorf("%s data = %q, want %q", want.Name, entry.Data, want.Data)
+		}
+	}
+
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+}
+
+func TestUploadFailsBeforeRemoteOnBadArchive(t *testing.T) {
+
+	remote := &sshRemote{}
+	err := remote.Upload(context.Background(), "/opt/shampoore", []File{
+		{Name: "../escape", Mode: 0o644, Data: []byte("x")},
+	}, false)
+	if err == nil {
+		t.Fatal("expected archive build error")
+	}
+	if !strings.Contains(err.Error(), "build upload archive") {
+		t.Fatalf("error = %v, want archive build failure", err)
+	}
+}
+
+func TestValidateArchiveName(t *testing.T) {
+	for _, name := range []string{"docker-compose.yml", "configs/route-7.json", "bin/shampoore-server", "rules/.keep"} {
+		if err := validateArchiveName(name); err != nil {
+			t.Errorf("validateArchiveName(%q) = %v, want nil", name, err)
+		}
+	}
+	for _, name := range []string{"", "/etc/passwd", "..", "../escape", "configs/../../escape", "./"} {
+		if err := validateArchiveName(name); err == nil {
+			t.Errorf("validateArchiveName(%q) = nil, want error", name)
+		}
 	}
 }

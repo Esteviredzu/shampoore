@@ -34,6 +34,13 @@ func (s *fakeStore) BucketExists(_ context.Context, bucket string) (bool, error)
 	return bucket == s.bucket, nil
 }
 
+func (s *fakeStore) MakeBucket(_ context.Context, bucket string, _ minio.MakeBucketOptions) error {
+	if bucket != s.bucket {
+		return errors.New("access denied")
+	}
+	return nil
+}
+
 func (s *fakeStore) PutObject(_ context.Context, bucket, object string, reader io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
 	if bucket != s.bucket {
 		return minio.UploadInfo{}, errors.New("no such bucket")

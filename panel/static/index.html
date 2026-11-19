@@ -2,151 +2,114 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Shampoore Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
 <link rel="stylesheet" href="styles.css">
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 </head>
 <body>
-
-<header class="app-bar">
-  <div class="app-bar__title" data-lang="app.title">Shampoore Panel</div>
-  <div class="app-bar__actions">
-    <div id="sys-stats" class="sys-stats" style="display:none;"></div>
-    <button id="btn-logout" class="btn btn--tonal btn--icon" type="button" title="Logout">
-      <span class="material-symbols-rounded">logout</span>
-    </button>
-    <div class="dropdown" id="lang-dropdown">
-      <button class="lang-select" type="button">
-        <span id="current-lang-label">English</span>
-        <span class="material-symbols-rounded" style="font-size:18px;">expand_more</span>
-      </button>
-      <div class="dropdown-menu">
-        <button class="dropdown-item" onclick="changeLanguage('en')">English</button>
-        <button class="dropdown-item" onclick="changeLanguage('ru')">Русский</button>
-        <button class="dropdown-item" onclick="changeLanguage('eo')">Esperanto</button>
-      </div>
+<div class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand__mark material-symbols-rounded">shield_lock</span>
+      <div><strong>Shampoore</strong><span data-lang="app.subtitle">Control plane</span></div>
     </div>
-    <div id="global-status" class="status-dot"></div>
-  </div>
-</header>
-
-<main class="container">
-  <section id="server-bar" class="server-control"></section>
-
-  <nav class="panel-tabs" id="panel-tabs">
-    <button class="panel-tab active" type="button" data-panel="configs" data-lang="nav.configs">Configurations</button>
-    <button class="panel-tab" type="button" data-panel="nodes" data-lang="nav.nodes">Servers</button>
-    <button class="panel-tab" type="button" data-panel="routes" data-lang="nav.routes">Routes</button>
-    <button class="panel-tab" type="button" data-panel="users" data-lang="nav.users">Users</button>
-  </nav>
-
-  <div id="panel-configs" class="panel-view">
-    <section class="configs-section">
-      <div class="section-header">
-        <h2 class="section-title" data-lang="config.title">Configurations</h2>
-        <div class="section-actions">
-          <button id="btn-backup" class="btn btn--tonal btn--icon" type="button" title="Backup">
-            <span class="material-symbols-rounded">archive</span>
-          </button>
-          <button id="btn-refresh" class="btn btn--tonal btn--icon" type="button" title="Refresh">
-            <span class="material-symbols-rounded">refresh</span>
-          </button>
-          <button id="btn-rules" class="btn btn--tonal" type="button">
-            <span class="material-symbols-rounded">public</span>
-            <span>Geo Rules</span>
-          </button>
-          <button id="btn-add" class="btn btn--filled" type="button">
-            <span class="material-symbols-rounded">add</span>
-            <span data-lang="config.add">Add Config</span>
-          </button>
-        </div>
+    <nav class="nav" id="main-nav">
+      <button class="nav-item active" type="button" data-panel="dashboard"><span class="material-symbols-rounded">space_dashboard</span><span data-lang="nav.dashboard">Dashboard</span></button>
+      <button class="nav-item" type="button" data-panel="nodes"><span class="material-symbols-rounded">dns</span><span data-lang="nav.nodes">Servers</span></button>
+      <button class="nav-item" type="button" data-panel="routes"><span class="material-symbols-rounded">alt_route</span><span data-lang="nav.routes">Routes</span></button>
+      <button class="nav-item" type="button" data-panel="users"><span class="material-symbols-rounded">group</span><span data-lang="nav.users">Users</span></button>
+      <button class="nav-item" type="button" data-panel="configs"><span class="material-symbols-rounded">tune</span><span data-lang="nav.configs">Configurations</span></button>
+      <button class="nav-item" type="button" id="btn-rules"><span class="material-symbols-rounded">public</span><span data-lang="nav.rules">Geo rules</span></button>
+    </nav>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar__left">
+        <button class="icon-btn mobile-menu" type="button" id="btn-menu" data-lang-title="actions.menu" aria-label="Menu"><span class="material-symbols-rounded">menu</span></button>
+        <div><h1 id="page-title" data-lang="nav.dashboard">Dashboard</h1><p id="page-subtitle" data-lang="app.tagline">Everything is configured in a few clicks.</p></div>
       </div>
-
-      <div class="toolbar">
-        <div class="search-bar">
-          <span class="material-symbols-rounded">search</span>
-          <input id="search" type="search" data-lang-placeholder="config.search" placeholder="Search configs…">
-        </div>
-        <div class="dropdown" id="sort-dropdown">
-          <button class="btn btn--tonal" style="height:48px;">
-            <span class="material-symbols-rounded">sort</span>
-            <span id="current-sort-label" data-lang="config.sort.name">Sort: Name</span>
-          </button>
+      <div class="topbar__right">
+        <div id="server-bar" class="server-control server-control--topbar"></div>
+        <div id="sys-stats" class="sys-stats" style="display:none;"></div>
+        <div class="dropdown" id="lang-dropdown">
+          <button class="lang-select" type="button"><span id="current-lang-label">English</span><span class="material-symbols-rounded" style="font-size:18px;">expand_more</span></button>
           <div class="dropdown-menu">
-            <button class="dropdown-item" onclick="changeSort('name')" data-lang="config.sort.name">Name (A-Z)</button>
-            <button class="dropdown-item" onclick="changeSort('status')" data-lang="config.sort.status">Status</button>
+            <button class="dropdown-item" onclick="changeLanguage('en')">English</button>
+            <button class="dropdown-item" onclick="changeLanguage('ru')">Русский</button>
+            <button class="dropdown-item" onclick="changeLanguage('eo')">Esperanto</button>
           </div>
         </div>
+        <button id="btn-logout" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.logout" title="Logout"><span class="material-symbols-rounded">logout</span></button>
       </div>
-
-      <div id="configs" class="grid"></div>
-      <div id="empty" class="empty hidden"></div>
-    </section>
-  </div>
-
-  <div id="panel-nodes" class="panel-view hidden">
-    <section class="configs-section">
-      <div class="section-header">
-        <h2 class="section-title" data-lang="fleet.nodesTitle">Servers (Nodes)</h2>
-        <div class="section-actions">
-          <button id="btn-refresh-nodes" class="btn btn--tonal btn--icon" type="button" title="Refresh">
-            <span class="material-symbols-rounded">refresh</span>
-          </button>
-          <button id="btn-add-node" class="btn btn--filled" type="button">
-            <span class="material-symbols-rounded">add</span>
-            <span data-lang="fleet.addNode">Add Node</span>
-          </button>
+    </header>
+    <main class="content">
+      <section id="view-dashboard" class="panel-view">
+        <div class="stat-grid" id="dashboard-stats"></div>
+        <div class="dashboard-cards">
+          <section class="card">
+            <div class="card__head">
+              <div><h3 data-lang="dashboard.domainTitle">Subscription domain</h3><p data-lang="dashboard.domainHint">Point a DNS record at this server — Caddy gets a certificate automatically.</p></div>
+              <span class="status-chip" id="dashboard-domain-status"></span>
+            </div>
+            <div class="domain-row">
+              <div class="field domain-row__field">
+                <label data-lang="dashboard.publicUrl">Public URL</label>
+                <input class="input" id="subscription-domain" type="text" placeholder="sub.example.com" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="domain-row__actions">
+                <button class="btn btn--filled" type="button" onclick="saveSubscriptionDomain()"><span class="material-symbols-rounded">save</span><span data-lang="actions.save">Save</span></button>
+                <button class="btn btn--danger-ghost hidden" id="btn-delete-domain" type="button" onclick="deleteSubscriptionDomain()"><span class="material-symbols-rounded">delete_forever</span><span data-lang="dashboard.deleteDomain">Delete domain</span></button>
+              </div>
+            </div>
+            <div class="domain-switch">
+              <label class="switch">
+                <input type="checkbox" id="subscriptions-enabled" onchange="toggleSubscriptions(this.checked)">
+                <span class="slider"></span>
+              </label>
+              <div class="domain-switch__text">
+                <span data-lang="dashboard.subscriptionsEnabled">Serve subscriptions over the network</span>
+                <span class="hint" data-lang="dashboard.subscriptionsHint">When disabled, users only receive the offline config.</span>
+              </div>
+            </div>
+            <div class="domain-current" id="dashboard-domain-message"></div>
+          </section>
+          <section class="card">
+            <div class="card__head">
+              <div><h3 data-lang="dashboard.statusTitle">Server status</h3><p data-lang="dashboard.statusHint">Live state of every Relay and Exit.</p></div>
+              <button class="btn btn--tonal btn--compact" type="button" id="btn-dashboard-refresh"><span class="material-symbols-rounded">refresh</span><span data-lang="actions.refresh">Refresh</span></button>
+            </div>
+            <div id="dashboard-nodes" class="dashboard-table"></div>
+          </section>
         </div>
-      </div>
-      <div id="nodes-list" class="node-grid"></div>
-    </section>
+      </section>
+      <section id="view-nodes" class="panel-view hidden">
+        <div class="section-head"><div><h2 data-lang="nodes.title">Servers</h2><p data-lang="nodes.subtitle">Relay accepts client connections. Exit sends traffic to the internet.</p></div><div class="section-actions"><button id="btn-refresh-nodes" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.refresh" title="Refresh"><span class="material-symbols-rounded">refresh</span></button><button id="btn-add-node" class="btn btn--filled" type="button"><span class="material-symbols-rounded">add</span><span data-lang="nodes.add">Add server</span></button></div></div>
+        <div id="nodes-list" class="node-grid"></div>
+      </section>
+      <section id="view-routes" class="panel-view hidden">
+        <div class="section-head"><div><h2 data-lang="routes.title">Routes</h2><p data-lang="routes.subtitle">A route connects one Relay to one Exit over a transport.</p></div><div class="section-actions"><button id="btn-refresh-routes" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.refresh" title="Refresh"><span class="material-symbols-rounded">refresh</span></button><button id="btn-add-route" class="btn btn--filled" type="button"><span class="material-symbols-rounded">add</span><span data-lang="routes.add">Add route</span></button></div></div>
+        <div id="routes-list" class="data-list"></div>
+      </section>
+      <section id="view-users" class="panel-view hidden">
+        <div class="section-head"><div><h2 data-lang="users.title">Users</h2><p data-lang="users.subtitle">Each user gets a personal subscription link and QR code.</p></div><div class="section-actions"><button id="btn-refresh-users" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.refresh" title="Refresh"><span class="material-symbols-rounded">refresh</span></button><button id="btn-add-user" class="btn btn--filled" type="button"><span class="material-symbols-rounded">add</span><span data-lang="users.add">Add user</span></button></div></div>
+        <div id="users-list" class="data-list"></div>
+      </section>
+      <section id="view-configs" class="panel-view hidden">
+        <div class="section-head"><div><h2 data-lang="config.title">Configurations</h2><p data-lang="config.subtitle">Advanced: local shampoore-server configs running on this panel host.</p></div><div class="section-actions"><button id="btn-backup" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.backup" title="Backup"><span class="material-symbols-rounded">archive</span></button><button id="btn-refresh" class="btn btn--tonal btn--icon" type="button" data-lang-title="actions.refresh" title="Refresh"><span class="material-symbols-rounded">refresh</span></button><button id="btn-add" class="btn btn--filled" type="button"><span class="material-symbols-rounded">add</span><span data-lang="config.add">Add config</span></button></div></div>
+        <div class="toolbar"><div class="search-bar"><span class="material-symbols-rounded">search</span><input id="search" type="search" data-lang-placeholder="config.search" placeholder="Search configs…"></div><div class="dropdown" id="sort-dropdown"><button class="btn btn--tonal"><span class="material-symbols-rounded">sort</span><span id="current-sort-label" data-lang="config.sort.name">Sort: Name</span></button><div class="dropdown-menu"><button class="dropdown-item" onclick="changeSort('name')" data-lang="config.sort.name">Name (A-Z)</button><button class="dropdown-item" onclick="changeSort('status')" data-lang="config.sort.status">Status</button></div></div></div>
+        <div id="configs" class="grid"></div>
+        <div id="empty" class="empty hidden"></div>
+      </section>
+    </main>
   </div>
-
-  <div id="panel-routes" class="panel-view hidden">
-    <section class="configs-section">
-      <div class="section-header">
-        <h2 class="section-title" data-lang="fleet.routesTitle">Routes</h2>
-        <div class="section-actions">
-          <button id="btn-refresh-routes" class="btn btn--tonal btn--icon" type="button" title="Refresh">
-            <span class="material-symbols-rounded">refresh</span>
-          </button>
-          <button id="btn-add-route" class="btn btn--filled" type="button">
-            <span class="material-symbols-rounded">add</span>
-            <span data-lang="fleet.addRoute">Add Route</span>
-          </button>
-        </div>
-      </div>
-      <div id="routes-list" class="data-list"></div>
-    </section>
-  </div>
-
-  <div id="panel-users" class="panel-view hidden">
-    <section class="configs-section">
-      <div class="section-header">
-        <h2 class="section-title" data-lang="fleet.usersTitle">Users</h2>
-        <div class="section-actions">
-          <button id="btn-refresh-users" class="btn btn--tonal btn--icon" type="button" title="Refresh">
-            <span class="material-symbols-rounded">refresh</span>
-          </button>
-          <button id="btn-add-user" class="btn btn--filled" type="button">
-            <span class="material-symbols-rounded">add</span>
-            <span data-lang="fleet.addUser">Add User</span>
-          </button>
-        </div>
-      </div>
-      <div id="users-list" class="data-list"></div>
-    </section>
-  </div>
-</main>
-
+</div>
 <div id="modal-root" class="modal-root hidden"></div>
 <div id="toasts" class="toasts"></div>
-
 <script src="lang.js"></script>
 <script src="app.js"></script>
 </body>

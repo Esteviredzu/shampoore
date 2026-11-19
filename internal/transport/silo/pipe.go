@@ -23,6 +23,7 @@ import (
 
 type objectStore interface {
 	BucketExists(ctx context.Context, bucket string) (bool, error)
+	MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error
 	PutObject(ctx context.Context, bucket, object string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 	GetObject(ctx context.Context, bucket, object string, opts minio.GetObjectOptions) (io.ReadCloser, error)
 	RemoveObject(ctx context.Context, bucket, object string, opts minio.RemoveObjectOptions) error
@@ -35,6 +36,10 @@ type minioStore struct {
 
 func (s *minioStore) BucketExists(ctx context.Context, bucket string) (bool, error) {
 	return s.client.BucketExists(ctx, bucket)
+}
+
+func (s *minioStore) MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error {
+	return s.client.MakeBucket(ctx, bucket, opts)
 }
 
 func (s *minioStore) PutObject(ctx context.Context, bucket, object string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
@@ -109,10 +114,31 @@ func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, err
 	return newPipeWithStore(cfg, role, logger, store)
 }
 
+func ensureBucket(ctx context.Context, store objectStore, bucket string) error {
+	exists, err := store.BucketExists(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if err := store.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.Code == "BucketAlreadyOwnedByYou" || resp.Code == "BucketAlreadyExists" {
+			return nil
+		}
+
+		if exists, checkErr := store.BucketExists(ctx, bucket); checkErr == nil && exists {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 func newPipeWithStore(cfg *Config, role string, logger logging.ContextLogger, store objectStore) (*Pipe, error) {
-	exists, err := store.BucketExists(context.Background(), cfg.Bucket)
-	if err != nil || !exists {
-		return nil, fmt.Errorf("silo: bucket %q unavailable: %v", cfg.Bucket, err)
+	if err := ensureBucket(context.Background(), store, cfg.Bucket); err != nil {
+		return nil, fmt.Errorf("silo: ensure bucket %q: %w", cfg.Bucket, err)
 	}
 
 	writePrefix, readPrefix := buildPrefixes(cfg, role)

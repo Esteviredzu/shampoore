@@ -65,6 +65,49 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_routes_exit  ON routes(exit_node_id);
 	CREATE INDEX IF NOT EXISTS idx_users_token  ON users(sub_token);
 	CREATE INDEX IF NOT EXISTS idx_nodes_secret ON nodes(node_secret);`,
+	`CREATE TABLE IF NOT EXISTS settings (
+		key        TEXT PRIMARY KEY,
+		value      TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	);`,
+	`CREATE TABLE IF NOT EXISTS geo_rule_sources (
+		name                    TEXT PRIMARY KEY,
+		url                     TEXT NOT NULL,
+		update_interval_minutes INTEGER NOT NULL DEFAULT 0,
+		last_updated_at         TEXT NOT NULL DEFAULT '',
+		last_error              TEXT NOT NULL DEFAULT ''
+	);`,
+	`CREATE TABLE IF NOT EXISTS geo_rule_nodes (
+		rule_name TEXT    NOT NULL,
+		node_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		PRIMARY KEY (rule_name, node_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_geo_rule_nodes_node ON geo_rule_nodes(node_id);`,
+	`CREATE TRIGGER IF NOT EXISTS trg_routes_unique_insert
+	BEFORE INSERT ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;
+	CREATE TRIGGER IF NOT EXISTS trg_routes_unique_update
+	BEFORE UPDATE ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE id <> OLD.id
+		  AND entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;`,
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {

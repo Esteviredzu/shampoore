@@ -1,10 +1,7 @@
 package livekit
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -109,6 +106,12 @@ func newTestSessionServer(t *testing.T, cfg Config) (*MultiServer, *fakeDialer, 
 	if err := registry.Upsert(auth.UserSpec{UserID: "bob", Enabled: false}); err != nil {
 		t.Fatal(err)
 	}
+	server, dialer, deleted := newTestMultiServer(t, cfg, registry)
+	return server, dialer, deleted, registry
+}
+
+func newTestMultiServer(t *testing.T, cfg Config, registry *auth.UserRegistry) (*MultiServer, *fakeDialer, *deleteRecorder) {
+	t.Helper()
 	if cfg.SignalURL == "" {
 		cfg.SignalURL = "wss://livekit.example"
 	}
@@ -120,12 +123,6 @@ func newTestSessionServer(t *testing.T, cfg Config) (*MultiServer, *fakeDialer, 
 	}
 	if cfg.RoomPrefix == "" {
 		cfg.RoomPrefix = "test"
-	}
-	if cfg.TokenSecret == "" {
-		cfg.TokenSecret = "s3cr3t"
-	}
-	if cfg.TokenListen == "" {
-		cfg.TokenListen = "127.0.0.1:0"
 	}
 	server := NewMultiServer(cfg, nopLogger{}, registry, tunnel.Config{
 		FlushThreshold: 12000,
@@ -140,10 +137,10 @@ func newTestSessionServer(t *testing.T, cfg Config) (*MultiServer, *fakeDialer, 
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	return server, dialer, deleted, registry
+	return server, dialer, deleted
 }
 
-func startTestSessionServer(t *testing.T, server *MultiServer) string {
+func startTestMultiServer(t *testing.T, server *MultiServer) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -157,39 +154,17 @@ func startTestSessionServer(t *testing.T, server *MultiServer) string {
 			t.Errorf("stop: %v", err)
 		}
 	})
-	addr := server.Addr()
-	if addr == "" {
-		t.Fatal("server did not bind a listener")
-	}
-	return addr
 }
 
-func postSession(t *testing.T, addr, path, secret, userID, exitNodeID string) (*http.Response, sessionResponse) {
+func newSubscriptionRegistry(t *testing.T, specs ...auth.UserSpec) *auth.UserRegistry {
 	t.Helper()
-	body, err := json.Marshal(sessionRequest{UserID: userID, ExitNodeID: exitNodeID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret != "" {
-		req.Header.Set("X-Shampoore-Secret", secret)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("post session: %v", err)
-	}
-	var out sessionResponse
-	if resp.StatusCode == http.StatusOK {
-		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatalf("decode response: %v", err)
+	registry := auth.NewRegistry()
+	for _, spec := range specs {
+		if err := registry.Upsert(spec); err != nil {
+			t.Fatalf("upsert %s: %v", spec.UserID, err)
 		}
 	}
-	return resp, out
+	return registry
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, what string, fn func() bool) {
@@ -203,199 +178,157 @@ func waitForCondition(t *testing.T, timeout time.Duration, what string, fn func(
 	}
 }
 
-func TestMultiServerIssuesSessionAndAuthorizesUser(t *testing.T) {
-	server, dialer, deleted, _ := newTestSessionServer(t, Config{IdleTimeoutMs: 60_000})
-	addr := startTestSessionServer(t, server)
+func waitForSessionCount(t *testing.T, server *MultiServer, want int) {
+	t.Helper()
+	waitForCondition(t, 5*time.Second, "session count", func() bool {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		return len(server.sessions) == want
+	})
+}
 
-	resp, session := postSession(t, addr, server.SessionPath(), "s3cr3t", "alice", "exit-germany")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	resp.Body.Close()
+func TestMultiServerSubscribesToRegistry(t *testing.T) {
+	registry := newSubscriptionRegistry(t,
+		auth.UserSpec{UserID: "alice", Enabled: true},
+		auth.UserSpec{UserID: "bob", Enabled: false},
+	)
+	server, dialer, deleted := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+	startTestMultiServer(t, server)
 
-	if session.URL != "wss://livekit.example" {
-		t.Fatalf("url = %q", session.URL)
-	}
-	if !strings.HasPrefix(session.Room, "test-alice-") {
-		t.Fatalf("room = %q, want test-alice-*", session.Room)
-	}
-	if session.Token == "" {
-		t.Fatal("client token is empty")
-	}
+	waitForSessionCount(t, server, 1)
 
-	verifier, err := lkauth.ParseAPIToken(session.Token)
-	if err != nil {
-		t.Fatalf("parse client token: %v", err)
-	}
-	if verifier.APIKey() != "key" {
-		t.Fatalf("api key = %q", verifier.APIKey())
-	}
-	if verifier.Identity() != "alice" {
-		t.Fatalf("client identity = %q", verifier.Identity())
-	}
-	claims, grants, err := verifier.Verify("secret")
-	if err != nil {
-		t.Fatalf("verify client token: %v", err)
-	}
-	if grants.Video == nil || !grants.Video.RoomJoin || grants.Video.Room != session.Room {
-		t.Fatalf("unexpected video grant: %+v", grants.Video)
-	}
-	if claims.ExpiresAt == nil || !claims.ExpiresAt.After(time.Now()) {
-		t.Fatalf("token does not expire in the future: %+v", claims.ExpiresAt)
+	server.mu.Lock()
+	session := server.sessions["test-alice"]
+	server.mu.Unlock()
+	if session == nil {
+		t.Fatal("alice subscription session was not registered")
 	}
 
 	call := dialer.last()
 	if call.token == "" {
 		t.Fatal("server token was not used")
 	}
-	serverVerifier, err := lkauth.ParseAPIToken(call.token)
+	verifier, err := lkauth.ParseAPIToken(call.token)
 	if err != nil {
 		t.Fatalf("parse server token: %v", err)
 	}
-	if !strings.HasPrefix(serverVerifier.Identity(), "server-") {
-		t.Fatalf("server identity = %q", serverVerifier.Identity())
+	if !strings.HasPrefix(verifier.Identity(), "server-") {
+		t.Fatalf("server identity = %q", verifier.Identity())
 	}
-	if _, serverGrants, err := serverVerifier.Verify("secret"); err != nil {
+	if _, grants, err := verifier.Verify("secret"); err != nil {
 		t.Fatalf("verify server token: %v", err)
-	} else if serverGrants.Video == nil || serverGrants.Video.Room != session.Room {
-		t.Fatalf("unexpected server grant: %+v", serverGrants.Video)
+	} else if grants.Video == nil || !grants.Video.RoomJoin || grants.Video.Room != "test-alice" {
+		t.Fatalf("unexpected server grant: %+v", grants.Video)
 	}
+
+	call.room.setParticipants(1)
+	call.events.OnParticipantJoined("alice")
+	call.room.setParticipants(0)
+	call.events.OnParticipantLeft("alice")
+	time.Sleep(50 * time.Millisecond)
 
 	server.mu.Lock()
-	active := len(server.sessions)
+	stillActive := len(server.sessions) == 1
 	server.mu.Unlock()
-	if active != 1 {
-		t.Fatalf("active sessions = %d, want 1", active)
+	if !stillActive {
+		t.Fatal("subscription session closed after the client left the room")
 	}
 
-	if resp, _ := postSession(t, addr, server.SessionPath(), "", "alice", "exit-germany"); resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("missing secret status = %d, want 401", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-	if resp, _ := postSession(t, addr, server.SessionPath(), "s3cr3t", "bob", ""); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("disabled user status = %d, want 403", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-	if resp, _ := postSession(t, addr, server.SessionPath(), "s3cr3t", "alice", "exit-other"); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("forbidden exit status = %d, want 403", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-
-	server.mu.Lock()
-	active = len(server.sessions)
-	sessionRef := server.sessions[session.Room]
-	server.mu.Unlock()
-	if active != 1 {
-		t.Fatalf("denied requests created sessions: %d", active)
-	}
-	if sessionRef == nil {
-		t.Fatal("session was not registered")
-	}
-	sessionRef.close("test cleanup")
-	if room := <-deleted.done; room != session.Room {
-		t.Fatalf("deleted room = %q, want %q", room, session.Room)
-	}
-}
-
-func TestMultiServerAutoClosesSession(t *testing.T) {
-	t.Run("client left", func(t *testing.T) {
-		server, dialer, deleted, _ := newTestSessionServer(t, Config{IdleTimeoutMs: 60_000})
-		addr := startTestSessionServer(t, server)
-
-		resp, session := postSession(t, addr, server.SessionPath(), "s3cr3t", "alice", "exit-germany")
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d", resp.StatusCode)
-		}
-		resp.Body.Close()
-
-		call := dialer.last()
-		call.room.setParticipants(1)
-		if call.events.OnParticipantJoined != nil {
-			call.events.OnParticipantJoined("alice")
-		}
-		call.room.setParticipants(0)
-		if call.events.OnParticipantLeft != nil {
-			call.events.OnParticipantLeft("alice")
-		}
-
-		select {
-		case <-call.room.disconnected:
-		case <-time.After(3 * time.Second):
-			t.Fatal("server room was not disconnected")
-		}
-		select {
-		case room := <-deleted.done:
-			if room != session.Room {
-				t.Fatalf("deleted room = %q", room)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("room delete was not invoked")
-		}
-		waitForCondition(t, 3*time.Second, "session removal", func() bool {
-			server.mu.Lock()
-			defer server.mu.Unlock()
-			return len(server.sessions) == 0
-		})
-	})
-
-	t.Run("idle timeout", func(t *testing.T) {
-		server, dialer, deleted, _ := newTestSessionServer(t, Config{IdleTimeoutMs: 50})
-		addr := startTestSessionServer(t, server)
-
-		resp, session := postSession(t, addr, server.SessionPath(), "s3cr3t", "alice", "exit-germany")
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d", resp.StatusCode)
-		}
-		resp.Body.Close()
-
-		call := dialer.last()
-		select {
-		case <-call.room.disconnected:
-		case <-time.After(3 * time.Second):
-			t.Fatal("idle session did not disconnect the room")
-		}
-		select {
-		case room := <-deleted.done:
-			if room != session.Room {
-				t.Fatalf("deleted room = %q", room)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("idle session did not invoke room delete")
-		}
-		waitForCondition(t, 3*time.Second, "idle session removal", func() bool {
-			server.mu.Lock()
-			defer server.mu.Unlock()
-			return len(server.sessions) == 0
-		})
-	})
-}
-
-func TestMultiServerHandlerContextCanceledOnStop(t *testing.T) {
-	server, _, _, _ := newTestSessionServer(t, Config{IdleTimeoutMs: 60_000})
-	handlerDone := make(chan struct{})
-	server.SetSessionHandler(func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
-		<-ctx.Done()
-		close(handlerDone)
-		return ctx.Err()
-	})
-	addr := startTestSessionServer(t, server)
-	resp, _ := postSession(t, addr, server.SessionPath(), "s3cr3t", "alice", "exit-germany")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	resp.Body.Close()
-
-	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Stop(stopCtx); err != nil {
-		t.Fatalf("stop: %v", err)
+	registry.Remove("alice")
+	select {
+	case <-call.room.disconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("user removal did not disconnect the room")
 	}
 	select {
-	case <-handlerDone:
+	case room := <-deleted.done:
+		if room != "test-alice" {
+			t.Fatalf("deleted room = %q, want test-alice", room)
+		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("session handler was not canceled")
+		t.Fatal("user removal did not delete the room")
 	}
+	waitForSessionCount(t, server, 0)
+}
+
+func TestMultiServerSubscriptionStopsInactiveUsers(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		registry := newSubscriptionRegistry(t, auth.UserSpec{UserID: "alice", Enabled: true})
+		server, dialer, deleted := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+		startTestMultiServer(t, server)
+		waitForSessionCount(t, server, 1)
+		call := dialer.last()
+
+		if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: false}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-call.room.disconnected:
+		case <-time.After(3 * time.Second):
+			t.Fatal("disabling the user did not disconnect the room")
+		}
+		select {
+		case room := <-deleted.done:
+			if room != "test-alice" {
+				t.Fatalf("deleted room = %q", room)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("disabling the user did not delete the room")
+		}
+		waitForSessionCount(t, server, 0)
+	})
+
+	t.Run("traffic limit", func(t *testing.T) {
+		registry := newSubscriptionRegistry(t, auth.UserSpec{
+			UserID: "alice", Enabled: true, TrafficLimitBytes: 10,
+		})
+		server, dialer, deleted := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+		startTestMultiServer(t, server)
+		waitForSessionCount(t, server, 1)
+		call := dialer.last()
+
+		if err := registry.AddTraffic("alice", 11, 0); err == nil {
+			t.Fatal("expected traffic limit error")
+		}
+		select {
+		case <-call.room.disconnected:
+		case <-time.After(3 * time.Second):
+			t.Fatal("traffic limit did not disconnect the room")
+		}
+		select {
+		case room := <-deleted.done:
+			if room != "test-alice" {
+				t.Fatalf("deleted room = %q", room)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("traffic limit did not delete the room")
+		}
+		waitForSessionCount(t, server, 0)
+	})
+
+	t.Run("expiry", func(t *testing.T) {
+		registry := newSubscriptionRegistry(t, auth.UserSpec{
+			UserID: "alice", Enabled: true, ExpiresAt: time.Now().Add(time.Second),
+		})
+		server, dialer, deleted := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+		server.syncInterval = 20 * time.Millisecond
+		startTestMultiServer(t, server)
+		waitForSessionCount(t, server, 1)
+		call := dialer.last()
+
+		select {
+		case <-call.room.disconnected:
+		case <-time.After(5 * time.Second):
+			t.Fatal("expired user did not disconnect the room")
+		}
+		select {
+		case room := <-deleted.done:
+			if room != "test-alice" {
+				t.Fatalf("deleted room = %q", room)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("expired user did not delete the room")
+		}
+		waitForSessionCount(t, server, 0)
+	})
 }

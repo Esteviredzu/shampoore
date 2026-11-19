@@ -2,12 +2,8 @@ package livekit
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,21 +23,9 @@ import (
 )
 
 const (
-	sessionRequestBodyLimit = 64 << 10
-	roomDeleteTimeout       = 2 * time.Second
-	sessionStopTimeout      = 2 * time.Second
+	roomDeleteTimeout  = 2 * time.Second
+	sessionStopTimeout = 2 * time.Second
 )
-
-type sessionRequest struct {
-	UserID     string `json:"user_id"`
-	ExitNodeID string `json:"exit_node_id"`
-}
-
-type sessionResponse struct {
-	URL   string `json:"url"`
-	Token string `json:"token"`
-	Room  string `json:"room"`
-}
 
 type roomEvents struct {
 	DataTopic           string
@@ -99,25 +83,22 @@ type MultiServer struct {
 	muxCfg   tunnel.Config
 	password string
 
-	listenAddr  string
-	sessionPath string
-	idleTimeout time.Duration
-	clientTTL   time.Duration
-	serverTTL   time.Duration
+	serverTTL time.Duration
 
 	connectRoom roomDialFunc
 	deleteRoom  func(ctx context.Context, room string) error
 
-	mu       sync.Mutex
-	handler  app.SessionHandler
-	sessions map[string]*activeSession
-	ctx      context.Context
-	cancel   context.CancelFunc
-	started  bool
-	httpSrv  *http.Server
-	ln       net.Listener
-	addr     string
-	wg       sync.WaitGroup
+	mu           sync.Mutex
+	handler      app.SessionHandler
+	sessions     map[string]*activeSession
+	starting     map[string]struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
+	started      bool
+	unsubscribe  func()
+	syncInterval time.Duration
+	wg           sync.WaitGroup
+	syncMu       sync.Mutex
 }
 
 func NewMultiServer(
@@ -129,37 +110,20 @@ func NewMultiServer(
 ) *MultiServer {
 	cfg.applyDefaults()
 	muxCfg.Registry = registry
-	listenAddr, sessionPath, err := parseTokenListen(cfg.TokenListen)
-	if err != nil {
-
-		listenAddr = ""
-		sessionPath = "/session"
-	}
 	m := &MultiServer{
-		cfg:         cfg,
-		logger:      logger,
-		registry:    registry,
-		muxCfg:      muxCfg,
-		password:    password,
-		listenAddr:  listenAddr,
-		sessionPath: sessionPath,
-		idleTimeout: cfg.idleTimeout(),
-		clientTTL:   cfg.clientTokenTTL(),
-		serverTTL:   cfg.serverTokenTTL(),
-		sessions:    make(map[string]*activeSession),
+		cfg:          cfg,
+		logger:       logger,
+		registry:     registry,
+		muxCfg:       muxCfg,
+		password:     password,
+		serverTTL:    cfg.serverTokenTTL(),
+		sessions:     make(map[string]*activeSession),
+		starting:     make(map[string]struct{}),
+		syncInterval: defaultSyncInterval,
 	}
 	m.connectRoom = connectLiveKitRoom
 	m.deleteRoom = m.deleteRemoteRoom
-	if strings.TrimSpace(cfg.TokenSecret) == "" {
-		logger.Warn("livekit: multiuser session endpoint has no token_secret; it is unprotected")
-	}
 	return m
-}
-
-func (m *MultiServer) Addr() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.addr
 }
 
 func (m *MultiServer) ActiveSessions() int {
@@ -168,24 +132,10 @@ func (m *MultiServer) ActiveSessions() int {
 	return len(m.sessions)
 }
 
-func (m *MultiServer) SessionPath() string {
-	return m.sessionPath
-}
-
 func (m *MultiServer) SetSessionHandler(handler app.SessionHandler) {
 	m.mu.Lock()
 	m.handler = handler
 	m.mu.Unlock()
-}
-
-func (m *MultiServer) Handler() http.Handler {
-	mux := http.NewServeMux()
-	path := m.sessionPath
-	if path == "" {
-		path = "/session"
-	}
-	mux.HandleFunc(path, m.handleSession)
-	return mux
 }
 
 func connectLiveKitRoom(ctx context.Context, url, token string, events roomEvents) (roomSession, error) {
@@ -246,38 +196,32 @@ func (m *MultiServer) Start(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.listenAddr == "" {
+	if strings.TrimSpace(m.cfg.SignalURL) == "" || m.cfg.APIKey == "" || m.cfg.APISecret == "" {
 		m.mu.Unlock()
-		return errors.New("livekit: token_listen is required")
+		return errors.New("livekit: signal_url, api_key and api_secret are required for multiuser mode")
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
-	ln, err := net.Listen("tcp", m.listenAddr)
-	if err != nil {
-		cancel()
-		m.mu.Unlock()
-		return fmt.Errorf("livekit: listen %s: %w", m.listenAddr, err)
-	}
-	srv := &http.Server{
-		Handler:           m.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
 	m.ctx = serveCtx
 	m.cancel = cancel
 	m.started = true
-	m.httpSrv = srv
-	m.ln = ln
-	m.addr = ln.Addr().String()
 	m.mu.Unlock()
 
-	m.logger.Info("livekit: on-demand session endpoint listening on http://", m.addr, m.sessionPath)
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			m.logger.Warn("livekit: session endpoint stopped: ", err)
+	if m.registry != nil {
+		unsub := m.registry.Subscribe(m.syncUsers)
+		m.mu.Lock()
+		if !m.started {
+			m.mu.Unlock()
+			unsub()
+			cancel()
+			return nil
 		}
-	}()
+		m.unsubscribe = unsub
+		m.mu.Unlock()
+	}
+	m.wg.Add(1)
+	go m.reconcileLoop(serveCtx)
+	m.logger.Info("livekit: multiuser subscription server ready (room_prefix=", m.cfg.RoomPrefix, ")")
+	m.syncUsers()
 	return nil
 }
 
@@ -289,24 +233,18 @@ func (m *MultiServer) Stop(ctx context.Context) error {
 	}
 	m.started = false
 	cancel := m.cancel
-	srv := m.httpSrv
+	unsub := m.unsubscribe
 	sessions := make([]*activeSession, 0, len(m.sessions))
 	for room, session := range m.sessions {
 		sessions = append(sessions, session)
 		delete(m.sessions, room)
 	}
 	m.cancel = nil
-	m.httpSrv = nil
-	m.ln = nil
-	m.addr = ""
+	m.unsubscribe = nil
 	m.mu.Unlock()
 
-	if srv != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), sessionStopTimeout)
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			_ = srv.Close()
-		}
-		shutdownCancel()
+	if unsub != nil {
+		unsub()
 	}
 	if cancel != nil {
 		cancel()
@@ -327,92 +265,118 @@ func (m *MultiServer) Stop(ctx context.Context) error {
 	}
 }
 
-func (m *MultiServer) handleSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (m *MultiServer) reconcileLoop(ctx context.Context) {
+	defer m.wg.Done()
+	interval := m.syncInterval
+	if interval <= 0 {
+		interval = defaultSyncInterval
 	}
-	if !m.authorizedRequest(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	body := http.MaxBytesReader(w, r.Body, sessionRequestBodyLimit)
-	defer body.Close()
-	var req sessionRequest
-	dec := json.NewDecoder(body)
-	if err := dec.Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	userID, err := auth.NormalizeUserID(req.UserID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	exitNodeID := strings.TrimSpace(req.ExitNodeID)
-	if m.registry != nil {
-		if err := m.registry.Authorize(userID, exitNodeID); err != nil {
-			m.logger.Warn("livekit: session denied for ", userID, ": ", err)
-			http.Error(w, err.Error(), http.StatusForbidden)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			m.syncUsers()
 		}
 	}
+}
+
+func (m *MultiServer) syncUsers() {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
 
 	m.mu.Lock()
-	started := m.started
-	parent := m.ctx
-	m.mu.Unlock()
-	if !started || parent == nil {
-		http.Error(w, "session server is not running", http.StatusServiceUnavailable)
+	if !m.started {
+		m.mu.Unlock()
 		return
 	}
-
-	resp, err := m.createSession(parent, userID, exitNodeID)
-	if err != nil {
-		m.logger.Warn("livekit: create session for ", userID, ": ", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-func (m *MultiServer) authorizedRequest(r *http.Request) bool {
-	expected := strings.TrimSpace(m.cfg.TokenSecret)
-	if expected == "" {
-		return true
-	}
-	got := strings.TrimSpace(r.Header.Get("X-Shampoore-Secret"))
-	if got == "" {
-		authz := strings.TrimSpace(r.Header.Get("Authorization"))
-		if strings.HasPrefix(strings.ToLower(authz), "bearer ") {
-			got = strings.TrimSpace(authz[len("bearer "):])
+	ctx := m.ctx
+	active := make(map[string]struct{})
+	if m.registry != nil {
+		for _, spec := range m.registry.ActiveUsers() {
+			active[spec.UserID] = struct{}{}
 		}
 	}
-	if got == "" {
-		return false
+	existing := make(map[string]*activeSession, len(m.sessions))
+	for _, session := range m.sessions {
+		existing[session.userID] = session
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+	var toStart []string
+	for userID := range active {
+		if _, ok := existing[userID]; ok {
+			continue
+		}
+		if _, ok := m.starting[RoomForUser(m.cfg.RoomPrefix, userID)]; ok {
+			continue
+		}
+		toStart = append(toStart, userID)
+	}
+	var toStop []*activeSession
+	for userID, session := range existing {
+		if _, ok := active[userID]; ok {
+			continue
+		}
+		toStop = append(toStop, session)
+		delete(m.sessions, session.room)
+	}
+	m.mu.Unlock()
+
+	for _, session := range toStop {
+		m.logger.Info("livekit: stopping user session ", session.userID, " (room=", session.room, ")")
+		session.close("user inactive")
+	}
+	for _, userID := range toStart {
+		m.startUserSession(ctx, userID)
+	}
 }
 
-func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID string) (sessionResponse, error) {
-	room, err := m.newRoomName(userID)
-	if err != nil {
-		return sessionResponse{}, err
+func (m *MultiServer) startUserSession(ctx context.Context, userID string) {
+	if ctx == nil {
+		return
 	}
+	room := RoomForUser(m.cfg.RoomPrefix, userID)
+
+	m.mu.Lock()
+	if !m.started || ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
+	if _, ok := m.sessions[room]; ok {
+		m.mu.Unlock()
+		return
+	}
+	if _, ok := m.starting[room]; ok {
+		m.mu.Unlock()
+		return
+	}
+	m.starting[room] = struct{}{}
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	m.logger.Info("livekit: starting user session ", userID, " (room=", room, ")")
+	go func() {
+		defer m.wg.Done()
+		defer func() {
+			m.mu.Lock()
+			delete(m.starting, room)
+			m.mu.Unlock()
+		}()
+		if _, err := m.openSession(ctx, room, userID, ""); err != nil && ctx.Err() == nil {
+			m.logger.Warn("livekit: user ", userID, " session: ", err)
+		}
+	}()
+}
+
+func (m *MultiServer) openSession(
+	parent context.Context,
+	room, userID, exitNodeID string,
+) (*activeSession, error) {
 	serverIdentity := "server-" + shortID()
-	clientToken, err := makeTokenFor(m.cfg.APIKey, m.cfg.APISecret, room, userID, m.clientTTL)
-	if err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: client token: %w", err)
-	}
 	serverToken, err := makeTokenFor(m.cfg.APIKey, m.cfg.APISecret, room, serverIdentity, m.serverTTL)
 	if err != nil {
-		return sessionResponse{}, fmt.Errorf("livekit: server token: %w", err)
+		return nil, fmt.Errorf("livekit: server token: %w", err)
 	}
 
 	sessionCtx, cancel := context.WithCancel(parent)
@@ -441,14 +405,7 @@ func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID s
 		},
 		OnParticipantLeft: func(identity string) {
 			m.logger.Info("livekit: client ", identity, " left room ", room)
-			session.mu.Lock()
-			roomConn := session.roomConn
-			session.mu.Unlock()
-			if roomConn != nil && roomConn.RemoteParticipantCount() > 0 {
-				session.touch()
-				return
-			}
-			session.close("client left")
+			session.touch()
 		},
 		OnDisconnected: func() {
 			session.close("server room disconnected")
@@ -458,12 +415,12 @@ func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID s
 	roomConn, err := m.connectRoom(sessionCtx, m.cfg.SignalURL, serverToken, events)
 	if err != nil {
 		cancel()
-		return sessionResponse{}, fmt.Errorf("livekit: connect server participant: %w", err)
+		return nil, fmt.Errorf("livekit: connect server participant: %w", err)
 	}
 	if sessionCtx.Err() != nil {
 		roomConn.Disconnect()
 		cancel()
-		return sessionResponse{}, context.Canceled
+		return nil, context.Canceled
 	}
 
 	pipe := newPipe(roomConn.LocalParticipant(), m.cfg.DataTopic, userID)
@@ -472,9 +429,13 @@ func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID s
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
 		cancel()
-		return sessionResponse{}, fmt.Errorf("livekit: wrap encryption: %w", err)
+		return nil, fmt.Errorf("livekit: wrap encryption: %w", err)
 	}
-	mux := tunnel.New(NewTransport(secured), m.logger, m.muxCfg)
+	muxCfg := m.muxCfg
+	muxCfg.UserID = ""
+	muxCfg.ExitNodeID = ""
+	muxCfg.Registry = m.registry
+	mux := tunnel.New(NewTransport(secured), m.logger, muxCfg)
 
 	session.mu.Lock()
 	session.roomConn = roomConn
@@ -488,12 +449,12 @@ func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID s
 		_ = mux.Stop(context.Background())
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
-		return sessionResponse{}, context.Canceled
+		return nil, context.Canceled
 	}
 
 	if err := mux.Start(sessionCtx); err != nil {
 		session.close("mux start failed")
-		return sessionResponse{}, fmt.Errorf("livekit: start mux: %w", err)
+		return nil, fmt.Errorf("livekit: start mux: %w", err)
 	}
 
 	session.mu.Lock()
@@ -502,27 +463,35 @@ func (m *MultiServer) createSession(parent context.Context, userID, exitNodeID s
 		_ = mux.Stop(context.Background())
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
-		return sessionResponse{}, context.Canceled
+		return nil, context.Canceled
 	}
 	m.mu.Lock()
 	if !m.started {
 		m.mu.Unlock()
 		session.mu.Unlock()
 		session.close("server stopped")
-		return sessionResponse{}, errors.New("livekit: session server is not running")
+		return nil, errors.New("livekit: session server is not running")
+	}
+	if _, exists := m.sessions[room]; exists {
+		m.mu.Unlock()
+		session.mu.Unlock()
+		_ = mux.Stop(context.Background())
+		_ = pipe.Stop(context.Background())
+		roomConn.Disconnect()
+		cancel()
+		return nil, fmt.Errorf("livekit: room %q is already active", room)
 	}
 	handler := m.handler
 	m.sessions[room] = session
-	m.wg.Add(2)
+	m.wg.Add(1)
 	m.mu.Unlock()
 	session.mu.Unlock()
 
 	go m.runSessionHandler(session, handler)
-	go m.monitorSession(session)
 
 	m.logger.Info("livekit: session ", room, " ready for user ", userID,
 		" exit=", exitNodeID)
-	return sessionResponse{URL: m.cfg.SignalURL, Token: clientToken, Room: room}, nil
+	return session, nil
 }
 
 func (m *MultiServer) runSessionHandler(session *activeSession, handler app.SessionHandler) {
@@ -539,70 +508,6 @@ func (m *MultiServer) runSessionHandler(session *activeSession, handler app.Sess
 		m.logger.Warn("livekit: session ", session.room, " handler: ", err)
 	}
 	session.close("handler finished")
-}
-
-func (m *MultiServer) monitorSession(session *activeSession) {
-	defer m.wg.Done()
-	interval := m.idleTimeout / 4
-	if interval < 10*time.Millisecond {
-		interval = 10 * time.Millisecond
-	}
-	if interval > time.Second {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	session.mu.Lock()
-	lastSent := session.lastSent
-	lastRecv := session.lastRecv
-	session.mu.Unlock()
-
-	for {
-		select {
-		case <-session.ctx.Done():
-			return
-		case <-ticker.C:
-			session.mu.Lock()
-			pipe := session.pipe
-			session.mu.Unlock()
-			if pipe != nil {
-				sent := pipe.BytesSent()
-				recv := pipe.BytesRecv()
-				if sent != lastSent || recv != lastRecv {
-					lastSent, lastRecv = sent, recv
-					session.touch()
-				}
-			}
-			last := session.lastActivity.Load()
-			if time.Since(time.Unix(0, last)) >= m.idleTimeout {
-				m.logger.Info("livekit: session ", session.room, " idle timeout")
-				session.close("idle timeout")
-				return
-			}
-		}
-	}
-}
-
-func (m *MultiServer) newRoomName(userID string) (string, error) {
-	prefix := sanitizeRoomPart(m.cfg.RoomPrefix)
-	if prefix == "" {
-		prefix = defaultRoomPrefix
-	}
-	user := sanitizeRoomPart(userID)
-	if user == "" {
-		user = "user"
-	}
-	for i := 0; i < 8; i++ {
-		room := prefix + "-" + user + "-" + shortID()
-		m.mu.Lock()
-		_, exists := m.sessions[room]
-		m.mu.Unlock()
-		if !exists {
-			return room, nil
-		}
-	}
-	return "", errors.New("livekit: could not allocate a unique room name")
 }
 
 func (m *MultiServer) removeSession(room string, session *activeSession) {
@@ -624,6 +529,18 @@ func (m *MultiServer) deleteRemoteRoom(ctx context.Context, room string) error {
 
 func shortID() string {
 	return strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+}
+
+func RoomForUser(prefix, userID string) string {
+	prefix = sanitizeRoomPart(prefix)
+	if prefix == "" {
+		prefix = defaultRoomPrefix
+	}
+	user := sanitizeRoomPart(strings.ToLower(strings.TrimSpace(userID)))
+	if user == "" {
+		user = "user"
+	}
+	return prefix + "-" + user
 }
 
 func sanitizeRoomPart(s string) string {

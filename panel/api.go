@@ -3,6 +3,7 @@ package panel
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -45,22 +46,48 @@ type API struct {
 	publicURL   string
 	deployMu    sync.Mutex
 	deploying   map[int64]struct{}
+	pending     map[int64]struct{}
+
+	settingsMu   sync.RWMutex
+	settings     panelstore.Settings
+	caddy        CaddySyncer
+	caddyMu      sync.Mutex
+	localHosts   []string
+	publicListen string
+
+	geoMu          sync.Mutex
+	geoClient      *http.Client
+	geoUpdateEvery time.Duration
 }
 
 func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string, filter *geofilter.Filter, rulesDir string, opts ...Option) *API {
 	a := &API{
-		client:     client,
-		sup:        sup,
-		logger:     logger,
-		token:      strings.TrimSpace(token),
-		configsDir: configsDir,
-		filter:     filter,
-		rulesDir:   rulesDir,
-		limiter:    newLoginLimiter(),
-		deploying:  make(map[int64]struct{}),
+		client:         client,
+		sup:            sup,
+		logger:         logger,
+		token:          strings.TrimSpace(token),
+		configsDir:     configsDir,
+		filter:         filter,
+		rulesDir:       rulesDir,
+		limiter:        newLoginLimiter(),
+		deploying:      make(map[int64]struct{}),
+		pending:        make(map[int64]struct{}),
+		settings:       panelstore.DefaultSettings(),
+		geoClient:      &http.Client{Timeout: geoDownloadTimeout},
+		geoUpdateEvery: time.Minute,
 	}
 	for _, opt := range opts {
 		opt(a)
+	}
+	if a.store != nil {
+		if settings, err := a.store.GetSettings(context.Background()); err != nil {
+			a.logger.Warn("panel: load settings: ", err)
+		} else {
+			a.settings = settings
+		}
+	}
+	if a.caddy == nil {
+		a.caddy = NewLocalCaddy()
 	}
 	return a
 }
@@ -231,12 +258,35 @@ func (a *API) logout(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *API) listRules(w http.ResponseWriter, _ *http.Request) {
+type ruleView struct {
+	geofilter.RuleSet
+	ExitNodeIDs []int64 `json:"exit_node_ids"`
+}
+
+func (a *API) listRules(w http.ResponseWriter, r *http.Request) {
 	if a.filter == nil {
-		writeJSON(w, 200, []geofilter.RuleSet{})
+		writeJSON(w, 200, []ruleView{})
 		return
 	}
-	writeJSON(w, 200, a.filter.Rules())
+	bindings := map[string][]int64{}
+	if a.store != nil {
+		var err error
+		bindings, err = a.store.ListGeoRuleBindings(r.Context())
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+	}
+	rules := a.filter.Rules()
+	out := make([]ruleView, 0, len(rules))
+	for _, rule := range rules {
+		ids := bindings[rule.Name]
+		if ids == nil {
+			ids = []int64{}
+		}
+		out = append(out, ruleView{RuleSet: rule, ExitNodeIDs: ids})
+	}
+	writeJSON(w, 200, out)
 }
 
 func (a *API) enableRule(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +299,7 @@ func (a *API) enableRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	a.redeployGeoRule(r.Context(), name, "geoip rule enabled")
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -262,6 +313,7 @@ func (a *API) disableRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	a.redeployGeoRule(r.Context(), name, "geoip rule disabled")
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -974,8 +1026,9 @@ func (a *API) addRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name  string   `json:"name"`
-		CIDRs []string `json:"cidrs"`
+		Name        string   `json:"name"`
+		CIDRs       []string `json:"cidrs"`
+		ExitNodeIDs []int64  `json:"exit_node_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err)
@@ -985,6 +1038,12 @@ func (a *API) addRule(w http.ResponseWriter, r *http.Request) {
 	if req.Name == "" {
 		writeErr(w, 400, fmt.Errorf("name is required"))
 		return
+	}
+	if a.store != nil {
+		if err := a.store.ValidateExitNodeIDs(r.Context(), req.ExitNodeIDs); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
 	}
 	safe := sanitizeName(req.Name)
 	path := filepath.Join(a.rulesDir, safe+".txt")
@@ -996,18 +1055,35 @@ func (a *API) addRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	previousExitIDs := []int64{}
+	_, statErr := os.Stat(cleanPath)
+	existed := statErr == nil
+	if a.store != nil {
+		previousExitIDs = a.geoRuleExitIDs(r.Context(), safe)
+	}
+
 	contentStr := strings.Join(req.CIDRs, "\n")
+	a.geoMu.Lock()
+	defer a.geoMu.Unlock()
 	if err := writeFile0600(cleanPath, []byte(contentStr)); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	if a.filter != nil {
-		if err := a.filter.LoadDir(a.rulesDir); err != nil {
-			writeErr(w, 500, err)
+	exitNodeIDs := []int64{}
+	if a.store != nil {
+		ids, err := a.store.SetGeoRuleNodes(r.Context(), safe, req.ExitNodeIDs)
+		if err != nil {
+			writeStoreErr(w, err)
 			return
 		}
+		exitNodeIDs = ids
 	}
-	writeJSON(w, 201, map[string]any{"ok": true})
+	affected := exitNodeIDs
+	if existed {
+		affected = mergeGeoRuleExitIDs(previousExitIDs, exitNodeIDs)
+	}
+	a.reloadGeoRules(r.Context(), affected)
+	writeJSON(w, 201, map[string]any{"ok": true, "exit_node_ids": exitNodeIDs})
 }
 
 func (a *API) deleteRule(w http.ResponseWriter, r *http.Request) {
@@ -1017,7 +1093,18 @@ func (a *API) deleteRule(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	safe := sanitizeName(name)
+	a.geoMu.Lock()
+	defer a.geoMu.Unlock()
 
+	var previousExitIDs []int64
+	if a.store != nil {
+		ids, err := a.store.GeoRuleNodes(r.Context(), safe)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		previousExitIDs = ids
+	}
 	for _, ext := range []string{".txt", ".json"} {
 		path := filepath.Join(a.rulesDir, safe+ext)
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1025,11 +1112,12 @@ func (a *API) deleteRule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if a.filter != nil {
-		if err := a.filter.LoadDir(a.rulesDir); err != nil {
-			writeErr(w, 500, err)
+	if a.store != nil {
+		if err := a.store.DeleteGeoRuleSource(r.Context(), safe); err != nil {
+			writeStoreErr(w, err)
 			return
 		}
 	}
+	a.reloadGeoRules(r.Context(), previousExitIDs)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
