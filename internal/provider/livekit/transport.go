@@ -7,9 +7,6 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
-// pipeTransport adapts a LiveKit Pipe to the generic transport.Transport
-// interface. It is shared by the single-user provider and the multiuser
-// session server.
 type pipeTransport struct {
 	pipe transport.Pipe
 
@@ -17,7 +14,6 @@ type pipeTransport struct {
 	bytesDelivered atomic.Int64
 }
 
-// NewTransport wraps a transport.Pipe into a transport.Transport.
 func NewTransport(p transport.Pipe) transport.Transport {
 	return &pipeTransport{pipe: p}
 }

@@ -73,8 +73,6 @@ func (s *RemoteHandler) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool
 	s.cfgMu.Unlock()
 }
 
-// SetExitUpstreams configures the exit-node ID -> SOCKS5 upstream table.
-// Empty values and "local" mean a direct connection.
 func (s *RemoteHandler) SetExitUpstreams(upstreams map[string]string) {
 	out := make(map[string]string, len(upstreams))
 	for id, raw := range upstreams {
@@ -90,8 +88,6 @@ func (s *RemoteHandler) SetExitUpstreams(upstreams map[string]string) {
 	s.cfgMu.Unlock()
 }
 
-// ExitUpstreams returns a copy of the configured exit-node -> SOCKS5
-// upstream table.
 func (s *RemoteHandler) ExitUpstreams() map[string]string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()

@@ -75,8 +75,6 @@ func (r *lkRoomSession) Disconnect() {
 	r.room.Disconnect()
 }
 
-// BuildUserRegistry builds a registry from the users block of a transport
-// configuration.
 func BuildUserRegistry(specs []auth.UserSpec) (*auth.UserRegistry, error) {
 	registry := auth.NewRegistry()
 	for _, spec := range specs {
@@ -94,8 +92,6 @@ func makeTokenFor(apiKey, apiSecret, room, identity string, ttl time.Duration) (
 	return at.ToJWT()
 }
 
-// MultiServer is an on-demand LiveKit session server. It exposes a small HTTP
-// endpoint that authorizes a user and returns a fresh room + client token.
 type MultiServer struct {
 	cfg      Config
 	logger   logging.ContextLogger
@@ -124,7 +120,6 @@ type MultiServer struct {
 	wg       sync.WaitGroup
 }
 
-// NewMultiServer creates an on-demand LiveKit session server.
 func NewMultiServer(
 	cfg Config,
 	logger logging.ContextLogger,
@@ -136,8 +131,7 @@ func NewMultiServer(
 	muxCfg.Registry = registry
 	listenAddr, sessionPath, err := parseTokenListen(cfg.TokenListen)
 	if err != nil {
-		// The builder validates the config first; keep a safe fallback so a
-		// directly constructed server still fails cleanly in Start.
+
 		listenAddr = ""
 		sessionPath = "/session"
 	}
@@ -162,21 +156,18 @@ func NewMultiServer(
 	return m
 }
 
-// Addr returns the bound HTTP listener address (after Start).
 func (m *MultiServer) Addr() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.addr
 }
 
-// ActiveSessions returns the number of currently active on-demand rooms.
 func (m *MultiServer) ActiveSessions() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.sessions)
 }
 
-// SessionPath returns the HTTP path of the session endpoint.
 func (m *MultiServer) SessionPath() string {
 	return m.sessionPath
 }
@@ -187,8 +178,6 @@ func (m *MultiServer) SetSessionHandler(handler app.SessionHandler) {
 	m.mu.Unlock()
 }
 
-// Handler returns the HTTP handler for the session endpoint. It is useful for
-// embedding the server behind another listener (and for tests).
 func (m *MultiServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	path := m.sessionPath

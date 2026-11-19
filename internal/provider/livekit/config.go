@@ -18,11 +18,6 @@ const (
 	defaultServerTokenTTL = time.Hour
 )
 
-// Config is the transport configuration for the LiveKit data channel.
-//
-// The legacy fields (signal_url, api_key, api_secret, room) keep the original
-// single-user behaviour intact. New multiuser / on-demand fields are only
-// consulted when explicitly set.
 type Config struct {
 	SignalURL string `json:"signal_url"`
 	APIKey    string `json:"api_key"`
@@ -34,8 +29,6 @@ type Config struct {
 	UserID     string `json:"user_id,omitempty"`
 	ExitNodeID string `json:"exit_node_id,omitempty"`
 
-	// Token may contain a pre-issued LiveKit JWT. When set, api_key and
-	// api_secret are not required for a client.
 	Token string `json:"token,omitempty"`
 
 	Multiuser bool            `json:"multiuser,omitempty"`
@@ -43,14 +36,10 @@ type Config struct {
 
 	RoomPrefix string `json:"room_prefix,omitempty"`
 
-	// TokenListen is the address (or HTTP URL) the multiuser server binds
-	// its session endpoint to, for example "127.0.0.1:8099" or
-	// "http://127.0.0.1:8099/session".
 	TokenListen string `json:"token_listen,omitempty"`
-	// TokenURL is the client endpoint that issues on-demand sessions.
+
 	TokenURL string `json:"token_url,omitempty"`
-	// TokenSecret protects the session endpoint. It is sent in the
-	// X-Shampoore-Secret header (or as a Bearer token).
+
 	TokenSecret string `json:"token_secret,omitempty"`
 
 	IdleTimeoutMs         int `json:"idle_timeout_ms,omitempty"`
@@ -101,13 +90,11 @@ func (c *Config) hasTokenEndpoint() bool {
 	return strings.TrimSpace(c.TokenURL) != "" || strings.TrimSpace(c.TokenListen) != ""
 }
 
-// Validate validates transport settings without knowing the runtime role.
-// It is used by the panel/manager before a runtime is built.
 func (c *Config) Validate() error {
 	c.applyDefaults()
 
 	if strings.TrimSpace(c.SignalURL) == "" {
-		// On-demand clients receive the actual URL with the session response.
+
 		if c.Multiuser || !c.hasTokenEndpoint() {
 			return fmt.Errorf("livekit: signal_url is required")
 		}
@@ -124,8 +111,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.hasTokenEndpoint() || strings.TrimSpace(c.Token) != "" {
-		// On-demand client or pre-issued token: the room is supplied by the
-		// session endpoint (or embedded in the token).
+
 		return nil
 	}
 
@@ -138,8 +124,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ValidateForRole performs the role-specific validation used by the
-// transport builder.
 func (c *Config) ValidateForRole(role string) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -173,7 +157,6 @@ func (c *Config) ValidateForRole(role string) error {
 	return nil
 }
 
-// NormalizeTokenURL converts a token endpoint into an absolute HTTP URL.
 func NormalizeTokenURL(raw string) string {
 	return normalizeTokenURL(raw)
 }
@@ -210,8 +193,6 @@ func parseEndpointURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// parseTokenListen accepts "host:port", ":port", a path ("/session") or an
-// HTTP URL. It returns the TCP listen address and the endpoint path.
 func parseTokenListen(raw string) (listenAddr, path string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

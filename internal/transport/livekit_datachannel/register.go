@@ -133,8 +133,7 @@ func build(
 	if strings.TrimSpace(cfg.ExitNodeID) == "" {
 		cfg.ExitNodeID = strings.TrimSpace(s.ExitNodeID)
 	}
-	// Keep app.MuxConfig in sync with transport-level identity so the tunnel
-	// sends FrameHello on the single-user path as well.
+
 	if strings.TrimSpace(s.UserID) == "" && cfg.UserID != "" {
 		s.UserID = cfg.UserID
 	}

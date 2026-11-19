@@ -97,8 +97,6 @@ func (m *Manager) SetStartAll(v bool) {
 	m.startAll = v
 }
 
-// SetExitUpstreams configures the exit-node ID -> upstream table used by all
-// remote handlers started by this manager.
 func (m *Manager) SetExitUpstreams(upstreams map[string]string) {
 	out := make(map[string]string, len(upstreams))
 	for id, raw := range upstreams {
@@ -127,7 +125,6 @@ func (m *Manager) exitUpstreamsSnapshot() map[string]string {
 	return out
 }
 
-// ExitUpstreams returns a copy of the configured exit-node -> upstream table.
 func (m *Manager) ExitUpstreams() map[string]string {
 	return m.exitUpstreamsSnapshot()
 }

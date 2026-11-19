@@ -202,8 +202,6 @@ func (m *TunnelMultiplexer) requiresHelloLocked() bool {
 	return m.authRequired
 }
 
-// SessionIdentity returns the user and exit node confirmed by a FrameHello.
-// It is safe for concurrent use.
 func (m *TunnelMultiplexer) SessionIdentity() (userID, exitNodeID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -981,8 +979,7 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
 	registry := m.cfg.Registry
 	if registry == nil {
-		// Legacy/isolated sessions have no registry but may still carry an
-		// identity for cascade routing.
+
 		var hello Hello
 		if f.Hello != nil {
 			hello = *f.Hello
