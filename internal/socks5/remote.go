@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +15,16 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
-func dialTCP(ctx context.Context, target string, ipv4Only bool) (net.Conn, error) {
+func dialTCP(ctx context.Context, target string, ipv4Only bool, upstream string) (net.Conn, error) {
+	if upstream != "" {
+		up, err := parseSocks5Upstream(upstream)
+		if err != nil {
+			return nil, err
+		}
+		if up != nil {
+			return dialSocks5TCP(ctx, up, target)
+		}
+	}
 	network := "tcp"
 	if ipv4Only {
 		network = "tcp4"
@@ -23,15 +33,30 @@ func dialTCP(ctx context.Context, target string, ipv4Only bool) (net.Conn, error
 	return dialer.DialContext(ctx, network, target)
 }
 
+func dialUDP(ctx context.Context, target, upstream string) (net.Conn, error) {
+	if upstream != "" {
+		up, err := parseSocks5Upstream(upstream)
+		if err != nil {
+			return nil, err
+		}
+		if up != nil {
+			return dialSocks5UDP(ctx, up, target)
+		}
+	}
+	dialer := net.Dialer{Timeout: 30 * time.Second}
+	return dialer.DialContext(ctx, "udp", target)
+}
+
 type RemoteHandler struct {
 	mux       multiplexing.StreamMultiplexer
 	logger    logging.ContextLogger
 	chunkSize int
 	ipv4Only  bool
 
-	cfgMu        sync.RWMutex
-	filter       *geofilter.Filter
-	blockUnknown bool
+	cfgMu         sync.RWMutex
+	filter        *geofilter.Filter
+	blockUnknown  bool
+	exitUpstreams map[string]string
 
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
@@ -46,6 +71,61 @@ func (s *RemoteHandler) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool
 	s.filter = filter
 	s.blockUnknown = blockUnknown
 	s.cfgMu.Unlock()
+}
+
+// SetExitUpstreams configures the exit-node ID -> SOCKS5 upstream table.
+// Empty values and "local" mean a direct connection.
+func (s *RemoteHandler) SetExitUpstreams(upstreams map[string]string) {
+	out := make(map[string]string, len(upstreams))
+	for id, raw := range upstreams {
+		id = strings.TrimSpace(id)
+		raw = strings.TrimSpace(raw)
+		if id == "" || raw == "" || strings.EqualFold(raw, "local") {
+			continue
+		}
+		out[id] = raw
+	}
+	s.cfgMu.Lock()
+	s.exitUpstreams = out
+	s.cfgMu.Unlock()
+}
+
+// ExitUpstreams returns a copy of the configured exit-node -> SOCKS5
+// upstream table.
+func (s *RemoteHandler) ExitUpstreams() map[string]string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if len(s.exitUpstreams) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(s.exitUpstreams))
+	for id, raw := range s.exitUpstreams {
+		out[id] = raw
+	}
+	return out
+}
+
+func (s *RemoteHandler) upstreamFor(exitNodeID string) string {
+	exitNodeID = strings.TrimSpace(exitNodeID)
+	if exitNodeID == "" || strings.EqualFold(exitNodeID, "local") {
+		return ""
+	}
+	s.cfgMu.RLock()
+	upstream := s.exitUpstreams[exitNodeID]
+	s.cfgMu.RUnlock()
+	return strings.TrimSpace(upstream)
+}
+
+func (s *RemoteHandler) sessionIdentity() (userID, exitNodeID string) {
+	if s.mux == nil {
+		return "", ""
+	}
+	if identity, ok := s.mux.(interface {
+		SessionIdentity() (string, string)
+	}); ok {
+		return identity.SessionIdentity()
+	}
+	return "", ""
 }
 
 func (s *RemoteHandler) shouldBlock(ip net.IP) bool {
@@ -177,14 +257,25 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 	}
 
 	if isUDP, _ := meta["udp"].(bool); isUDP {
-		s.handleUDPStream(stream, host, port)
+		_, exitNodeID := s.sessionIdentity()
+		upstream := s.upstreamFor(exitNodeID)
+		if upstream != "" {
+			s.logger.Info("remote udp: ", streamID, " exit=", exitNodeID, " via ", upstream)
+		}
+		s.handleUDPStream(stream, host, port, upstream)
 		return
 	}
 
 	target := net.JoinHostPort(host, strconv.Itoa(port))
-	s.logger.Info("remote: ", streamID, " -> ", target)
+	_, exitNodeID := s.sessionIdentity()
+	upstream := s.upstreamFor(exitNodeID)
+	if upstream != "" {
+		s.logger.Info("remote: ", streamID, " -> ", target, " exit=", exitNodeID, " via ", upstream)
+	} else {
+		s.logger.Info("remote: ", streamID, " -> ", target)
+	}
 
-	conn, err := dialTCP(s.ctx, target, s.ipv4Only)
+	conn, err := dialTCP(s.ctx, target, s.ipv4Only, upstream)
 	if err != nil {
 		s.logger.Warn("remote: ", streamID, " connect failed: ", err)
 		s.closeStream(stream)
@@ -265,13 +356,12 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 	<-done
 }
 
-func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string, port int) {
+func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string, port int, upstream string) {
 	streamID := stream.ID()
 
 	target := net.JoinHostPort(host, strconv.Itoa(port))
 
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(s.ctx, "udp", target)
+	conn, err := dialUDP(s.ctx, target, upstream)
 	if err != nil {
 		s.logger.Warn("remote udp: ", streamID, " dial ", target, ": ", err)
 		s.closeStream(stream)
@@ -294,6 +384,21 @@ func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string,
 	defer func() {
 		cleanup()
 		s.logger.Debug("remote udp: ", streamID, " closed")
+	}()
+
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-s.ctx.Done():
+			cleanup()
+		case <-stopWatch:
+		}
+	}()
+	defer func() {
+		close(stopWatch)
+		<-watchDone
 	}()
 
 	done := make(chan struct{}, 2)

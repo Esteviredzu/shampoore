@@ -4,37 +4,73 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 )
 
 func DecodeURL(q url.Values) (json.RawMessage, error) {
 	signal := q.Get("signal_url")
-	if signal == "" {
+	key := q.Get("api_key")
+	secret := q.Get("api_secret")
+	room := q.Get("room")
+	multiuser, _ := strconv.ParseBool(q.Get("multiuser"))
+	tokenURL := q.Get("token_url")
+	if tokenURL == "" {
+		tokenURL = NormalizeTokenURL(q.Get("token_listen"))
+	}
+	token := q.Get("token")
+	if signal == "" && tokenURL == "" {
 		return nil, errors.New("livekit: missing signal_url")
 	}
-	key := q.Get("api_key")
-	if key == "" {
-		return nil, errors.New("livekit: missing api_key")
+	if key == "" || secret == "" {
+		if !multiuser && tokenURL == "" && token == "" {
+			return nil, errors.New("livekit: missing api_key or api_secret")
+		}
 	}
-	secret := q.Get("api_secret")
-	if secret == "" {
-		return nil, errors.New("livekit: missing api_secret")
-	}
-	room := q.Get("room")
-	if room == "" {
+	if room == "" && !multiuser && tokenURL == "" && token == "" {
 		return nil, errors.New("livekit: missing room")
 	}
 
 	out := map[string]any{
 		"signal_url": signal,
-		"api_key":    key,
-		"api_secret": secret,
-		"room":       room,
+	}
+	if key != "" {
+		out["api_key"] = key
+	}
+	if secret != "" {
+		out["api_secret"] = secret
+	}
+	if room != "" {
+		out["room"] = room
 	}
 	if topic := q.Get("data_topic"); topic != "" {
 		out["data_topic"] = topic
 	}
 	if identity := q.Get("identity"); identity != "" {
 		out["identity"] = identity
+	}
+	if userID := q.Get("user_id"); userID != "" {
+		out["user_id"] = userID
+	}
+	if exitID := q.Get("exit_node_id"); exitID != "" {
+		out["exit_node_id"] = exitID
+	}
+	if multiuser {
+		out["multiuser"] = true
+	}
+	if prefix := q.Get("room_prefix"); prefix != "" {
+		out["room_prefix"] = prefix
+	}
+	if listen := q.Get("token_listen"); listen != "" {
+		out["token_listen"] = listen
+	}
+	if tokenURL != "" {
+		out["token_url"] = tokenURL
+	}
+	if tokenSecret := q.Get("token_secret"); tokenSecret != "" {
+		out["token_secret"] = tokenSecret
+	}
+	if token != "" {
+		out["token"] = token
 	}
 	return json.Marshal(out)
 }
@@ -63,6 +99,30 @@ func EncodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if cfg.Identity != "" {
 		q.Set("identity", cfg.Identity)
+	}
+	if cfg.UserID != "" {
+		q.Set("user_id", cfg.UserID)
+	}
+	if cfg.ExitNodeID != "" {
+		q.Set("exit_node_id", cfg.ExitNodeID)
+	}
+	if cfg.Token != "" {
+		q.Set("token", cfg.Token)
+	}
+	if cfg.Multiuser {
+		q.Set("multiuser", "1")
+	}
+	if cfg.RoomPrefix != "" {
+		q.Set("room_prefix", cfg.RoomPrefix)
+	}
+	if cfg.TokenListen != "" {
+		q.Set("token_listen", cfg.TokenListen)
+	}
+	if cfg.TokenURL != "" {
+		q.Set("token_url", cfg.TokenURL)
+	}
+	if cfg.TokenSecret != "" {
+		q.Set("token_secret", cfg.TokenSecret)
 	}
 	return nil
 }

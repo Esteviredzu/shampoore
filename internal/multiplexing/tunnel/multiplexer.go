@@ -202,6 +202,14 @@ func (m *TunnelMultiplexer) requiresHelloLocked() bool {
 	return m.authRequired
 }
 
+// SessionIdentity returns the user and exit node confirmed by a FrameHello.
+// It is safe for concurrent use.
+func (m *TunnelMultiplexer) SessionIdentity() (userID, exitNodeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessionUser, m.sessionExit
+}
+
 func (m *TunnelMultiplexer) sendHello(ctx context.Context) {
 	if ctx == nil {
 		return
@@ -973,7 +981,13 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
 	registry := m.cfg.Registry
 	if registry == nil {
-
+		// Legacy/isolated sessions have no registry but may still carry an
+		// identity for cascade routing.
+		var hello Hello
+		if f.Hello != nil {
+			hello = *f.Hello
+		}
+		m.storeHelloIdentity(hello)
 		return
 	}
 
@@ -984,6 +998,12 @@ func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
 		if required {
 
 			m.rejectSession("unknown_user", auth.ErrUserNotFound)
+		} else {
+			var hello Hello
+			if f.Hello != nil {
+				hello = *f.Hello
+			}
+			m.storeHelloIdentity(hello)
 		}
 		return
 	}
@@ -1015,6 +1035,24 @@ func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
 	m.mu.Unlock()
 
 	m.logger.Info("tunnel: authorized user ", userID)
+}
+
+func (m *TunnelMultiplexer) storeHelloIdentity(hello Hello) bool {
+	userID, err := auth.NormalizeUserID(hello.UserID)
+	if err != nil {
+		return false
+	}
+	exitNodeID := strings.TrimSpace(hello.ExitNodeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return false
+	}
+	m.authorized = true
+	m.sessionUser = userID
+	m.sessionExit = exitNodeID
+	m.authRejected = false
+	return true
 }
 
 func (m *TunnelMultiplexer) closeAllStreams(err error) {

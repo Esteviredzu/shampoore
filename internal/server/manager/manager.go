@@ -32,6 +32,9 @@ type Manager struct {
 
 	startAll bool
 
+	exitMu        sync.RWMutex
+	exitUpstreams map[string]string
+
 	mu      sync.Mutex
 	entries map[string]*ManagedEntry
 
@@ -92,6 +95,41 @@ func (m *Manager) shouldBlock(ip net.IP) bool {
 
 func (m *Manager) SetStartAll(v bool) {
 	m.startAll = v
+}
+
+// SetExitUpstreams configures the exit-node ID -> upstream table used by all
+// remote handlers started by this manager.
+func (m *Manager) SetExitUpstreams(upstreams map[string]string) {
+	out := make(map[string]string, len(upstreams))
+	for id, raw := range upstreams {
+		id = strings.TrimSpace(id)
+		raw = strings.TrimSpace(raw)
+		if id == "" || raw == "" || strings.EqualFold(raw, "local") {
+			continue
+		}
+		out[id] = raw
+	}
+	m.exitMu.Lock()
+	m.exitUpstreams = out
+	m.exitMu.Unlock()
+}
+
+func (m *Manager) exitUpstreamsSnapshot() map[string]string {
+	m.exitMu.RLock()
+	defer m.exitMu.RUnlock()
+	if len(m.exitUpstreams) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m.exitUpstreams))
+	for id, raw := range m.exitUpstreams {
+		out[id] = raw
+	}
+	return out
+}
+
+// ExitUpstreams returns a copy of the configured exit-node -> upstream table.
+func (m *Manager) ExitUpstreams() map[string]string {
+	return m.exitUpstreamsSnapshot()
 }
 
 func (m *Manager) HasDir() bool { return m.dir != "" }
@@ -302,6 +340,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 
 	handler := socks5.NewRemoteHandler(ctx, mux, logger, 8000, app.IPv4Only)
 	handler.SetGeoFilter(m.filter, m.blockUnknown)
+	handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
 	go func() {
 		if err := handler.Run(); err != nil {
 			logger.Warn("remote handler stopped: ", err)
@@ -344,6 +383,7 @@ func (m *Manager) startSessionServer(
 	sessions.SetSessionHandler(func(sctx context.Context, mux multiplexing.StreamMultiplexer) error {
 		handler := socks5.NewRemoteHandler(sctx, mux, logger, 8000, app.IPv4Only)
 		handler.SetGeoFilter(m.filter, m.blockUnknown)
+		handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
 		err := handler.Run()
 		handler.Stop()
 		return err

@@ -1,16 +1,20 @@
 package livekit
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/livekit/protocol/auth"
-	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/livekit/server-sdk-go/v2"
 
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
@@ -18,13 +22,19 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
-const connectTimeout = 15 * time.Second
+const (
+	connectTimeout      = 15 * time.Second
+	tokenRequestTimeout = 20 * time.Second
+)
 
 type Provider struct {
 	cfg    Config
 	logger logging.ContextLogger
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	tokenURL   string
+	httpClient *http.Client
 
 	pipeMu sync.Mutex
 	pipe   *Pipe
@@ -53,6 +63,9 @@ func NewProvider(
 
 	identity := cfg.Identity
 	if identity == "" {
+		identity = strings.TrimSpace(cfg.UserID)
+	}
+	if identity == "" {
 		identity = names.Random()
 	}
 
@@ -60,6 +73,8 @@ func NewProvider(
 		cfg:          cfg,
 		logger:       logger,
 		identity:     identity,
+		tokenURL:     cfg.tokenEndpoint(),
+		httpClient:   &http.Client{Timeout: tokenRequestTimeout},
 		disconnected: make(chan struct{}, 1),
 	}
 	p.ctx, p.cancel = context.WithCancel(ctx)
@@ -95,9 +110,9 @@ func (p *Provider) start(ctx context.Context) error {
 }
 
 func (p *Provider) connect() error {
-	token, err := makeToken(p.cfg.APIKey, p.cfg.APISecret, p.cfg.Room, p.identity)
+	token, signalURL, roomName, err := p.connectionToken()
 	if err != nil {
-		return fmt.Errorf("livekit: make token: %w", err)
+		return err
 	}
 
 	cb := &lksdk.RoomCallback{
@@ -151,7 +166,7 @@ func (p *Provider) connect() error {
 	}
 
 	room, err := lksdk.ConnectToRoomWithToken(
-		p.cfg.SignalURL,
+		signalURL,
 		token,
 		cb,
 		lksdk.WithConnectTimeout(connectTimeout),
@@ -179,11 +194,12 @@ func (p *Provider) connect() error {
 	pipe := p.pipe
 	p.pipeMu.Unlock()
 
+	pipe.SetRemoteID("")
 	if rps := room.GetRemoteParticipants(); len(rps) > 0 {
 		pipe.SetRemoteID(rps[0].Identity())
 	}
 
-	p.logger.Info("livekit: room=", p.cfg.Room,
+	p.logger.Info("livekit: room=", roomName,
 		" identity=", p.identity,
 		" remote=", pipe.GetRemoteID(),
 		" topic=", p.cfg.DataTopic)
@@ -241,11 +257,91 @@ func (p *Provider) supervise() {
 	}
 }
 
+func (p *Provider) connectionToken() (token, signalURL, room string, err error) {
+	signalURL = p.cfg.SignalURL
+	room = p.cfg.Room
+
+	if p.tokenURL != "" {
+		resp, reqErr := p.requestSession()
+		if reqErr != nil {
+			return "", "", "", reqErr
+		}
+		if strings.TrimSpace(resp.URL) != "" {
+			signalURL = resp.URL
+		}
+		return resp.Token, signalURL, resp.Room, nil
+	}
+
+	if strings.TrimSpace(p.cfg.Token) != "" {
+		return p.cfg.Token, signalURL, room, nil
+	}
+
+	token, err = makeToken(p.cfg.APIKey, p.cfg.APISecret, room, p.identity)
+	if err != nil {
+		return "", "", "", fmt.Errorf("livekit: make token: %w", err)
+	}
+	return token, signalURL, room, nil
+}
+
+func (p *Provider) requestSession() (sessionResponse, error) {
+	if p.tokenURL == "" {
+		return sessionResponse{}, errors.New("livekit: token endpoint is not configured")
+	}
+	payload, err := json.Marshal(sessionRequest{
+		UserID:     p.cfg.UserID,
+		ExitNodeID: p.cfg.ExitNodeID,
+	})
+	if err != nil {
+		return sessionResponse{}, fmt.Errorf("livekit: encode session request: %w", err)
+	}
+
+	reqCtx := p.ctx
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	reqCtx, cancel := context.WithTimeout(reqCtx, tokenRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.tokenURL, bytes.NewReader(payload))
+	if err != nil {
+		return sessionResponse{}, fmt.Errorf("livekit: session request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret := strings.TrimSpace(p.cfg.TokenSecret); secret != "" {
+		req.Header.Set("X-Shampoore-Secret", secret)
+	}
+
+	client := p.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: tokenRequestTimeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return sessionResponse{}, fmt.Errorf("livekit: session request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return sessionResponse{}, fmt.Errorf("livekit: session endpoint returned %s: %s",
+			resp.Status, strings.TrimSpace(string(msg)))
+	}
+	var out sessionResponse
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<10))
+	if err := dec.Decode(&out); err != nil {
+		return sessionResponse{}, fmt.Errorf("livekit: decode session response: %w", err)
+	}
+	if strings.TrimSpace(out.Token) == "" || strings.TrimSpace(out.Room) == "" {
+		return sessionResponse{}, errors.New("livekit: session endpoint returned an empty token or room")
+	}
+	if strings.TrimSpace(out.URL) == "" {
+		out.URL = p.cfg.SignalURL
+	}
+	return out, nil
+}
+
 func makeToken(apiKey, apiSecret, room, identity string) (string, error) {
-	at := auth.NewAccessToken(apiKey, apiSecret)
-	grant := &auth.VideoGrant{RoomJoin: true, Room: room}
-	at.SetVideoGrant(grant).SetIdentity(identity).SetValidFor(24 * time.Hour)
-	return at.ToJWT()
+	return makeTokenFor(apiKey, apiSecret, room, identity, 24*time.Hour)
 }
 
 func (p *Provider) Pipe() *Pipe {
@@ -299,13 +395,26 @@ func (p *Provider) Stop(ctx context.Context) error {
 func (p *Provider) Tunnel() *vp8.Tunnel { return nil }
 
 func (p *Provider) BypassHosts() []string {
-	u, err := url.Parse(p.cfg.SignalURL)
-	if err != nil || u.Hostname() == "" {
-		return nil
+	seen := make(map[string]struct{})
+	var bypass []string
+	add := func(raw string) {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" {
+			return
+		}
+		host := u.Hostname()
+		for _, item := range append([]string{host}, netdial.ResolveIPv4(context.Background(), host)...) {
+			if _, ok := seen[item]; ok || item == "" {
+				continue
+			}
+			seen[item] = struct{}{}
+			bypass = append(bypass, item)
+		}
 	}
-	host := u.Hostname()
-	bypass := []string{host}
-	bypass = append(bypass, netdial.ResolveIPv4(context.Background(), host)...)
+	add(p.cfg.SignalURL)
+	if p.tokenURL != "" {
+		add(p.tokenURL)
+	}
 	return bypass
 }
 

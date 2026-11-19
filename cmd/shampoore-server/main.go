@@ -33,6 +33,23 @@ func (s *stringList) Set(v string) error {
 	return nil
 }
 
+func parseExitUpstreams(items []string) (map[string]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(items))
+	for _, item := range items {
+		id, raw, ok := strings.Cut(item, "=")
+		id = strings.TrimSpace(id)
+		raw = strings.TrimSpace(raw)
+		if !ok || id == "" || raw == "" {
+			return nil, fmt.Errorf("invalid %q (want id=upstream)", item)
+		}
+		out[id] = raw
+	}
+	return out, nil
+}
+
 func main() {
 	configsDir := flag.String("configs-dir", "./configs",
 		"directory with configs (used in both CLI and panel mode)")
@@ -46,6 +63,10 @@ func main() {
 	var configFiles stringList
 	flag.Var(&configFiles, "c",
 		"config file to run (repeatable; CLI mode, starts every file)")
+
+	var exitUpstreams stringList
+	flag.Var(&exitUpstreams, "exit-upstream",
+		"exit node upstream: id=socks5://host:port or id=local (repeatable)")
 
 	encode := flag.Bool("encode", false,
 		"encode config as shampoore:// URL and exit (needs -c FILE)")
@@ -86,6 +107,11 @@ func main() {
 	}
 
 	mgr := manager.New(*configsDir, logger, filter, *blockUnknown)
+	upstreamMap, err := parseExitUpstreams(exitUpstreams)
+	if err != nil {
+		log.Fatalf("exit-upstream: %v", err)
+	}
+	mgr.SetExitUpstreams(upstreamMap)
 
 	cliMode := len(configFiles) > 0 || *controlSock == ""
 	if cliMode {
