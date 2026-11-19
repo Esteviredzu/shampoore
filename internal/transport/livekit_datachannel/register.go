@@ -58,6 +58,7 @@ func init() {
 		Defaults:  defaults,
 		DecodeURL: lk.DecodeURL,
 		EncodeURL: lk.EncodeURL,
+		Validate:  validate,
 		Build:     build,
 	})
 	if err != nil {
@@ -72,8 +73,6 @@ func build(
 	logger logging.ContextLogger,
 	eff app.Values,
 ) (*app.BuildResult, error) {
-	_ = role
-
 	var cfg lk.Config
 	if data := s.TransportData(); len(data) > 0 {
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -92,8 +91,12 @@ func build(
 	}
 
 	var pipe transport.Pipe = provider.Pipe()
+	if pipe == nil {
+		_ = provider.Stop(ctx)
+		return nil, fmt.Errorf("livekit_datachannel: pipe not created")
+	}
 	if s.EncryptionPassword != "" {
-		wrapped, err := security.WrapPipe(pipe, s.EncryptionPassword, logger)
+		wrapped, err := security.WrapPipeWithRole(pipe, s.EncryptionPassword, role, logger)
 		if err != nil {
 			_ = provider.Stop(ctx)
 			return nil, fmt.Errorf("livekit_datachannel: wrap encryption: %w", err)
@@ -114,4 +117,14 @@ func build(
 		BypassHosts:  provider.BypassHosts(),
 		ConnectedIPs: provider.ConnectedIPsFunc(),
 	}, nil
+}
+
+func validate(raw json.RawMessage) error {
+	cfg := lk.Config{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	return cfg.Validate()
 }

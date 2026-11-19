@@ -2,9 +2,14 @@ package telemost
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -15,9 +20,15 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
-const wsPingPeriod = 5 * time.Second
+const (
+	wsPingPeriod       = 5 * time.Second
+	wsWriteTimeout     = 10 * time.Second
+	wsHandshakeTimeout = 15 * time.Second
+	disconnectGrace    = 5 * time.Second
+)
 
 type signaling struct {
 	cfg    *Config
@@ -27,14 +38,17 @@ type signaling struct {
 	ws   *websocket.Conn
 	wsMu sync.Mutex
 
-	pubPC *webrtc.PeerConnection
-	subPC *webrtc.PeerConnection
-
-	iceServers []ICEServer
-
+	pcMu         sync.RWMutex
+	pubPC        *webrtc.PeerConnection
+	subPC        *webrtc.PeerConnection
+	iceServers   []ICEServer
 	sharingTrack *webrtc.TrackLocalStaticSample
+	tunnel       *vp8.Tunnel
+	pubSeq       int
+	subSeq       int
+	slotsKey     int
 
-	tunnel *vp8.Tunnel
+	reuseTunnel *vp8.Tunnel
 
 	pubRemoteSet bool
 	subRemoteSet bool
@@ -42,16 +56,21 @@ type signaling struct {
 	subPending   []webrtc.ICECandidateInit
 	remoteMu     sync.Mutex
 
-	pubSeq       int
-	subSeq       int
-	slotsKey     int
 	pubReadySent bool
 	subReadySent bool
 	readyMu      sync.Mutex
 
+	cbMu                  sync.RWMutex
 	onPublishReady        func()
 	onSubscribe           func()
 	onSubscriberReconnect func()
+	onSessionLost         func(reason string)
+
+	lostOnce sync.Once
+
+	stateMu        sync.Mutex
+	stateTimer     *time.Timer
+	disconnectWait time.Duration
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -66,41 +85,332 @@ func newSignaling(cfg *Config, boot *bootstrapResult, logger logging.ContextLogg
 	}
 }
 
-func newWebRTCAPI() *webrtc.API {
+func newWebRTCAPI() (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	i := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
-		panic(err)
+		return nil, err
 	}
+
+	se := webrtc.SettingEngine{}
+	pionNet, err := netdial.NewPionNet()
+	if err != nil {
+		return nil, fmt.Errorf("telemost: create protected pion net: %w", err)
+	}
+	se.SetNet(pionNet)
+
 	return webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
+		webrtc.WithSettingEngine(se),
 		webrtc.WithInterceptorRegistry(i),
-	)
+	), nil
 }
 
-func (s *signaling) Tunnel() *vp8.Tunnel { return s.tunnel }
+func (s *signaling) Tunnel() *vp8.Tunnel {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.tunnel
+}
 
-func (s *signaling) connectWS(ctx context.Context) error {
-	header := http.Header{}
-	header.Set("User-Agent", userAgent)
-	header.Set("Origin", pageOrigin)
-	header.Set("Referer", pageOrigin+"/")
+func (s *signaling) setReuseTunnel(t *vp8.Tunnel) {
+	s.pcMu.Lock()
+	s.reuseTunnel = t
+	s.pcMu.Unlock()
+}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		Jar:              s.boot.jar,
+func (s *signaling) reuseTunnelRef() *vp8.Tunnel {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.reuseTunnel
+}
+
+func (s *signaling) publisher() *webrtc.PeerConnection {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.pubPC
+}
+
+func (s *signaling) subscriber() *webrtc.PeerConnection {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.subPC
+}
+
+func (s *signaling) publishSeq() int {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.pubSeq
+}
+
+func (s *signaling) subscriberSeq() int {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	return s.subSeq
+}
+
+func (s *signaling) setSubscriberSeq(seq int) {
+	s.pcMu.Lock()
+	s.subSeq = seq
+	s.pcMu.Unlock()
+}
+
+func (s *signaling) nextSlotsKey() int {
+	s.pcMu.Lock()
+	defer s.pcMu.Unlock()
+	s.slotsKey++
+	return s.slotsKey
+}
+
+func (s *signaling) iceServerList() []ICEServer {
+	s.pcMu.RLock()
+	defer s.pcMu.RUnlock()
+	out := make([]ICEServer, len(s.iceServers))
+	copy(out, s.iceServers)
+	return out
+}
+
+func (s *signaling) installPCs(
+	pub, sub *webrtc.PeerConnection,
+	tunnel *vp8.Tunnel,
+	sharing *webrtc.TrackLocalStaticSample,
+) (oldPub, oldSub *webrtc.PeerConnection) {
+	s.pcMu.Lock()
+	oldPub, oldSub = s.pubPC, s.subPC
+	s.pubPC, s.subPC, s.tunnel = pub, sub, tunnel
+	s.sharingTrack = sharing
+	s.pcMu.Unlock()
+	return oldPub, oldSub
+}
+
+func (s *signaling) setSubscriber(pc *webrtc.PeerConnection) (old *webrtc.PeerConnection) {
+	s.pcMu.Lock()
+	old = s.subPC
+	s.subPC = pc
+	s.pcMu.Unlock()
+	return old
+}
+
+func (s *signaling) setPublishReadyCallback(fn func()) {
+	s.cbMu.Lock()
+	s.onPublishReady = fn
+	s.cbMu.Unlock()
+}
+
+func (s *signaling) setSubscribeCallback(fn func()) {
+	s.cbMu.Lock()
+	s.onSubscribe = fn
+	s.cbMu.Unlock()
+}
+
+func (s *signaling) setSubscriberReconnectCallback(fn func()) {
+	s.cbMu.Lock()
+	s.onSubscriberReconnect = fn
+	s.cbMu.Unlock()
+}
+
+func (s *signaling) setSessionLostCallback(fn func(reason string)) {
+	s.cbMu.Lock()
+	s.onSessionLost = fn
+	s.cbMu.Unlock()
+}
+
+func (s *signaling) fireSubscriberReconnect() {
+	s.cbMu.RLock()
+	cb := s.onSubscriberReconnect
+	s.cbMu.RUnlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+func (s *signaling) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *signaling) notifySessionLost(reason string) {
+	if s.isClosed() {
+		return
+	}
+	s.lostOnce.Do(func() {
+		s.logger.Warn("telemost: session lost: ", reason)
+		s.cbMu.RLock()
+		cb := s.onSessionLost
+		s.cbMu.RUnlock()
+		if cb != nil {
+			cb(reason)
+		}
+	})
+}
+
+func (s *signaling) handlePCState(
+	label string,
+	pc *webrtc.PeerConnection,
+	state webrtc.PeerConnectionState,
+) {
+	if s.isClosed() {
+		return
 	}
 
-	conn, _, err := dialer.DialContext(ctx, s.boot.info.MediaServerURL, header)
+	switch state {
+	case webrtc.PeerConnectionStateConnected:
+		s.cancelStateTimer()
+		if label == "publisher" {
+			s.markPublishReady()
+		} else {
+			s.markSubscribeReady()
+		}
+	case webrtc.PeerConnectionStateDisconnected:
+
+		s.logger.Warn("telemost: ", label, " disconnected, waiting for recovery")
+		s.armStateTimer(label, pc)
+	case webrtc.PeerConnectionStateFailed:
+		s.notifySessionLost(label + " peer connection failed")
+	}
+}
+
+func (s *signaling) armStateTimer(label string, pc *webrtc.PeerConnection) {
+	grace := s.disconnectWait
+	if grace <= 0 {
+		grace = disconnectGrace
+	}
+
+	s.stateMu.Lock()
+	if s.stateTimer != nil {
+		s.stateTimer.Stop()
+	}
+	s.stateTimer = time.AfterFunc(grace, func() {
+		if s.isClosed() {
+			return
+		}
+		if pc != nil && pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
+			return
+		}
+		s.notifySessionLost(label + " connection stalled")
+	})
+	s.stateMu.Unlock()
+}
+
+func (s *signaling) cancelStateTimer() {
+	s.stateMu.Lock()
+	if s.stateTimer != nil {
+		s.stateTimer.Stop()
+		s.stateTimer = nil
+	}
+	s.stateMu.Unlock()
+}
+
+func (s *signaling) closePC(pc *webrtc.PeerConnection, label string) {
+	if pc == nil {
+		return
+	}
+	if err := pc.Close(); err != nil && !errors.Is(err, webrtc.ErrConnectionClosed) {
+		s.logger.Warn("telemost: close ", label, " peer connection: ", err)
+	}
+}
+
+func (s *signaling) connectWS(ctx context.Context) error {
+	u, err := url.Parse(s.boot.info.MediaServerURL)
+	if err != nil {
+		return fmt.Errorf("telemost: ws url: %w", err)
+	}
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "wss" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: wsHandshakeTimeout, Control: netdial.Control}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(u.Hostname(), port))
 	if err != nil {
 		return fmt.Errorf("telemost: ws dial: %w", err)
 	}
 
+	abort := make(chan struct{})
+	abortDone := make(chan struct{})
+	go func() {
+		defer close(abortDone)
+		select {
+		case <-ctx.Done():
+		case <-s.closed:
+		case <-abort:
+			return
+		}
+		if cerr := conn.Close(); cerr != nil {
+			s.logger.Debug("telemost: abort ws handshake: ", cerr)
+		}
+	}()
+
+	if err := conn.SetDeadline(time.Now().Add(wsHandshakeTimeout)); err != nil {
+		close(abort)
+		<-abortDone
+		if cerr := conn.Close(); cerr != nil {
+			s.logger.Debug("telemost: close ws connection: ", cerr)
+		}
+		return fmt.Errorf("telemost: ws handshake deadline: %w", err)
+	}
+
+	if u.Scheme == "wss" {
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName: u.Hostname(),
+			MinVersion: tls.VersionTLS12,
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			close(abort)
+			<-abortDone
+			if cerr := tlsConn.Close(); cerr != nil {
+				s.logger.Debug("telemost: close ws tls connection: ", cerr)
+			}
+			return fmt.Errorf("telemost: ws tls handshake: %w", err)
+		}
+		conn = tlsConn
+	}
+
+	header := http.Header{}
+	header.Set("User-Agent", userAgent)
+	header.Set("Origin", pageOrigin)
+	header.Set("Referer", pageOrigin+"/")
+	if s.boot.jar != nil {
+		for _, c := range s.boot.jar.Cookies(u) {
+			header.Add("Cookie", c.String())
+		}
+	}
+
+	ws, resp, err := websocket.NewClient(conn, u, header, 4096, 4096)
+	close(abort)
+	<-abortDone
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			if _, cerr := io.Copy(io.Discard, resp.Body); cerr != nil {
+				s.logger.Debug("telemost: drain ws handshake response: ", cerr)
+			}
+			if cerr := resp.Body.Close(); cerr != nil {
+				s.logger.Debug("telemost: close ws handshake response: ", cerr)
+			}
+		}
+		if cerr := conn.Close(); cerr != nil {
+			s.logger.Debug("telemost: close failed ws connection: ", cerr)
+		}
+		return fmt.Errorf("telemost: ws handshake: %w", err)
+	}
+	if resp != nil && s.boot.jar != nil {
+		if cookies := resp.Cookies(); len(cookies) > 0 {
+			s.boot.jar.SetCookies(u, cookies)
+		}
+	}
+
 	s.wsMu.Lock()
-	s.ws = conn
+	s.ws = ws
 	s.wsMu.Unlock()
 	return nil
 }
@@ -111,40 +421,52 @@ func (s *signaling) closeWS() {
 	s.ws = nil
 	s.wsMu.Unlock()
 	if ws != nil {
-		_ = ws.Close()
+		if err := ws.Close(); err != nil {
+			s.logger.Debug("telemost: close ws: ", err)
+		}
 	}
 }
 
 func (s *signaling) wsSend(v any) error {
+
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 
 	if s.ws == nil {
 		return fmt.Errorf("telemost: ws not connected")
 	}
-	data, err := json.Marshal(v)
-	if err != nil {
-		return err
+	if err := s.ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return fmt.Errorf("telemost: ws write deadline: %w", err)
 	}
 	return s.ws.WriteMessage(websocket.TextMessage, data)
 }
 
 func (s *signaling) Run(ctx context.Context) error {
-	if err := s.connectWS(ctx); err != nil {
-		return err
-	}
-	defer s.closeWS()
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	defer cancelDial()
 
 	runDone := make(chan struct{})
 	defer close(runDone)
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.closeWS()
 		case <-s.closed:
 		case <-runDone:
+			return
 		}
+		cancelDial()
+		s.closeWS()
 	}()
+
+	if err := s.connectWS(dialCtx); err != nil {
+		return err
+	}
+	defer s.closeWS()
 
 	if err := s.sendHello(); err != nil {
 		return fmt.Errorf("telemost: send hello: %w", err)
@@ -188,10 +510,17 @@ func (s *signaling) pingLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = s.wsSend(map[string]any{
+			err := s.wsSend(map[string]any{
 				"uid":  newUUID(),
 				"ping": map[string]any{},
 			})
+			if err != nil {
+				if !s.isClosed() {
+					s.logger.Warn("telemost: ping failed: ", err)
+					s.notifySessionLost("ping failed: " + err.Error())
+				}
+				return
+			}
 		}
 	}
 }
@@ -297,7 +626,7 @@ func (s *signaling) ack(uid string) {
 	if uid == "" {
 		return
 	}
-	_ = s.wsSend(map[string]any{
+	if err := s.wsSend(map[string]any{
 		"uid": uid,
 		"ack": map[string]any{
 			"status": map[string]any{
@@ -305,7 +634,9 @@ func (s *signaling) ack(uid string) {
 				"description": "",
 			},
 		},
-	})
+	}); err != nil && !s.isClosed() {
+		s.logger.Warn("telemost: ack failed: ", err)
+	}
 }
 
 func (s *signaling) onServerHello(raw any) error {
@@ -348,15 +679,22 @@ func (s *signaling) onServerHello(raw any) error {
 		}
 	}
 
-	_ = s.wsSend(setSlotsOffsetMessage(0))
+	if err := s.wsSend(setSlotsOffsetMessage(0)); err != nil {
+		return fmt.Errorf("telemost: set slots offset: %w", err)
+	}
 
 	return s.initPeerConnections(ice)
 }
 
 func (s *signaling) initPeerConnections(ice []ICEServer) error {
+	s.pcMu.Lock()
 	s.iceServers = ice
+	s.pcMu.Unlock()
 
-	api := newWebRTCAPI()
+	api, err := newWebRTCAPI()
+	if err != nil {
+		return err
+	}
 
 	cfg := webrtc.Configuration{}
 	for _, srv := range ice {
@@ -372,14 +710,12 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 	if err != nil {
 		return err
 	}
-	s.pubPC = pubPC
 
 	subPC, err := s.createSubPC()
 	if err != nil {
-		_ = pubPC.Close()
+		s.closePC(pubPC, "publisher")
 		return err
 	}
-	s.subPC = subPC
 
 	trackID := "video-" + s.boot.info.PeerID
 	streamID := "shampoore-" + s.boot.info.PeerID
@@ -392,8 +728,8 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 		trackID, streamID,
 	)
 	if err != nil {
-		_ = pubPC.Close()
-		_ = subPC.Close()
+		s.closePC(pubPC, "publisher")
+		s.closePC(subPC, "subscriber")
 		return err
 	}
 	videoTr, err := pubPC.AddTransceiverFromTrack(
@@ -401,26 +737,42 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
 	)
 	if err != nil {
-		_ = pubPC.Close()
-		_ = subPC.Close()
+		s.closePC(pubPC, "publisher")
+		s.closePC(subPC, "subscriber")
 		return err
 	}
 	go drainSenderRTCP(videoTr.Sender())
 
+	var sharing *webrtc.TrackLocalStaticSample
 	if s.cfg.UseSharing {
-		s.sharingTrack = videoTrack
+		sharing = videoTrack
 	}
 
-	tunnel, err := vp8.AttachTunnel(pubPC, subPC, videoTrack)
-	if err != nil {
-		_ = pubPC.Close()
-		_ = subPC.Close()
-		return err
-	}
-	s.tunnel = tunnel
+	reuse := s.reuseTunnelRef()
+	if reuse == nil {
 
-	if s.sharingTrack != nil {
-		tunnel.SetSharingTrack(s.sharingTrack)
+		reuse = s.Tunnel()
+	}
+
+	var tunnel *vp8.Tunnel
+	if reuse != nil {
+		if err := reuse.Rebind(subPC, videoTrack); err != nil {
+			s.closePC(pubPC, "publisher")
+			s.closePC(subPC, "subscriber")
+			return err
+		}
+		tunnel = reuse
+	} else {
+		tunnel, err = vp8.AttachTunnel(pubPC, subPC, videoTrack)
+		if err != nil {
+			s.closePC(pubPC, "publisher")
+			s.closePC(subPC, "subscriber")
+			return err
+		}
+	}
+
+	if sharing != nil {
+		tunnel.SetSharingTrack(sharing)
 		s.logger.Info("telemost: sharing track attached to tunnel")
 	}
 
@@ -428,24 +780,37 @@ func (s *signaling) initPeerConnections(ice []ICEServer) error {
 		if c == nil {
 			return
 		}
-		s.sendICE(c, "PUBLISHER", s.pubSeq)
+		s.sendICE(c, "PUBLISHER", s.publishSeq())
 	})
 	pubPC.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		s.logger.Info("telemost: pub ICE state = ", state.String())
 	})
 	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		s.logger.Info("telemost: pub PC state = ", state.String())
-		if state == webrtc.PeerConnectionStateConnected {
-			s.markPublishReady()
-		}
+		s.handlePCState("publisher", pubPC, state)
 	})
 
-	return s.startPublish()
+	if s.isClosed() {
+		s.closePC(pubPC, "publisher")
+		s.closePC(subPC, "subscriber")
+		return errors.New("telemost: signaling closed during peer connection setup")
+	}
+
+	if oldPub, oldSub := s.installPCs(pubPC, subPC, tunnel, sharing); oldPub != nil || oldSub != nil {
+		if oldPub != nil && oldPub != pubPC {
+			s.closePC(oldPub, "publisher")
+		}
+		if oldSub != nil && oldSub != subPC {
+			s.closePC(oldSub, "subscriber")
+		}
+	}
+
+	return s.startPublish(pubPC)
 }
 
 func (s *signaling) createSubPC() (*webrtc.PeerConnection, error) {
 	cfg := webrtc.Configuration{}
-	for _, srv := range s.iceServers {
+	for _, srv := range s.iceServerList() {
 		entry := webrtc.ICEServer{URLs: srv.URLs}
 		if srv.Username != "" {
 			entry.Username = srv.Username
@@ -454,7 +819,10 @@ func (s *signaling) createSubPC() (*webrtc.PeerConnection, error) {
 		cfg.ICEServers = append(cfg.ICEServers, entry)
 	}
 
-	api := newWebRTCAPI()
+	api, err := newWebRTCAPI()
+	if err != nil {
+		return nil, err
+	}
 	subPC, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		return nil, err
@@ -464,16 +832,14 @@ func (s *signaling) createSubPC() (*webrtc.PeerConnection, error) {
 		if c == nil {
 			return
 		}
-		s.sendICE(c, "SUBSCRIBER", s.subSeq)
+		s.sendICE(c, "SUBSCRIBER", s.subscriberSeq())
 	})
 	subPC.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		s.logger.Info("telemost: sub ICE state = ", state.String())
 	})
 	subPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		s.logger.Info("telemost: sub PC state = ", state.String())
-		if state == webrtc.PeerConnectionStateConnected {
-			s.markSubscribeReady()
-		}
+		s.handlePCState("subscriber", subPC, state)
 	})
 	return subPC, nil
 }
@@ -497,8 +863,11 @@ func (s *signaling) markPublishReady() {
 		return
 	}
 	s.pubReadySent = true
-	cb := s.onPublishReady
 	s.readyMu.Unlock()
+
+	s.cbMu.RLock()
+	cb := s.onPublishReady
+	s.cbMu.RUnlock()
 
 	s.logger.Info("telemost: publish connected")
 	if cb != nil {
@@ -513,8 +882,11 @@ func (s *signaling) markSubscribeReady() {
 		return
 	}
 	s.subReadySent = true
-	cb := s.onSubscribe
 	s.readyMu.Unlock()
+
+	s.cbMu.RLock()
+	cb := s.onSubscribe
+	s.cbMu.RUnlock()
 
 	s.logger.Info("telemost: subscribe connected")
 	if cb != nil {
@@ -522,13 +894,23 @@ func (s *signaling) markSubscribeReady() {
 	}
 }
 
-func (s *signaling) startPublish() error {
+func (s *signaling) subscriberReady() bool {
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	return s.subReadySent
+}
+
+func (s *signaling) startPublish(pc *webrtc.PeerConnection) error {
+	s.pcMu.Lock()
 	s.pubSeq = 1
-	offer, err := s.pubPC.CreateOffer(nil)
+	seq := s.pubSeq
+	s.pcMu.Unlock()
+
+	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return err
 	}
-	if err := s.pubPC.SetLocalDescription(offer); err != nil {
+	if err := pc.SetLocalDescription(offer); err != nil {
 		return err
 	}
 
@@ -555,14 +937,14 @@ func (s *signaling) startPublish() error {
 		tracks = append(tracks, DisplayVideoTrack(videoMids[0], label))
 	}
 
-	s.logger.Debug("telemost: -> publisherSdpOffer pcSeq=", s.pubSeq,
+	s.logger.Debug("telemost: -> publisherSdpOffer pcSeq=", seq,
 		" tracks=", len(tracks), " audioMids=", audioMids, " videoMids=", videoMids,
 		" useSharing=", s.cfg.UseSharing)
 
 	return s.wsSend(map[string]any{
 		"uid": newUUID(),
 		"publisherSdpOffer": map[string]any{
-			"pcSeq":  s.pubSeq,
+			"pcSeq":  seq,
 			"sdp":    offer.SDP,
 			"tracks": tracks,
 		},
@@ -576,7 +958,12 @@ func (s *signaling) onPublisherAnswer(raw any) error {
 		return fmt.Errorf("telemost: empty SDP in publisherSdpAnswer")
 	}
 
-	if err := s.pubPC.SetRemoteDescription(webrtc.SessionDescription{
+	pc := s.publisher()
+	if pc == nil {
+		return errors.New("telemost: publisher peer connection is not ready")
+	}
+
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,
 	}); err != nil {
@@ -590,32 +977,43 @@ func (s *signaling) onPublisherAnswer(raw any) error {
 	s.remoteMu.Unlock()
 
 	for _, c := range pending {
-		_ = s.pubPC.AddICECandidate(c)
+		if err := pc.AddICECandidate(c); err != nil {
+			s.logger.Warn("telemost: add pending publisher candidate: ", err)
+		}
 	}
 
-	s.wsSend(sdkCodecsInfoMessage())
+	if err := s.wsSend(sdkCodecsInfoMessage()); err != nil {
+		return fmt.Errorf("telemost: send codecs info: %w", err)
+	}
 
 	videoLabel := ""
 	if s.cfg.UseSharing {
 		videoLabel = "Screen"
 	}
-	s.wsSend(updatePublisherTrackDescriptionMessage(
-		s.pubPC,
+	if err := s.wsSend(updatePublisherTrackDescriptionMessage(
+		pc,
 		"Microphone",
 		videoLabel,
-	))
+	)); err != nil {
+		return fmt.Errorf("telemost: send track description: %w", err)
+	}
 
 	for i := 0; i < 4; i++ {
-		s.slotsKey++
-		key := s.slotsKey
-		s.wsSend(startupSetSlotsMessage(i, key))
+		key := s.nextSlotsKey()
+		if err := s.wsSend(startupSetSlotsMessage(i, key)); err != nil {
+			return fmt.Errorf("telemost: send startup slots: %w", err)
+		}
 		s.logger.Debug("telemost: -> setSlots key=", key, " startup=", i+1)
 	}
 
 	if s.cfg.UseSharing {
 		s.logger.Info("telemost: -> updatePublisherSharingTrack Screen")
-		s.wsSend(UpdatePublisherSharingTrackMessage("Screen"))
-		s.wsSend(UpdateMeMessage(s.cfg.EffectiveDisplayName(), false, true))
+		if err := s.wsSend(UpdatePublisherSharingTrackMessage("Screen")); err != nil {
+			return fmt.Errorf("telemost: send sharing track: %w", err)
+		}
+		if err := s.wsSend(UpdateMeMessage(s.cfg.EffectiveDisplayName(), false, true)); err != nil {
+			return fmt.Errorf("telemost: send update me: %w", err)
+		}
 	}
 
 	return nil
@@ -637,40 +1035,29 @@ func (s *signaling) onSubscriberOffer(raw any) error {
 		return fmt.Errorf("telemost: empty SDP in subscriberSdpOffer")
 	}
 	if pcSeq, ok := m["pcSeq"].(float64); ok {
-		s.subSeq = int(pcSeq)
+		s.setSubscriberSeq(int(pcSeq))
 	}
 
-	isReconnect := s.subReadySent
+	pc := s.subscriber()
+	if pc == nil {
+		return errors.New("telemost: subscriber peer connection is not ready")
+	}
 
-	if !isReconnect {
-		if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
-			Type: webrtc.SDPTypeOffer,
-			SDP:  sdp,
-		}); err != nil {
+	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}
+	if !s.subscriberReady() {
+		if err := pc.SetRemoteDescription(offer); err != nil {
 			return err
 		}
-		return s.answerSubscriber()
+		return s.answerSubscriber(pc)
 	}
 
-	if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  sdp,
-	}); err == nil {
+	if err := pc.SetRemoteDescription(offer); err == nil {
 		s.logger.Info("telemost: subscriber renegotiated on existing PC")
-		if s.onSubscriberReconnect != nil {
-			s.onSubscriberReconnect()
-		}
-		return s.answerSubscriber()
+		s.fireSubscriberReconnect()
+		return s.answerSubscriber(pc)
 	}
 
 	s.logger.Info("telemost: reconnect detected, recreating subscriber PC")
-
-	if s.subPC != nil {
-		_ = s.subPC.Close()
-	}
-	if s.onSubscriberReconnect != nil {
-		s.onSubscriberReconnect()
-	}
 
 	s.remoteMu.Lock()
 	s.subRemoteSet = false
@@ -681,22 +1068,22 @@ func (s *signaling) onSubscriberOffer(raw any) error {
 	if err != nil {
 		return err
 	}
-	s.subPC = newSubPC
-
-	if s.tunnel != nil {
-		s.tunnel.AttachSubPC(newSubPC)
+	if old := s.setSubscriber(newSubPC); old != nil && old != newSubPC {
+		s.closePC(old, "subscriber")
 	}
 
-	if err := s.subPC.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  sdp,
-	}); err != nil {
+	if t := s.Tunnel(); t != nil {
+		t.AttachSubPC(newSubPC)
+	}
+	s.fireSubscriberReconnect()
+
+	if err := newSubPC.SetRemoteDescription(offer); err != nil {
 		return err
 	}
-	return s.answerSubscriber()
+	return s.answerSubscriber(newSubPC)
 }
 
-func (s *signaling) answerSubscriber() error {
+func (s *signaling) answerSubscriber(pc *webrtc.PeerConnection) error {
 	s.remoteMu.Lock()
 	s.subRemoteSet = true
 	pending := s.subPending
@@ -704,21 +1091,23 @@ func (s *signaling) answerSubscriber() error {
 	s.remoteMu.Unlock()
 
 	for _, c := range pending {
-		_ = s.subPC.AddICECandidate(c)
+		if err := pc.AddICECandidate(c); err != nil {
+			s.logger.Warn("telemost: add pending subscriber candidate: ", err)
+		}
 	}
 
-	answer, err := s.subPC.CreateAnswer(nil)
+	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		return err
 	}
-	if err := s.subPC.SetLocalDescription(answer); err != nil {
+	if err := pc.SetLocalDescription(answer); err != nil {
 		return err
 	}
 	return s.wsSend(map[string]any{
 		"uid": newUUID(),
 		"subscriberSdpAnswer": map[string]any{
 			"sdp":   answer.SDP,
-			"pcSeq": s.subSeq,
+			"pcSeq": s.subscriberSeq(),
 		},
 	})
 }
@@ -737,23 +1126,36 @@ func (s *signaling) onICECandidate(raw any) error {
 		SDPMLineIndex: &idx,
 	}
 
-	s.remoteMu.Lock()
-	defer s.remoteMu.Unlock()
+	s.pcMu.RLock()
+	pubPC, subPC := s.pubPC, s.subPC
+	s.pcMu.RUnlock()
 
+	s.remoteMu.Lock()
 	switch target {
 	case "PUBLISHER":
 		if !s.pubRemoteSet {
 			s.pubPending = append(s.pubPending, init)
+			s.remoteMu.Unlock()
 			return nil
 		}
-		return s.pubPC.AddICECandidate(init)
+		s.remoteMu.Unlock()
+		if pubPC == nil {
+			return errors.New("telemost: publisher peer connection is not ready")
+		}
+		return pubPC.AddICECandidate(init)
 	case "SUBSCRIBER":
 		if !s.subRemoteSet {
 			s.subPending = append(s.subPending, init)
+			s.remoteMu.Unlock()
 			return nil
 		}
-		return s.subPC.AddICECandidate(init)
+		s.remoteMu.Unlock()
+		if subPC == nil {
+			return errors.New("telemost: subscriber peer connection is not ready")
+		}
+		return subPC.AddICECandidate(init)
 	}
+	s.remoteMu.Unlock()
 	return nil
 }
 
@@ -767,7 +1169,7 @@ func (s *signaling) sendICE(c *webrtc.ICECandidate, target string, pcSeq int) {
 	if jc.SDPMLineIndex != nil {
 		idx = *jc.SDPMLineIndex
 	}
-	_ = s.wsSend(map[string]any{
+	if err := s.wsSend(map[string]any{
 		"uid": newUUID(),
 		"webrtcIceCandidate": map[string]any{
 			"candidate":           jc.Candidate,
@@ -777,20 +1179,31 @@ func (s *signaling) sendICE(c *webrtc.ICECandidate, target string, pcSeq int) {
 			"target":              target,
 			"pcSeq":               pcSeq,
 		},
-	})
+	}); err != nil && !s.isClosed() {
+		s.logger.Warn("telemost: send ICE candidate: ", err)
+	}
 }
 
 func (s *signaling) Close() {
 	s.closeOnce.Do(func() { close(s.closed) })
+	s.cancelStateTimer()
 	s.closeWS()
-	if s.tunnel != nil {
-		_ = s.tunnel.Close()
+
+	s.pcMu.Lock()
+	pubPC := s.pubPC
+	subPC := s.subPC
+	s.pubPC = nil
+	s.subPC = nil
+	s.tunnel = nil
+	s.sharingTrack = nil
+	s.reuseTunnel = nil
+	s.pcMu.Unlock()
+
+	if pubPC != nil {
+		s.closePC(pubPC, "publisher")
 	}
-	if s.pubPC != nil {
-		_ = s.pubPC.Close()
-	}
-	if s.subPC != nil {
-		_ = s.subPC.Close()
+	if subPC != nil {
+		s.closePC(subPC, "subscriber")
 	}
 }
 

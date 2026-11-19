@@ -2,9 +2,11 @@ package livekit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/livekit/protocol/auth"
@@ -13,7 +15,10 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/names"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
+
+const connectTimeout = 15 * time.Second
 
 type Provider struct {
 	cfg    Config
@@ -31,6 +36,8 @@ type Provider struct {
 
 	disconnected chan struct{}
 
+	started  atomic.Bool
+	stopped  atomic.Bool
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
@@ -57,15 +64,34 @@ func NewProvider(
 	}
 	p.ctx, p.cancel = context.WithCancel(ctx)
 
-	if err := p.connect(); err != nil {
-		p.cancel()
+	if err := p.start(ctx); err != nil {
 		return nil, err
+	}
+
+	return p, nil
+}
+
+func (p *Provider) start(ctx context.Context) error {
+	if p.stopped.Load() {
+		return errors.New("livekit: provider is stopped")
+	}
+	if !p.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		p.started.Store(false)
+		return err
+	}
+	if err := p.connect(); err != nil {
+		if stopErr := p.Stop(context.Background()); stopErr != nil {
+			p.logger.Warn("livekit: cleanup after failed start: ", stopErr)
+		}
+		return err
 	}
 
 	p.wg.Add(1)
 	go p.supervise()
-
-	return p, nil
+	return nil
 }
 
 func (p *Provider) connect() error {
@@ -124,9 +150,19 @@ func (p *Provider) connect() error {
 		},
 	}
 
-	room, err := lksdk.ConnectToRoomWithToken(p.cfg.SignalURL, token, cb)
+	room, err := lksdk.ConnectToRoomWithToken(
+		p.cfg.SignalURL,
+		token,
+		cb,
+		lksdk.WithConnectTimeout(connectTimeout),
+	)
 	if err != nil {
 		return fmt.Errorf("livekit: connect: %w", err)
+	}
+
+	if p.stopped.Load() {
+		room.Disconnect()
+		return errors.New("livekit: provider stopped during connect")
 	}
 
 	p.roomMu.Lock()
@@ -218,10 +254,21 @@ func (p *Provider) Pipe() *Pipe {
 	return p.pipe
 }
 
-func (p *Provider) Start(context.Context) error { return nil }
+func (p *Provider) NotifyNetworkChanged() {
+	if p.stopped.Load() {
+		return
+	}
+	select {
+	case p.disconnected <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Provider) Start(ctx context.Context) error { return p.start(ctx) }
 
 func (p *Provider) Stop(ctx context.Context) error {
 	p.stopOnce.Do(func() {
+		p.stopped.Store(true)
 		if p.cancel != nil {
 			p.cancel()
 		}
@@ -230,7 +277,9 @@ func (p *Provider) Stop(ctx context.Context) error {
 		pipe := p.pipe
 		p.pipeMu.Unlock()
 		if pipe != nil {
-			_ = pipe.Stop(ctx)
+			if err := pipe.Stop(ctx); err != nil {
+				p.logger.Warn("livekit: stop pipe: ", err)
+			}
 		}
 
 		p.roomMu.Lock()
@@ -250,10 +299,14 @@ func (p *Provider) Stop(ctx context.Context) error {
 func (p *Provider) Tunnel() *vp8.Tunnel { return nil }
 
 func (p *Provider) BypassHosts() []string {
-	if u, err := url.Parse(p.cfg.SignalURL); err == nil && u.Hostname() != "" {
-		return []string{u.Hostname()}
+	u, err := url.Parse(p.cfg.SignalURL)
+	if err != nil || u.Hostname() == "" {
+		return nil
 	}
-	return nil
+	host := u.Hostname()
+	bypass := []string{host}
+	bypass = append(bypass, netdial.ResolveIPv4(context.Background(), host)...)
+	return bypass
 }
 
 func (p *Provider) ConnectedIPs() []string { return nil }

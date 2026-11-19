@@ -63,19 +63,24 @@ type Pipe struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	started  bool
+	startMu  sync.Mutex
+	started  atomic.Bool
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 
-	idleSeq uint32
-	sharing bool
+	sharing atomic.Bool
 
-	yuvBuf []byte
+	yuvBuf     []byte
+	idleYUV    []byte
+	payloadBuf []byte
+	dataBuf    []byte
+	decodeBuf  []byte
 
-	stFrames atomic.Int64
-	stBytes  atomic.Int64
-	stMsgs   atomic.Int64
-	stFull   atomic.Int64
+	stFrames  atomic.Int64
+	stBytes   atomic.Int64
+	stMsgs    atomic.Int64
+	stFull    atomic.Int64
+	stSendErr atomic.Int64
 
 	ctr transport.Counters
 }
@@ -149,7 +154,9 @@ func NewPipe(ch channel.MediaChannel, cfg Config, palette *Palette) (*Pipe, erro
 func recvQueueSize(n int) int { return n }
 
 func (p *Pipe) Start(ctx context.Context) error {
-	if p.started {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	if p.started.Load() {
 		return nil
 	}
 
@@ -172,7 +179,17 @@ func (p *Pipe) Start(ctx context.Context) error {
 		p.yuvBuf[i] = 128
 	}
 
-	p.started = true
+	p.payloadBuf = make([]byte, p.payloadBytes)
+	p.dataBuf = make([]byte, 0, p.maxData)
+	p.decodeBuf = make([]byte, p.payloadBytes)
+
+	p.idleYUV = make([]byte, len(p.yuvBuf))
+	copy(p.idleYUV, p.yuvBuf)
+	EncodeFrameYUV(p.idleYUV, p.cfg.Width, p.cfg.Height,
+		p.cfg.Cols, p.cfg.Rows, p.cfg.CellSize, p.payloadBuf, p.palette)
+	clear(p.payloadBuf)
+
+	p.started.Store(true)
 	p.wg.Add(2)
 	go p.recvLoop()
 	go p.sendLoop()
@@ -183,9 +200,12 @@ func (p *Pipe) Start(ctx context.Context) error {
 }
 
 func (p *Pipe) Stop(ctx context.Context) error {
+	p.startMu.Lock()
+	cancel := p.cancel
+	p.startMu.Unlock()
 	p.stopOnce.Do(func() {
-		if p.cancel != nil {
-			p.cancel()
+		if cancel != nil {
+			cancel()
 		}
 	})
 	p.wg.Wait()
@@ -201,14 +221,14 @@ func (p *Pipe) Stop(ctx context.Context) error {
 func (p *Pipe) SessionID() string                                   { return "framing" }
 func (p *Pipe) MaxMessageSize() int                                 { return p.maxMessage }
 func (p *Pipe) DeleteMessage(ctx context.Context, key string) error { return nil }
-func (p *Pipe) SetSharing(on bool)                                  { p.sharing = on }
+func (p *Pipe) SetSharing(on bool)                                  { p.sharing.Store(on) }
 
 func (p *Pipe) WalkLayers() []transport.Layer {
 	return []transport.Layer{{Kind: "pipe", Type: "framing", Snapshot: p.ctr.Snapshot()}}
 }
 
 func (p *Pipe) SendMessage(ctx context.Context, data []byte, key string) error {
-	if !p.started {
+	if !p.started.Load() {
 		return errors.New("framing: pipe not started")
 	}
 	if len(data) == 0 {
@@ -276,7 +296,10 @@ func (p *Pipe) sendLoop() {
 			if p.ctx.Err() != nil {
 				return
 			}
-			log.Printf("[framing] send error: %v", err)
+			n := p.stSendErr.Add(1)
+			if n <= 5 || n%300 == 0 {
+				log.Printf("[framing] send error (total=%d): %v", n, err)
+			}
 		}
 	}
 }
@@ -306,39 +329,37 @@ func (p *Pipe) takeBatch() [][]byte {
 }
 
 func (p *Pipe) sendBatch(batch [][]byte) error {
-	data := make([]byte, 0, p.maxData)
+	data := p.dataBuf[:0]
 	for _, m := range batch {
 		n := len(m)
 		data = append(data, byte(n), byte(n>>8))
 		data = append(data, m...)
 	}
-	payload := make([]byte, p.payloadBytes)
+	payload := p.payloadBuf
+	clear(payload)
 	binary.LittleEndian.PutUint32(payload[0:4], uint32(len(data)))
 	binary.LittleEndian.PutUint32(payload[4:8], crc32.ChecksumIEEE(data))
 	copy(payload[HdrLen:], data)
 	p.stMsgs.Add(int64(len(batch)))
 	p.ctr.UsefulSent.Add(int64(len(data)))
 	p.ctr.MessagesSent.Add(int64(len(batch)))
-	return p.emit(payload, fmt.Sprintf("batch msgs=%d bytes=%d", len(batch), len(data)))
+	EncodeFrameYUV(p.yuvBuf, p.cfg.Width, p.cfg.Height, p.cfg.Cols, p.cfg.Rows,
+		p.cfg.CellSize, payload, p.palette)
+	return p.emitPrepared(p.yuvBuf)
 }
 
 func (p *Pipe) sendIdle() error {
-	p.idleSeq++
-	payload := make([]byte, p.payloadBytes)
-	return p.emit(payload, "")
+	return p.emitPrepared(p.idleYUV)
 }
 
-func (p *Pipe) emit(payload []byte, label string) error {
-	yuv := p.yuvBuf
-	EncodeFrameYUV(yuv, p.cfg.Width, p.cfg.Height, p.cfg.Cols, p.cfg.Rows,
-		p.cfg.CellSize, payload, p.palette)
+func (p *Pipe) emitPrepared(yuv []byte) error {
 	frame, err := p.enc.Encode(yuv)
 	if err != nil {
 		return fmt.Errorf("framing: encode: %w", err)
 	}
 
 	var werr error
-	if p.sharing {
+	if p.sharing.Load() {
 		type sharingWriter interface {
 			WriteSharingVP8([]byte) error
 		}
@@ -357,15 +378,8 @@ func (p *Pipe) emit(payload []byte, label string) error {
 	p.ctr.NetworkSent.Add(int64(len(frame)))
 	p.ctr.FramesSent.Add(1)
 
-	n := p.stFrames.Add(1)
+	p.stFrames.Add(1)
 	p.stBytes.Add(int64(len(frame)))
-	if label != "" {
-		log.Printf("[framing] SEND %s vp8=%d", label, len(frame))
-	} else if n%300 == 1 {
-		log.Printf("[framing] SEND idle seq=%d vp8=%d (frames=%d avg=%.0fB)",
-			p.idleSeq, len(frame), n,
-			float64(p.stBytes.Load())/float64(n))
-	}
 	return nil
 }
 
@@ -385,6 +399,10 @@ func (p *Pipe) recvLoop() {
 	defer p.wg.Done()
 	defer close(p.recvCh)
 	frameCount := 0
+	decodeFails := 0
+	badLens := 0
+	crcFails := 0
+	truncated := 0
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -404,34 +422,43 @@ func (p *Pipe) recvLoop() {
 
 		yuv, err := p.dec.Decode(raw)
 		if err != nil {
-			log.Printf("[framing] recv #%d vp8=%d DECODE-FAIL: %v",
-				frameCount, len(raw), err)
+			decodeFails++
+			if decodeFails <= 5 || decodeFails%300 == 0 {
+				log.Printf("[framing] decode fail #%d vp8=%d (total=%d): %v",
+					frameCount, len(raw), decodeFails, err)
+			}
 			continue
 		}
 		if yuv == nil {
 			continue
 		}
-		payload := DecodeFrameYUV(yuv, p.cfg.Width,
+		payload := DecodeFrameYUVInto(p.decodeBuf, yuv, p.cfg.Width,
 			p.cfg.Cols, p.cfg.Rows, p.cfg.CellSize, p.payloadBytes, p.palette)
 		if payload == nil {
 			continue
 		}
 		length := binary.LittleEndian.Uint32(payload[0:4])
 		if length == 0 {
-			if frameCount <= 20 || frameCount%600 == 0 {
-				log.Printf("[framing] recv #%d idle", frameCount)
+			if frameCount%1800 == 0 {
+				log.Printf("[framing] recv idle summary frames=%d", frameCount)
 			}
 			continue
 		}
 		if int(length) > p.maxData {
-			log.Printf("[framing] recv #%d BAD-LEN len=%d max=%d",
-				frameCount, length, p.maxData)
+			badLens++
+			if badLens <= 5 || badLens%300 == 0 {
+				log.Printf("[framing] bad length len=%d max=%d (total=%d)",
+					length, p.maxData, badLens)
+			}
 			continue
 		}
 		crcGot := binary.LittleEndian.Uint32(payload[4:8])
 		data := payload[HdrLen : HdrLen+int(length)]
 		if crc32.ChecksumIEEE(data) != crcGot {
-			log.Printf("[framing] recv #%d CRC-FAIL len=%d", frameCount, length)
+			crcFails++
+			if crcFails <= 5 || crcFails%300 == 0 {
+				log.Printf("[framing] crc fail len=%d (total=%d)", length, crcFails)
+			}
 			continue
 		}
 		off := 0
@@ -443,8 +470,11 @@ func (p *Pipe) recvLoop() {
 				break
 			}
 			if off+mlen > len(data) {
-				log.Printf("[framing] recv #%d truncated record (%d+%d > %d)",
-					frameCount, off, mlen, len(data))
+				truncated++
+				if truncated <= 5 || truncated%300 == 0 {
+					log.Printf("[framing] truncated record (%d+%d > %d, total=%d)",
+						off, mlen, len(data), truncated)
+				}
 				break
 			}
 			out := make([]byte, mlen)
@@ -459,7 +489,6 @@ func (p *Pipe) recvLoop() {
 		}
 		p.ctr.UsefulRecv.Add(int64(len(data)))
 		p.ctr.MessagesRecv.Add(int64(n))
-		log.Printf("[framing] recv #%d OK msgs=%d bytes=%d", frameCount, n, length)
 	}
 }
 

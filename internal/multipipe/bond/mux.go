@@ -86,6 +86,14 @@ func NewMux(
 	}, nil
 }
 
+func (m *Mux) NotifyNetworkChanged() {
+	for _, t := range m.transports {
+		if n, ok := t.(interface{ NotifyNetworkChanged() }); ok {
+			n.NotifyNetworkChanged()
+		}
+	}
+}
+
 func (m *Mux) Start(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

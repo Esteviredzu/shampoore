@@ -18,6 +18,5 @@ func defaultSettings() *Settings {
 	return &Settings{
 		IPv4Only: IPv4Only,
 		Advanced: NewValues(),
-		Type:     "yandex",
 	}
 }

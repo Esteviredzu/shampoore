@@ -3,6 +3,7 @@ package silo
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type Config struct {
@@ -12,6 +13,8 @@ type Config struct {
 	Bucket    string `json:"bucket"`
 	UseSSL    bool   `json:"use_ssl"`
 	TunnelID  string `json:"tunnel_id"`
+
+	EncryptionPassword string `json:"encryption_password,omitempty"`
 
 	MinFileSizeKB  int `json:"min_file_size_kb"`
 	MaxFileSizeKB  int `json:"max_file_size_kb"`
@@ -44,6 +47,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TunnelID == "" {
 		c.TunnelID = "default"
+	}
+	if c.EncryptionPassword != "" && strings.TrimSpace(c.EncryptionPassword) == "" {
+		return errors.New("silo: encryption_password must not be blank")
 	}
 	if c.MinFileSizeKB <= 0 || c.MaxFileSizeKB < c.MinFileSizeKB {
 		return fmt.Errorf("silo: invalid file size bounds (min=%d KB, max=%d KB)", c.MinFileSizeKB, c.MaxFileSizeKB)

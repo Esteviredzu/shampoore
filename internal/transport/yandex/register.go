@@ -8,6 +8,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/core/reliability"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 func init() {
@@ -35,6 +36,7 @@ func init() {
 		Defaults:  defaults,
 		DecodeURL: decodeURL,
 		EncodeURL: encodeURL,
+		Validate:  validate,
 		Build:     buildTransport,
 	})
 	if err != nil {
@@ -93,14 +95,19 @@ func buildTransport(
 		Window:             eff.Int("reliable_window", 64),
 		ChunkSize:          eff.Int("reliable_chunk", 9000),
 		EncryptionPassword: s.EncryptionPassword,
+		Role:               role,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	bypass := []string{
+	bypassHosts := []string{
 		"boards.yandex.ru",
 		"socket63.boards.yandex.ru",
+	}
+	bypass := append([]string{}, bypassHosts...)
+	for _, host := range bypassHosts {
+		bypass = append(bypass, netdial.ResolveIPv4(ctx, host)...)
 	}
 
 	var sides []app.SideService
@@ -119,4 +126,14 @@ func buildTransport(
 		BypassHosts: bypass,
 		Side:        sides,
 	}, nil
+}
+
+func validate(raw json.RawMessage) error {
+	cfg := DefaultConfig()
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	return cfg.Validate()
 }

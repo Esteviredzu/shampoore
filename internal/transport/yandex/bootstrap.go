@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Esteviredzu/shampoore/internal/names"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 const (
@@ -45,8 +46,9 @@ func Bootstrap(ctx context.Context, hash string) (*Credentials, error) {
 
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
-		Timeout: httpTimeout,
-		Jar:     jar,
+		Timeout:   httpTimeout,
+		Jar:       jar,
+		Transport: netdial.NewHTTPTransport(),
 	}
 
 	cookieHeader, tokenValue, err := requestGuestToken(

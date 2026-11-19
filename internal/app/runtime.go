@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"errors"
+	"sync"
 
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/transport"
@@ -20,7 +22,9 @@ type Runtime struct {
 	ConnectedIPs func() []string
 	MuxConfig    MuxConfig
 	sideServices []SideService
-	started      bool
+
+	mu      sync.Mutex
+	started bool
 }
 
 func NewRuntime(
@@ -38,15 +42,26 @@ func NewRuntime(
 }
 
 func (r *Runtime) Start(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.started {
 		return nil
 	}
 	for i, svc := range r.sideServices {
 		if err := svc.Start(ctx); err != nil {
+			var cleanup []error
 			for j := i - 1; j >= 0; j-- {
-				_ = r.sideServices[j].Stop(ctx)
+				if stopErr := r.sideServices[j].Stop(ctx); stopErr != nil {
+					cleanup = append(cleanup, stopErr)
+				}
 			}
-			return err
+			if r.Provider != nil {
+				if stopErr := r.Provider.Stop(ctx); stopErr != nil {
+					cleanup = append(cleanup, stopErr)
+				}
+			}
+			return errors.Join(append([]error{err}, cleanup...)...)
 		}
 	}
 	r.started = true
@@ -54,15 +69,40 @@ func (r *Runtime) Start(ctx context.Context) error {
 }
 
 func (r *Runtime) Stop(ctx context.Context) error {
-	if !r.started {
-		return nil
-	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	started := r.started
 	r.started = false
-	for i := len(r.sideServices) - 1; i >= 0; i-- {
-		_ = r.sideServices[i].Stop(ctx)
+
+	var errs []error
+	if started {
+		for i := len(r.sideServices) - 1; i >= 0; i-- {
+			if err := r.sideServices[i].Stop(ctx); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
+
 	if r.Provider != nil {
-		_ = r.Provider.Stop(ctx)
+		if err := r.Provider.Stop(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func (r *Runtime) NotifyNetworkChanged() {
+	if r == nil {
+		return
+	}
+	if n, ok := r.Provider.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
+	}
+	if n, ok := r.StreamMux.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
+	}
+	if n, ok := r.Transport.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
+	}
 }

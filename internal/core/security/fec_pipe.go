@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/transport"
 	"github.com/klauspost/reedsolomon"
@@ -17,6 +18,9 @@ const (
 
 	fecShardHeaderSize = 7
 	fecBypassThreshold = 100
+
+	defaultMaxRecvGroups = 256
+	defaultFECGroupTTL   = 10 * time.Second
 )
 
 type FECPipe struct {
@@ -28,14 +32,19 @@ type FECPipe struct {
 	mu  sync.Mutex
 	seq uint32
 
-	recvMu     sync.Mutex
-	recvGroups map[uint32]*recvGroup
+	recvMu        sync.Mutex
+	recvGroups    map[uint32]*recvGroup
+	maxRecvGroups int
+	groupTTL      time.Duration
+	lastCleanup   time.Time
+	now           func() time.Time
 }
 
 type recvGroup struct {
-	shards [][]byte
-	parity [][]byte
-	total  int
+	shards    [][]byte
+	parity    [][]byte
+	total     int
+	createdAt time.Time
 }
 
 func NewFECPipe(inner transport.Pipe, dataShards, parityShards int) (*FECPipe, error) {
@@ -50,18 +59,65 @@ func NewFECPipe(inner transport.Pipe, dataShards, parityShards int) (*FECPipe, e
 		return nil, err
 	}
 	return &FECPipe{
-		inner:        inner,
-		dataShards:   dataShards,
-		parityShards: parityShards,
-		enc:          enc,
-		recvGroups:   make(map[uint32]*recvGroup),
+		inner:         inner,
+		dataShards:    dataShards,
+		parityShards:  parityShards,
+		enc:           enc,
+		recvGroups:    make(map[uint32]*recvGroup),
+		maxRecvGroups: defaultMaxRecvGroups,
+		groupTTL:      defaultFECGroupTTL,
+		now:           time.Now,
 	}, nil
+}
+
+func (p *FECPipe) currentTime() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
+}
+
+func (p *FECPipe) pruneLocked(now time.Time) {
+	if p.groupTTL <= 0 {
+		return
+	}
+	if !p.lastCleanup.IsZero() && now.Sub(p.lastCleanup) < p.groupTTL/2 {
+		return
+	}
+	p.lastCleanup = now
+	for seq, grp := range p.recvGroups {
+		if now.Sub(grp.createdAt) > p.groupTTL {
+			delete(p.recvGroups, seq)
+		}
+	}
+}
+
+func (p *FECPipe) evictOldestLocked() {
+	var oldestSeq uint32
+	var oldestAt time.Time
+	found := false
+	for seq, grp := range p.recvGroups {
+		if !found || grp.createdAt.Before(oldestAt) {
+			oldestSeq = seq
+			oldestAt = grp.createdAt
+			found = true
+		}
+	}
+	if found {
+		delete(p.recvGroups, oldestSeq)
+	}
 }
 
 func (p *FECPipe) Start(ctx context.Context) error { return p.inner.Start(ctx) }
 func (p *FECPipe) Stop(ctx context.Context) error  { return p.inner.Stop(ctx) }
-func (p *FECPipe) SessionID() string               { return p.inner.SessionID() }
-func (p *FECPipe) MaxMessageSize() int             { return p.inner.MaxMessageSize() }
+
+func (p *FECPipe) NotifyNetworkChanged() {
+	if n, ok := p.inner.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
+	}
+}
+func (p *FECPipe) SessionID() string   { return p.inner.SessionID() }
+func (p *FECPipe) MaxMessageSize() int { return p.inner.MaxMessageSize() }
 
 func (p *FECPipe) WalkLayers() []transport.Layer {
 	if tw, ok := p.inner.(transport.Telemetry); ok {
@@ -149,13 +205,19 @@ func (p *FECPipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 				continue
 			}
 
+			now := p.currentTime()
 			p.recvMu.Lock()
+			p.pruneLocked(now)
 			grp, ok := p.recvGroups[seq]
 			if !ok {
+				if p.maxRecvGroups > 0 && len(p.recvGroups) >= p.maxRecvGroups {
+					p.evictOldestLocked()
+				}
 				grp = &recvGroup{
-					shards: make([][]byte, p.dataShards),
-					parity: make([][]byte, p.parityShards),
-					total:  total,
+					shards:    make([][]byte, p.dataShards),
+					parity:    make([][]byte, p.parityShards),
+					total:     total,
+					createdAt: now,
 				}
 				p.recvGroups[seq] = grp
 			}

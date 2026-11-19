@@ -147,8 +147,10 @@ if systemctl is-active --quiet shampoore; then
   ✓ shampoore is running
 
     panel:     http://$LISTEN_NOW
-    open:      http://$LISTEN_NOW/?token=$TOKEN_NOW
+    open:      http://$LISTEN_NOW/
     token:     $TOKEN_NOW
+
+  Enter the token on the panel login page (it is kept in an HttpOnly cookie).
 
     logs:      journalctl -u shampoore -f
     configs:   $STATE_DIR/configs/

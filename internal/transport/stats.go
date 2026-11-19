@@ -1,11 +1,14 @@
 package transport
 
 import (
+	"encoding/json"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+const DefaultStatsCacheTTL = 750 * time.Millisecond
 
 type Snapshot struct {
 	NetworkSent  int64     `json:"network_sent"`
@@ -135,13 +138,91 @@ type AggregatedStats struct {
 	Subflows []SubflowStats `json:"subflows,omitempty"`
 }
 
+type JSONCache struct {
+	ttl time.Duration
+	now func() time.Time
+
+	mu       sync.Mutex
+	valid    bool
+	cachedAt time.Time
+	payload  []byte
+}
+
+func NewJSONCache(ttl time.Duration) *JSONCache {
+	if ttl <= 0 {
+		ttl = DefaultStatsCacheTTL
+	}
+	return &JSONCache{ttl: ttl, now: time.Now}
+}
+
+func (c *JSONCache) Get(build func() ([]byte, error)) ([]byte, error) {
+	if c == nil {
+		return build()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	if c.valid && now.Sub(c.cachedAt) < c.ttl {
+		return c.payload, nil
+	}
+
+	payload, err := build()
+	if err != nil {
+		return nil, err
+	}
+	c.payload = payload
+	c.cachedAt = now
+	c.valid = true
+	return payload, nil
+}
+
+func (c *JSONCache) Invalidate() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.valid = false
+	c.cachedAt = time.Time{}
+	c.payload = nil
+	c.mu.Unlock()
+}
+
 type StatsAggregator struct {
+	ttl time.Duration
+	now func() time.Time
+
 	mu     sync.Mutex
 	meters map[string]*RateMeter
+
+	hasCache bool
+	cachedAt time.Time
+	cached   AggregatedStats
+	cachedJS []byte
 }
 
 func NewStatsAggregator() *StatsAggregator {
-	return &StatsAggregator{meters: map[string]*RateMeter{}}
+	return NewStatsAggregatorWithTTL(DefaultStatsCacheTTL)
+}
+
+func NewStatsAggregatorWithTTL(ttl time.Duration) *StatsAggregator {
+	if ttl <= 0 {
+		ttl = DefaultStatsCacheTTL
+	}
+	return &StatsAggregator{
+		ttl:    ttl,
+		now:    time.Now,
+		meters: map[string]*RateMeter{},
+	}
+}
+
+func (a *StatsAggregator) Invalidate() {
+	a.mu.Lock()
+	a.hasCache = false
+	a.cachedAt = time.Time{}
+	a.cached = AggregatedStats{}
+	a.cachedJS = nil
+	a.mu.Unlock()
 }
 
 func (a *StatsAggregator) meter(key string) *RateMeter {
@@ -157,6 +238,47 @@ func (a *StatsAggregator) meter(key string) *RateMeter {
 }
 
 func (a *StatsAggregator) Update(layers []Layer) AggregatedStats {
+	stats, _, _ := a.snapshot(layers, false)
+	return stats
+}
+
+func (a *StatsAggregator) UpdateJSON(layers []Layer) (AggregatedStats, []byte, error) {
+	return a.snapshot(layers, true)
+}
+
+func (a *StatsAggregator) snapshot(layers []Layer, wantJSON bool) (AggregatedStats, []byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	now := a.now()
+	if a.hasCache && now.Sub(a.cachedAt) < a.ttl {
+		if wantJSON && a.cachedJS == nil {
+			data, err := json.Marshal(a.cached)
+			if err != nil {
+				return a.cached, nil, err
+			}
+			a.cachedJS = data
+		}
+		return a.cached, a.cachedJS, nil
+	}
+
+	out := a.aggregate(layers, now)
+	a.cached = out
+	a.cachedAt = now
+	a.hasCache = true
+	a.cachedJS = nil
+	if wantJSON {
+		data, err := json.Marshal(out)
+		if err != nil {
+			return out, nil, err
+		}
+		a.cachedJS = data
+		return out, data, nil
+	}
+	return out, nil, nil
+}
+
+func (a *StatsAggregator) aggregate(layers []Layer, now time.Time) AggregatedStats {
 	var appSent, appRecv, wireSent, wireRecv int64
 
 	for _, l := range layers {
@@ -175,7 +297,7 @@ func (a *StatsAggregator) Update(layers []Layer) AggregatedStats {
 		NetworkRecv: wireRecv,
 		UsefulSent:  appSent,
 		UsefulRecv:  appRecv,
-		Timestamp:   time.Now(),
+		Timestamp:   now,
 	}
 
 	subGroups := map[string][]Layer{}
@@ -198,9 +320,6 @@ func (a *StatsAggregator) Update(layers []Layer) AggregatedStats {
 		}
 		subs = append(subs, sf)
 	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	totalWireBoth := wireSent + wireRecv
 
@@ -234,7 +353,7 @@ func (a *StatsAggregator) Update(layers []Layer) AggregatedStats {
 			NetworkRecv: s.WireRecv,
 			UsefulSent:  s.UsefulSent,
 			UsefulRecv:  s.UsefulRecv,
-			Timestamp:   time.Now(),
+			Timestamp:   now,
 		})
 		out.Subflows = append(out.Subflows, *s)
 	}

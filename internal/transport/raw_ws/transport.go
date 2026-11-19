@@ -2,11 +2,11 @@ package raw_ws
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
@@ -41,29 +42,42 @@ const (
 
 	enqueueTimeout = 50 * time.Millisecond
 	sendQueueCap   = 4096
+
+	defaultReconnectDelay = 2 * time.Second
 )
 
 var frameMagic = [4]byte{'S', 'W', 'F', 'T'}
 
 const frameFlagBatched byte = 1
 
+type recvItem struct {
+	data []byte
+	err  error
+}
+
 type wsTransport struct {
 	cfg    Config
 	logger logging.ContextLogger
 
-	connMu sync.Mutex
-	conn   *websocket.Conn
-
-	recvCh    chan []byte
+	connMu    sync.Mutex
+	conn      *websocket.Conn
 	sendQueue chan []byte
+
+	flushMu sync.Mutex
+
+	recvCh chan recvItem
 
 	batchEnabled   bool
 	paddingEnabled bool
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	started  bool
-	wg       sync.WaitGroup
+	reconnectDelay time.Duration
+
+	stateMu sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started bool
+	wg      sync.WaitGroup
+
 	stopOnce sync.Once
 
 	bytesSent      atomic.Int64
@@ -73,33 +87,45 @@ type wsTransport struct {
 }
 
 func newTransport(cfg Config, logger logging.ContextLogger) *wsTransport {
-	t := &wsTransport{
+
+	ctx, cancel := context.WithCancel(context.Background())
+	return &wsTransport{
 		cfg:            cfg,
 		logger:         logger,
-		recvCh:         make(chan []byte, 256),
+		recvCh:         make(chan recvItem, 256),
 		batchEnabled:   cfg.Batch,
 		paddingEnabled: cfg.Padding,
+		reconnectDelay: defaultReconnectDelay,
+		ctx:            ctx,
+		cancel:         cancel,
 	}
-	if t.batchEnabled {
-		t.sendQueue = make(chan []byte, sendQueueCap)
+}
+
+func (t *wsTransport) transportCtx() context.Context {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return t
+	return ctx
 }
 
 func (t *wsTransport) Start(ctx context.Context) error {
+	t.stateMu.Lock()
 	if t.started {
+		t.stateMu.Unlock()
 		return nil
+	}
+	if t.cancel != nil {
+		t.cancel()
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.started = true
-
 	t.wg.Add(1)
-	go t.runLoop()
+	t.stateMu.Unlock()
 
-	if t.batchEnabled {
-		t.wg.Add(1)
-		go t.sendLoop()
-	}
+	go t.runLoop()
 
 	return nil
 }
@@ -107,31 +133,42 @@ func (t *wsTransport) Start(ctx context.Context) error {
 func (t *wsTransport) runLoop() {
 	defer t.wg.Done()
 
+	ctx := t.transportCtx()
+	reconnect := false
+
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
 
-		err := t.connectAndServe()
-		if err != nil {
-			if t.ctx.Err() == nil {
-				t.logger.Warn("raw_ws: connection lost, reconnecting in 2s: ", err)
+		established, err := t.connectAndServe(ctx, reconnect)
+		if established {
+			reconnect = true
+		}
+		if err != nil && ctx.Err() == nil {
+			delay := t.reconnectDelay
+			if delay <= 0 {
+				delay = defaultReconnectDelay
 			}
+			t.logger.Warn("raw_ws: connection lost, reconnecting in ", delay, ": ", err)
 			select {
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				return
-			case <-time.After(2 * time.Second):
+			case <-time.After(delay):
 			}
 		}
 	}
 }
 
-func (t *wsTransport) connectAndServe() error {
+func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (bool, error) {
+	if err := validateSecureServerURL(t.cfg.ServerURL, t.cfg.AllowInsecureWS); err != nil {
+		return false, err
+	}
 	wsURL, err := buildWSURL(t.cfg.ServerURL, t.cfg.Room)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	header := http.Header{}
@@ -139,13 +176,19 @@ func (t *wsTransport) connectAndServe() error {
 		header.Set("X-Room-Password", t.cfg.Password)
 	}
 
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, resp, err := dialer.DialContext(t.ctx, wsURL, header)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		NetDialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+			Control: netdial.Control,
+		}).DialContext,
+	}
+	conn, resp, err := dialer.DialContext(parent, wsURL, header)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
+			return false, fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
 		}
-		return fmt.Errorf("dial: %w", err)
+		return false, fmt.Errorf("dial: %w", err)
 	}
 
 	conn.SetReadLimit(maxWSPayload)
@@ -154,36 +197,117 @@ func (t *wsTransport) connectAndServe() error {
 		return conn.SetReadDeadline(time.Now().Add(readIdleTimout))
 	})
 
+	var queue chan []byte
+	if t.batchEnabled {
+		queue = make(chan []byte, sendQueueCap)
+	}
+
 	t.connMu.Lock()
 	t.conn = conn
+	t.sendQueue = queue
 	t.connMu.Unlock()
+
+	if reconnect {
+
+		t.signalReset()
+	}
 
 	t.logger.Info("raw_ws: connected (room=", t.cfg.Room, ")")
 
-	errCh := make(chan error, 2)
-	go t.readLoop(conn, errCh)
-	go t.pingLoop(conn, errCh)
+	connCtx, connCancel := context.WithCancel(parent)
+
+	var connWg sync.WaitGroup
+	errCh := make(chan error, 3)
+
+	connWg.Add(1)
+	go func() {
+		defer connWg.Done()
+		t.readLoop(connCtx, conn, errCh)
+	}()
+	connWg.Add(1)
+	go func() {
+		defer connWg.Done()
+		t.pingLoop(connCtx, conn, errCh)
+	}()
+	if queue != nil {
+		connWg.Add(1)
+		go func() {
+			defer connWg.Done()
+			t.sendLoop(connCtx, queue, errCh)
+		}()
+	}
 
 	var runErr error
 	select {
-	case <-t.ctx.Done():
+	case <-parent.Done():
 		runErr = nil
 	case err := <-errCh:
 		runErr = err
 	}
 
+	connCancel()
+	t.detachConn(conn)
+	connWg.Wait()
+
+	return true, runErr
+}
+
+func (t *wsTransport) detachConn(conn *websocket.Conn) {
 	_ = conn.Close()
 	t.connMu.Lock()
-	t.conn = nil
+	if t.conn == conn {
+		t.conn = nil
+		t.sendQueue = nil
+	}
 	t.connMu.Unlock()
+}
 
-	return runErr
+func (t *wsTransport) signalReset() {
+	dropped := 0
+drain:
+	for {
+		select {
+		case item := <-t.recvCh:
+			if item.err == nil {
+				dropped++
+			}
+		default:
+			break drain
+		}
+	}
+	if dropped > 0 && t.logger != nil {
+		t.logger.Warn("raw_ws: dropped ", dropped, " stale messages of the previous session")
+	}
+
+	resetErr := fmt.Errorf("%w: raw_ws: session reconnected", transport.ErrTransportReset)
+	select {
+	case t.recvCh <- recvItem{err: resetErr}:
+	case <-t.transportCtx().Done():
+	}
+}
+
+func (t *wsTransport) NotifyNetworkChanged() {
+	t.connMu.Lock()
+	conn := t.conn
+	t.connMu.Unlock()
+	if conn == nil {
+		return
+	}
+	if t.logger != nil {
+		t.logger.Info("raw_ws: network changed, reconnecting")
+	}
+	if err := conn.Close(); err != nil && t.logger != nil {
+		t.logger.Debug("raw_ws: close for reconnect: ", err)
+	}
 }
 
 func (t *wsTransport) Stop(ctx context.Context) error {
 	t.stopOnce.Do(func() {
-		if t.cancel != nil {
-			t.cancel()
+		t.stateMu.Lock()
+		cancel := t.cancel
+		t.stateMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 	})
 	t.wg.Wait()
@@ -203,39 +327,66 @@ func (t *wsTransport) Send(ctx context.Context, data []byte) error {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
+	t.connMu.Lock()
+	queue := t.sendQueue
+	t.connMu.Unlock()
+	if queue == nil {
+
+		return fmt.Errorf("%w: raw_ws: no active connection", transport.ErrTransportReset)
+	}
+
 	timer := time.NewTimer(enqueueTimeout)
 	defer timer.Stop()
 
 	select {
-	case t.sendQueue <- cp:
-		return nil
+	case queue <- cp:
 	case <-timer.C:
 		return errors.New("raw_ws: send queue full")
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-t.ctx.Done():
+	case <-t.transportCtx().Done():
 		return errors.New("raw_ws: transport stopped")
+	}
+
+	t.connMu.Lock()
+	live := t.sendQueue == queue
+	t.connMu.Unlock()
+	if !live {
+		return fmt.Errorf("%w: raw_ws: connection lost while enqueuing", transport.ErrTransportReset)
+	}
+	return nil
+}
+
+func reportErr(errCh chan<- error, err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case errCh <- err:
+	default:
 	}
 }
 
-func (t *wsTransport) sendLoop() {
-	defer t.wg.Done()
-
+func (t *wsTransport) sendLoop(ctx context.Context, queue <-chan []byte, errCh chan<- error) {
 	var batch [][]byte
 	var batchBytes int
 
-	flush := func() {
+	flush := func() error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
 		frame := encodeFrame(batch, true, t.paddingEnabled)
-		if err := t.sendRaw(t.ctx, frame); err != nil {
-			if t.ctx.Err() == nil {
-				t.logger.Warn("raw_ws: flush batch: ", err)
+		if err := t.sendRaw(ctx, frame); err != nil {
+
+			if t.logger != nil {
+				t.logger.Warn("raw_ws: flush batch failed (", len(batch), " msgs / ",
+					batchBytes, " bytes): ", err)
 			}
+			return err
 		}
 		batch = nil
 		batchBytes = 0
+		return nil
 	}
 
 	timer := time.NewTimer(t.nextFlushDelay())
@@ -243,14 +394,19 @@ func (t *wsTransport) sendLoop() {
 
 	for {
 		select {
-		case <-t.ctx.Done():
-			flush()
+		case <-ctx.Done():
+			if err := flush(); err != nil && t.logger != nil {
+				t.logger.Debug("raw_ws: final flush during shutdown: ", err)
+			}
 			return
-		case msg := <-t.sendQueue:
+		case msg := <-queue:
 			batch = append(batch, msg)
 			batchBytes += len(msg)
 			if batchBytes >= maxBatchPayload {
-				flush()
+				if err := flush(); err != nil {
+					reportErr(errCh, err)
+					return
+				}
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
@@ -260,54 +416,59 @@ func (t *wsTransport) sendLoop() {
 				timer.Reset(t.nextFlushDelay())
 			}
 		case <-timer.C:
-			flush()
+			if err := flush(); err != nil {
+				reportErr(errCh, err)
+				return
+			}
 			timer.Reset(t.nextFlushDelay())
 		}
 	}
 }
 
 func (t *wsTransport) nextFlushDelay() time.Duration {
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(batchJitterMax)))
-	if err != nil {
-		return batchBaseDelay
-	}
-	return batchBaseDelay + time.Duration(n.Int64())
+	return batchBaseDelay + time.Duration(rand.IntN(int(batchJitterMax)))
 }
 
 func (t *wsTransport) sendRaw(ctx context.Context, data []byte) error {
-	for {
-		t.connMu.Lock()
-		conn := t.conn
-		t.connMu.Unlock()
-
-		if conn != nil {
-			_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			err := conn.WriteMessage(websocket.BinaryMessage, data)
-			if err == nil {
-				t.bytesSent.Add(int64(len(data)))
-				t.ctr.NetworkSent.Add(int64(len(data)))
-				return nil
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.ctx.Done():
-			return errors.New("raw_ws: transport stopped")
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+
+	t.connMu.Lock()
+	conn := t.conn
+	t.connMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("%w: raw_ws: no active connection", transport.ErrTransportReset)
+	}
+
+	t.flushMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := conn.WriteMessage(websocket.BinaryMessage, data)
+	t.flushMu.Unlock()
+
+	if err != nil {
+
+		t.detachConn(conn)
+		return fmt.Errorf("raw_ws: write: %w", err)
+	}
+
+	t.bytesSent.Add(int64(len(data)))
+	t.ctr.NetworkSent.Add(int64(len(data)))
+	return nil
 }
 
 func (t *wsTransport) Receive(ctx context.Context) ([]byte, error) {
+	tctx := t.transportCtx()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-t.ctx.Done():
-		return nil, t.ctx.Err()
-	case data := <-t.recvCh:
-		return data, nil
+	case <-tctx.Done():
+		return nil, tctx.Err()
+	case item := <-t.recvCh:
+		if item.err != nil {
+			return nil, item.err
+		}
+		return item.data, nil
 	}
 }
 
@@ -321,11 +482,11 @@ func (t *wsTransport) WalkLayers() []transport.Layer {
 	}}
 }
 
-func (t *wsTransport) readLoop(conn *websocket.Conn, errCh chan<- error) {
+func (t *wsTransport) readLoop(ctx context.Context, conn *websocket.Conn, errCh chan<- error) {
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			errCh <- err
+			reportErr(errCh, err)
 			return
 		}
 		t.bytesDelivered.Add(int64(len(data)))
@@ -338,28 +499,55 @@ func (t *wsTransport) readLoop(conn *websocket.Conn, errCh chan<- error) {
 
 		for _, m := range msgs {
 			select {
-			case t.recvCh <- m:
-			case <-t.ctx.Done():
+			case <-ctx.Done():
+				return
+			default:
+			}
+			select {
+			case t.recvCh <- recvItem{data: m}:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}
 }
 
-func (t *wsTransport) pingLoop(conn *websocket.Conn, errCh chan<- error) {
+func (t *wsTransport) pingLoop(ctx context.Context, conn *websocket.Conn, errCh chan<- error) {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(pingDeadline)); err != nil {
-				errCh <- err
+				reportErr(errCh, err)
 				return
 			}
 		}
+	}
+}
+
+func validateSecureServerURL(raw string, allowInsecure bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return errors.New("raw_ws: server_url is empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("raw_ws: invalid server_url: %q", raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "wss", "https":
+		return nil
+	case "ws", "http":
+		if !allowInsecure {
+			return errors.New("raw_ws: insecure ws:// is disabled; use wss:// or set allow_insecure_ws: true")
+		}
+		return nil
+	default:
+		return fmt.Errorf("raw_ws: invalid scheme: %s", u.Scheme)
 	}
 }
 
@@ -397,16 +585,13 @@ func buildWSURL(base, room string) (string, error) {
 }
 
 func encodeFrame(msgs [][]byte, batched, padding bool) []byte {
-	var payload []byte
+	payloadLen := 0
 	if batched {
 		for _, m := range msgs {
-			var l [4]byte
-			binary.BigEndian.PutUint32(l[:], uint32(len(m)))
-			payload = append(payload, l[:]...)
-			payload = append(payload, m...)
+			payloadLen += 4 + len(m)
 		}
-	} else {
-		payload = msgs[0]
+	} else if len(msgs) > 0 {
+		payloadLen = len(msgs[0])
 	}
 
 	var flags byte
@@ -416,18 +601,34 @@ func encodeFrame(msgs [][]byte, batched, padding bool) []byte {
 
 	var padLen int
 	if padding {
-		padLen = randomPadLen(len(payload))
+		padLen = randomPadLen(payloadLen)
 	}
 
-	out := make([]byte, frameHeaderSize+len(payload)+padLen)
-	copy(out[0:4], frameMagic[:])
-	out[4] = frameVersion
-	out[5] = flags
-	binary.BigEndian.PutUint16(out[6:8], uint16(padLen))
-	binary.BigEndian.PutUint32(out[8:12], uint32(len(payload)))
-	copy(out[frameHeaderSize:], payload)
+	totalLen := frameHeaderSize + payloadLen + padLen
+	out := make([]byte, 0, totalLen)
+	out = append(out, frameMagic[:]...)
+	out = append(out, frameVersion, flags)
+
+	var tmp [4]byte
+	binary.BigEndian.PutUint16(tmp[0:2], uint16(padLen))
+	out = append(out, tmp[0:2]...)
+	binary.BigEndian.PutUint32(tmp[0:4], uint32(payloadLen))
+	out = append(out, tmp[:]...)
+
+	if batched {
+		for _, m := range msgs {
+			binary.BigEndian.PutUint32(tmp[0:4], uint32(len(m)))
+			out = append(out, tmp[:]...)
+			out = append(out, m...)
+		}
+	} else if len(msgs) > 0 {
+		out = append(out, msgs[0]...)
+	}
+
 	if padLen > 0 {
-		_, _ = rand.Read(out[frameHeaderSize+len(payload):])
+		start := len(out)
+		out = out[:start+padLen]
+		fillRandom(out[start:])
 	}
 	return out
 }
@@ -474,19 +675,25 @@ func decodeFrame(data []byte) ([][]byte, bool) {
 }
 
 func randomPadLen(payloadLen int) int {
-	base, err := rand.Int(rand.Reader, big.NewInt(int64(maxPadExtra)))
-	if err != nil {
-		return 0
-	}
-	target := minPadTotal + int(base.Int64())
+	target := minPadTotal + rand.IntN(maxPadExtra)
 	if payloadLen < target {
 		return target - payloadLen
 	}
-	extra, err := rand.Int(rand.Reader, big.NewInt(int64(smallPadExtra)))
-	if err != nil {
-		return 0
+	return rand.IntN(smallPadExtra)
+}
+
+func fillRandom(b []byte) {
+	for len(b) >= 8 {
+		binary.LittleEndian.PutUint64(b, rand.Uint64())
+		b = b[8:]
 	}
-	return int(extra.Int64())
+	if len(b) > 0 {
+		v := rand.Uint64()
+		for i := range b {
+			b[i] = byte(v)
+			v >>= 8
+		}
+	}
 }
 
 var _ transport.Transport = (*wsTransport)(nil)

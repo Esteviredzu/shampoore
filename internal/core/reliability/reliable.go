@@ -24,6 +24,14 @@ const (
 	defaultWindow      = 64
 	sendWindowTimeout  = 10 * time.Second
 	sessionCooldown    = 5 * time.Second
+
+	defaultAckBatchMs = 20
+
+	maxAssembledMessageSize = 4 << 20
+
+	maxBufferedIncomingBytes = 16 << 20
+
+	maxUnexpectedRemoteSessions = 64
 )
 
 type Config struct {
@@ -32,10 +40,12 @@ type Config struct {
 	AckBatchMs         int
 	AckDisabled        bool
 	EncryptionPassword string
+
+	Role string
 }
 
 func DefaultConfig() Config {
-	return Config{Window: defaultWindow}
+	return Config{Window: defaultWindow, AckBatchMs: defaultAckBatchMs}
 }
 
 type pendingPacket struct {
@@ -75,6 +85,8 @@ type ReliableSession struct {
 	nextSendSequence int
 	spaceCh          chan struct{}
 
+	encrypted bool
+
 	wakeRetry chan struct{}
 
 	recvMu              sync.Mutex
@@ -82,6 +94,9 @@ type ReliableSession struct {
 	nextACKSequence     int
 	incomingChunks      map[int]map[int][]byte
 	incomingTotals      map[int]int
+	incomingSizes       map[int]int
+	incomingBytes       int
+	maxChunksPerMessage int
 	completedPackets    map[int][]byte
 
 	pendingACKSession string
@@ -96,12 +111,13 @@ type ReliableSession struct {
 
 	ctr transport.Counters
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
-	closed  bool
-	wg      sync.WaitGroup
-	ackWg   sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	started  bool
+	starting bool
+	closed   bool
+	wg       sync.WaitGroup
+	ackWg    sync.WaitGroup
 }
 
 func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Config) (*ReliableSession, error) {
@@ -109,12 +125,18 @@ func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Conf
 		cfg.Window = defaultWindow
 	}
 
+	if cfg.AckBatchMs <= 0 {
+		cfg.AckBatchMs = defaultAckBatchMs
+	}
+
+	encrypted := false
 	if cfg.EncryptionPassword != "" {
-		wrapped, err := security.WrapPipe(pipe, cfg.EncryptionPassword, log)
+		wrapped, err := security.WrapPipeWithRole(pipe, cfg.EncryptionPassword, cfg.Role, log)
 		if err != nil {
 			return nil, err
 		}
 		pipe = wrapped
+		encrypted = true
 		log.Info("reliable: encryption enabled")
 	}
 
@@ -137,16 +159,30 @@ func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Conf
 		return nil, err
 	}
 
+	maxChunksPerMessage := maxAssembledMessageSize / chunkSize
+	if maxAssembledMessageSize%chunkSize != 0 {
+		maxChunksPerMessage++
+	}
+	if maxChunksPerMessage < 1 {
+		maxChunksPerMessage = 1
+	}
+	if maxChunksPerMessage > maxChunks {
+		maxChunksPerMessage = maxChunks
+	}
+
 	s := &ReliableSession{
 		pipe:                     pipe,
 		codec:                    codec,
 		logger:                   log,
 		cfg:                      cfg,
+		encrypted:                encrypted,
 		unexpectedRemoteSessions: make(map[string]bool),
 		pendingPackets:           make(map[int]*pendingPacket),
 		spaceCh:                  make(chan struct{}, 1),
 		incomingChunks:           make(map[int]map[int][]byte),
 		incomingTotals:           make(map[int]int),
+		incomingSizes:            make(map[int]int),
+		maxChunksPerMessage:      maxChunksPerMessage,
 		completedPackets:         make(map[int][]byte),
 		receiveQueue:             make(chan any, 512),
 		wakeRetry:                make(chan struct{}, 1),
@@ -155,8 +191,7 @@ func NewReliableSession(pipe transport.Pipe, log logging.ContextLogger, cfg Conf
 
 	if cfg.AckDisabled {
 		log.Warn("reliable: ACK disabled")
-	}
-	if cfg.AckBatchMs > 0 {
+	} else {
 		log.Info("reliable: ack batching every ", cfg.AckBatchMs, "ms")
 	}
 	return s, nil
@@ -188,32 +223,62 @@ func (s *ReliableSession) WalkLayers() []transport.Layer {
 }
 
 func (s *ReliableSession) Start(ctx context.Context) error {
-	if s.started {
+	s.sendMu.Lock()
+	if s.started || s.starting {
+		s.sendMu.Unlock()
 		return nil
 	}
+	if s.closed {
+		s.sendMu.Unlock()
+		return errors.New("reliable: session closed")
+	}
+	s.starting = true
+	s.sendMu.Unlock()
+
 	if err := s.pipe.Start(ctx); err != nil {
+		s.sendMu.Lock()
+		s.starting = false
+		s.sendMu.Unlock()
 		return err
 	}
 
+	s.sendMu.Lock()
+	if s.closed {
+		s.starting = false
+		s.sendMu.Unlock()
+		if err := s.pipe.Stop(context.Background()); err != nil {
+			s.logger.Warn("reliable: pipe stop after aborted start: ", err)
+		}
+		return errors.New("reliable: session closed during start")
+	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.ownSessionID = uuid.NewString()
 	s.nextSendSequence = 0
+	s.recvMu.Lock()
 	s.nextReceiveSequence = 0
 	s.nextACKSequence = 0
+	s.recvMu.Unlock()
 	s.started = true
+	s.starting = false
+
+	ackFlush := s.cfg.AckBatchMs > 0 && !s.cfg.AckDisabled
 
 	s.wg.Add(2)
-	go s.receiveLoop()
-	go s.retryLoop()
-	if s.cfg.AckBatchMs > 0 && !s.cfg.AckDisabled {
+	if ackFlush {
 		s.wg.Add(1)
-		go s.ackFlushLoop()
 	}
+	s.sendMu.Unlock()
 
 	s.logger.Info("reliable: started; session=", s.ownSessionID,
 		" window=", s.cfg.Window,
 		" ack_disabled=", s.cfg.AckDisabled,
 		" ack_batch_ms=", s.cfg.AckBatchMs)
+
+	go s.receiveLoop()
+	go s.retryLoop()
+	if ackFlush {
+		go s.ackFlushLoop()
+	}
 	return nil
 }
 
@@ -224,14 +289,15 @@ func (s *ReliableSession) Stop(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	cancel := s.cancel
 	s.sendMu.Unlock()
 
 	s.recvMu.Lock()
 	s.ackCond.Broadcast()
 	s.recvMu.Unlock()
 
-	if s.cancel != nil {
-		s.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	s.wg.Wait()
 	s.ackWg.Wait()
@@ -322,12 +388,16 @@ func (s *ReliableSession) Receive(ctx context.Context) ([]byte, error) {
 		case *resetMarker:
 			return nil, fmt.Errorf("%w: %s", transport.ErrTransportReset, v.reason)
 		case receivedPacket:
-			if v.sequence != s.nextACKSequence {
+			s.recvMu.Lock()
+			expected := s.nextACKSequence
+			if v.sequence != expected {
+				s.recvMu.Unlock()
 				return nil, fmt.Errorf(
 					"receive sequence mismatch: expected %d, got %d",
-					s.nextACKSequence, v.sequence)
+					expected, v.sequence)
 			}
 			s.nextACKSequence++
+			s.recvMu.Unlock()
 
 			if !s.cfg.AckDisabled {
 				if s.cfg.AckBatchMs > 0 {
@@ -509,13 +579,29 @@ func (s *ReliableSession) receiveLoop() {
 		}
 
 		s.ctr.NetworkRecv.Add(int64(len(raw)))
-
-		pkt := s.codec.Decode(raw)
-		if pkt == nil {
-			continue
-		}
-		s.dispatch(pkt)
+		s.handleRaw(raw)
 	}
+}
+
+func (s *ReliableSession) handleRaw(raw []byte) {
+	if s.encrypted && !pipeAuthenticated(s.pipe) {
+		s.logger.Error("reliable: dropping unauthenticated packet from insecure pipe")
+		return
+	}
+	pkt := s.codec.Decode(raw)
+	if pkt == nil {
+		return
+	}
+	s.dispatch(pkt)
+}
+
+type authenticatedPipe interface {
+	Authenticated() bool
+}
+
+func pipeAuthenticated(p transport.Pipe) bool {
+	a, ok := p.(authenticatedPipe)
+	return ok && a.Authenticated()
 }
 
 func (s *ReliableSession) dispatch(pkt *DecodedPacket) {
@@ -565,6 +651,10 @@ func (s *ReliableSession) acceptRemoteSession(sessionID string) bool {
 	s.remoteSessionID = sessionID
 	s.lastSessionChange = now
 	if !s.unexpectedRemoteSessions[sessionID] {
+
+		if len(s.unexpectedRemoteSessions) >= maxUnexpectedRemoteSessions {
+			s.unexpectedRemoteSessions = make(map[string]bool)
+		}
 		s.unexpectedRemoteSessions[sessionID] = true
 	}
 	s.remoteMu.Unlock()
@@ -578,6 +668,8 @@ func (s *ReliableSession) resetForNewRemoteSession() {
 	s.recvMu.Lock()
 	s.incomingChunks = make(map[int]map[int][]byte)
 	s.incomingTotals = make(map[int]int)
+	s.incomingSizes = make(map[int]int)
+	s.incomingBytes = 0
 	s.completedPackets = make(map[int][]byte)
 	s.ackDirty = false
 	s.nextReceiveSequence = 0
@@ -641,20 +733,14 @@ func (s *ReliableSession) safeDelete(key string) {
 
 func (s *ReliableSession) processChunk(pkt *DecodedPacket) {
 	seq := pkt.Sequence
+	var ready []receivedPacket
+
 	s.recvMu.Lock()
 
 	if seq < s.nextReceiveSequence {
 		if seq < s.nextACKSequence && !s.cfg.AckDisabled {
 			lastSeen := s.nextACKSequence - 1
-			if s.cfg.AckBatchMs > 0 {
-				s.markACKDirtyLocked(pkt.SessionID, lastSeen)
-			} else {
-				s.ackWg.Add(1)
-				go func(sid string, sq int) {
-					defer s.ackWg.Done()
-					s.sendACKSafe(sid, sq)
-				}(pkt.SessionID, lastSeen)
-			}
+			s.markACKDirtyLocked(pkt.SessionID, lastSeen)
 		}
 		s.recvMu.Unlock()
 		return
@@ -664,6 +750,14 @@ func (s *ReliableSession) processChunk(pkt *DecodedPacket) {
 		return
 	}
 	if _, done := s.completedPackets[seq]; done {
+		s.recvMu.Unlock()
+		return
+	}
+	if pkt.TotalChunks <= 0 || pkt.TotalChunks > s.maxChunksPerMessage {
+		s.recvMu.Unlock()
+		return
+	}
+	if pkt.ChunkIndex < 0 || pkt.ChunkIndex >= pkt.TotalChunks {
 		s.recvMu.Unlock()
 		return
 	}
@@ -680,47 +774,104 @@ func (s *ReliableSession) processChunk(pkt *DecodedPacket) {
 		s.recvMu.Unlock()
 		return
 	}
+	if len(pkt.Data) > maxAssembledMessageSize ||
+		s.incomingSizes[seq]+len(pkt.Data) > maxAssembledMessageSize ||
+		s.incomingBytes+len(pkt.Data) > maxBufferedIncomingBytes {
+		s.dropIncomingLocked(seq)
+		s.recvMu.Unlock()
+		return
+	}
 	chunks[pkt.ChunkIndex] = pkt.Data
+	s.incomingSizes[seq] += len(pkt.Data)
+	s.incomingBytes += len(pkt.Data)
+
 	if len(chunks) != pkt.TotalChunks {
 		s.recvMu.Unlock()
 		return
 	}
-	full := make([]byte, 0)
+
+	totalSize := 0
+	for i := 0; i < pkt.TotalChunks; i++ {
+		chunk, ok := chunks[i]
+		if !ok {
+			s.dropIncomingLocked(seq)
+			s.recvMu.Unlock()
+			return
+		}
+		totalSize += len(chunk)
+	}
+	if totalSize > maxAssembledMessageSize {
+		s.dropIncomingLocked(seq)
+		s.recvMu.Unlock()
+		return
+	}
+
+	full := make([]byte, 0, totalSize)
 	for i := 0; i < pkt.TotalChunks; i++ {
 		full = append(full, chunks[i]...)
 	}
+	s.dropIncomingLocked(seq)
+	s.completedPackets[seq] = full
+	ready = s.flushCompletedLocked(pkt.SessionID)
+	s.recvMu.Unlock()
+
+	s.deliverCompleted(ready)
+}
+
+func (s *ReliableSession) dropIncomingLocked(seq int) {
+	for _, chunk := range s.incomingChunks[seq] {
+		s.incomingBytes -= len(chunk)
+	}
+	if s.incomingBytes < 0 {
+		s.incomingBytes = 0
+	}
 	delete(s.incomingChunks, seq)
 	delete(s.incomingTotals, seq)
-	s.completedPackets[seq] = full
-	s.flushCompletedLocked(pkt.SessionID)
-	s.recvMu.Unlock()
+	delete(s.incomingSizes, seq)
 }
 
 func (s *ReliableSession) markACKDirtyLocked(sessionID string, seq int) {
+	if s.ackDirty && seq < s.pendingACKSeq {
+
+		return
+	}
 	s.pendingACKSession = sessionID
 	s.pendingACKSeq = seq
 	s.ackDirty = true
 	s.ackCond.Signal()
 }
 
-func (s *ReliableSession) flushCompletedLocked(sessionID string) {
+func (s *ReliableSession) flushCompletedLocked(sessionID string) []receivedPacket {
+	var ready []receivedPacket
 	for {
 		full, ok := s.completedPackets[s.nextReceiveSequence]
 		if !ok {
-			return
+			return ready
 		}
 		delete(s.completedPackets, s.nextReceiveSequence)
-		pkt := receivedPacket{
+		ready = append(ready, receivedPacket{
 			sequence:  s.nextReceiveSequence,
 			sessionID: sessionID,
 			data:      full,
-		}
+		})
+		s.nextReceiveSequence++
+	}
+}
+
+func (s *ReliableSession) deliverCompleted(pkts []receivedPacket) {
+	if len(pkts) == 0 {
+		return
+	}
+	var done <-chan struct{}
+	if s.ctx != nil {
+		done = s.ctx.Done()
+	}
+	for _, pkt := range pkts {
 		select {
 		case s.receiveQueue <- pkt:
-		case <-s.ctx.Done():
+		case <-done:
 			return
 		}
-		s.nextReceiveSequence++
 	}
 }
 
@@ -742,6 +893,8 @@ func (s *ReliableSession) signalTransportReset(reason string) {
 	s.recvMu.Lock()
 	s.incomingChunks = make(map[int]map[int][]byte)
 	s.incomingTotals = make(map[int]int)
+	s.incomingSizes = make(map[int]int)
+	s.incomingBytes = 0
 	s.completedPackets = make(map[int][]byte)
 	s.ackDirty = false
 	s.nextReceiveSequence = 0
@@ -773,6 +926,12 @@ push:
 	select {
 	case s.receiveQueue <- &resetMarker{reason: reason}:
 	default:
+	}
+}
+
+func (s *ReliableSession) NotifyNetworkChanged() {
+	if n, ok := s.pipe.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
 	}
 }
 

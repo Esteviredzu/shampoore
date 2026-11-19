@@ -15,6 +15,6 @@ func StartTUN(ctx context.Context, cfg TUNConfig, m multiplexing.StreamMultiplex
 	return errTUNUnsupported
 }
 
-func StartTUNFD(ctx context.Context, fd int, mtu int) error {
-	return errTUNUnsupported
+func StartTUNFD(ctx context.Context, fd int, mtu int) (<-chan error, error) {
+	return nil, errTUNUnsupported
 }

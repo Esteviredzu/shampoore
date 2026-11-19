@@ -3,10 +3,17 @@ package silo
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/url"
+	"strings"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 func init() {
@@ -28,11 +35,19 @@ func init() {
 		Defaults:  defaults,
 		EncodeURL: encodeURL,
 		DecodeURL: decodeURL,
+		Validate:  validate,
 		Build:     build,
 	})
 	if err != nil {
 		panic(err)
 	}
+}
+
+func wrapEncryption(inner transport.Pipe, password, role string, logger logging.ContextLogger) (transport.Pipe, error) {
+	if password == "" {
+		return inner, nil
+	}
+	return security.WrapPipeWithRole(inner, password, role, logger)
 }
 
 func build(
@@ -57,14 +72,44 @@ func build(
 		return nil, err
 	}
 
-	if err := pipe.Start(ctx); err != nil {
+	password := s.EncryptionPassword
+	if cfg.EncryptionPassword != "" {
+		if password != "" && password != cfg.EncryptionPassword {
+			return nil, errors.New("silo: settings and transport encryption passwords differ")
+		}
+		password = cfg.EncryptionPassword
+	}
+
+	var secured transport.Pipe = pipe
+	if password != "" {
+		wrapped, err := wrapEncryption(pipe, password, role, logger)
+		if err != nil {
+			return nil, fmt.Errorf("silo: wrap encryption: %w", err)
+		}
+		secured = wrapped
+		logger.Info("silo: XChaCha20-Poly1305 encryption enabled")
+	}
+
+	if err := secured.Start(ctx); err != nil {
 		return nil, err
 	}
 
 	logger.Info("silo: ready (endpoint=", cfg.Endpoint, ", bucket=", cfg.Bucket, ", role=", role, ")")
 
+	host := cfg.Endpoint
+	if h, _, err := net.SplitHostPort(cfg.Endpoint); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	bypass := []string{}
+	if host != "" {
+		bypass = append(bypass, host)
+		bypass = append(bypass, netdial.ResolveIPv4(ctx, host)...)
+	}
+
 	return &app.BuildResult{
-		Transport: newTransport(pipe),
+		Transport:   newTransport(secured),
+		BypassHosts: bypass,
 	}, nil
 }
 
@@ -74,6 +119,7 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	cfg.Bucket = q.Get("bucket")
 	cfg.AccessKey = q.Get("access_key")
 	cfg.SecretKey = q.Get("secret_key")
+	cfg.EncryptionPassword = q.Get("encryption_password")
 	return json.Marshal(cfg)
 }
 
@@ -86,5 +132,18 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	q.Set("bucket", cfg.Bucket)
 	q.Set("access_key", cfg.AccessKey)
 	q.Set("secret_key", cfg.SecretKey)
+	if cfg.EncryptionPassword != "" {
+		q.Set("encryption_password", cfg.EncryptionPassword)
+	}
 	return nil
+}
+
+func validate(raw json.RawMessage) error {
+	cfg := DefaultConfig()
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	return cfg.Validate()
 }

@@ -54,6 +54,7 @@ func init() {
 		Defaults:  defaults,
 		DecodeURL: telemost.DecodeURL,
 		EncodeURL: telemost.EncodeURL,
+		Validate:  validate,
 		Build:     build,
 	})
 	if err != nil {
@@ -85,6 +86,7 @@ func build(
 
 	providerPipe := telemost.NewPipe(&cfg, boot, logger)
 	if err := providerPipe.Start(ctx); err != nil {
+		_ = providerPipe.Stop(ctx)
 		return nil, fmt.Errorf("yandex_telemost_raw: signaling start: %w", err)
 	}
 	tunnel := providerPipe.Tunnel()
@@ -127,6 +129,7 @@ func build(
 		FECParityShards: eff.Int("fec_parity_shards", 3),
 
 		EncryptionPassword: s.EncryptionPassword,
+		Role:               role,
 	}
 	inner, err := kcp.NewSession(rawPipe, logger, kcpCfg)
 	if err != nil {
@@ -160,4 +163,14 @@ func build(
 		BypassHosts:  providerPipe.BypassHosts(),
 		ConnectedIPs: providerPipe.ConnectedIPs,
 	}, nil
+}
+
+func validate(raw json.RawMessage) error {
+	cfg := telemost.DefaultConfig()
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	return cfg.Validate()
 }

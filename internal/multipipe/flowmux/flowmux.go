@@ -31,6 +31,7 @@ type Config struct {
 	FlushThreshold int
 	FlushInterval  time.Duration
 	SampleInterval time.Duration
+	StatsTTL       time.Duration
 }
 
 func DefaultConfig() Config {
@@ -38,6 +39,7 @@ func DefaultConfig() Config {
 		FlushThreshold: 12000,
 		FlushInterval:  20 * time.Millisecond,
 		SampleInterval: 2 * time.Second,
+		StatsTTL:       transport.DefaultStatsCacheTTL,
 	}
 }
 
@@ -56,6 +58,11 @@ type subflow struct {
 	lastSampleAt  time.Time
 }
 
+type cachedLayers struct {
+	at     time.Time
+	layers []transport.Layer
+}
+
 type FlowMux struct {
 	subflows []*subflow
 	logger   logging.ContextLogger
@@ -64,9 +71,12 @@ type FlowMux struct {
 	incoming    chan multiplexing.Stream
 	pickCount   atomic.Uint32
 	firstOpenAt atomic.Int64
+	layerCache  atomic.Pointer[cachedLayers]
 
-	ctx     context.Context
-	cancel  context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stateMu sync.Mutex
 	started bool
 	wg      sync.WaitGroup
 }
@@ -89,6 +99,9 @@ func New(
 	if cfg.SampleInterval <= 0 {
 		cfg.SampleInterval = 2 * time.Second
 	}
+	if cfg.StatsTTL <= 0 {
+		cfg.StatsTTL = transport.DefaultStatsCacheTTL
+	}
 	m := &FlowMux{
 		logger:   logger,
 		cfg:      cfg,
@@ -109,16 +122,31 @@ func New(
 	return m, nil
 }
 
+func (m *FlowMux) NotifyNetworkChanged() {
+	for _, sf := range m.subflows {
+		if n, ok := sf.transport.(interface{ NotifyNetworkChanged() }); ok {
+			n.NotifyNetworkChanged()
+		}
+	}
+}
+
 func (m *FlowMux) Start(ctx context.Context) error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
 	if m.started {
 		return nil
 	}
 	m.ctx, m.cancel = context.WithCancel(ctx)
+	m.drainIncomingStreams()
 	for _, sf := range m.subflows {
 		if err := sf.mux.Start(ctx); err != nil {
 			for _, s := range m.subflows {
 				_ = s.mux.Stop(context.Background())
 			}
+			m.cancel()
+			m.ctx = nil
+			m.cancel = nil
 			return fmt.Errorf("flowmux: start %s: %w", sf.name, err)
 		}
 		m.logger.Info("flowmux: subflow ", sf.name, " started")
@@ -134,10 +162,14 @@ func (m *FlowMux) Start(ctx context.Context) error {
 }
 
 func (m *FlowMux) Stop(ctx context.Context) error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
 	if !m.started {
 		return nil
 	}
 	m.started = false
+	m.layerCache.Store(nil)
 	if m.cancel != nil {
 		m.cancel()
 	}
@@ -152,6 +184,16 @@ func (m *FlowMux) Stop(ctx context.Context) error {
 }
 
 func (m *FlowMux) WalkLayers() []transport.Layer {
+	now := time.Now()
+	if cached := m.layerCache.Load(); cached != nil && now.Sub(cached.at) < m.cfg.StatsTTL {
+		return cached.layers
+	}
+	layers := m.walkLayers()
+	m.layerCache.Store(&cachedLayers{at: now, layers: layers})
+	return layers
+}
+
+func (m *FlowMux) walkLayers() []transport.Layer {
 	var appSent, appRecv int64
 	var wires []transport.Layer
 	for _, sf := range m.subflows {
@@ -226,6 +268,19 @@ func (w *wrappedStream) Close() error {
 		w.sf.active.Add(-1)
 	}
 	return w.Stream.Close()
+}
+
+func (m *FlowMux) drainIncomingStreams() {
+	for {
+		select {
+		case s := <-m.incoming:
+			if err := s.Close(); err != nil {
+				m.logger.Debug("flowmux: drain incoming stream: ", err)
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (m *FlowMux) acceptLoop(sf *subflow) {

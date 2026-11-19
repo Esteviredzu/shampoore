@@ -86,6 +86,12 @@ func ParseURL(raw string) (*Settings, error) {
 		return nil, fmt.Errorf("app: decode transport %q: %w", kind, err)
 	}
 	s.SetTransportData(kind, data)
+	if err := s.Advanced.ValidateAgainstDefaults(d.Defaults); err != nil {
+		return nil, fmt.Errorf("app: advanced: %w", err)
+	}
+	if err := s.ApplyDefaults(); err != nil {
+		return nil, err
+	}
 
 	return s, nil
 }

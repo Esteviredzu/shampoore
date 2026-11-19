@@ -17,6 +17,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
@@ -48,6 +49,7 @@ func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, err
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
+			Control:   netdial.Control,
 		}).DialContext,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
@@ -179,10 +181,10 @@ func (p *Pipe) sendLoop() {
 			flush()
 			return
 		case data := <-p.sendCh:
-			msg := make([]byte, 4+len(data))
-			binary.BigEndian.PutUint32(msg[0:4], uint32(len(data)))
-			copy(msg[4:], data)
-			buffer = append(buffer, msg...)
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+			buffer = append(buffer, hdr[:]...)
+			buffer = append(buffer, data...)
 
 			if len(buffer) >= targetSize {
 				flush()
@@ -214,22 +216,52 @@ func (p *Pipe) upload(buf []byte) {
 	p.ctr.MessagesSent.Add(1)
 }
 
+const maxPollBackoff = 500 * time.Millisecond
+
+func nextPollDelay(cur, base, max time.Duration) time.Duration {
+	if base <= 0 {
+		base = 10 * time.Millisecond
+	}
+	if max < base {
+		max = base
+	}
+	if cur < base {
+		cur = base
+	}
+	cur *= 2
+	if cur > max {
+		cur = max
+	}
+	return cur
+}
+
 func (p *Pipe) receiveLoop() {
 	defer p.wg.Done()
-	ticker := time.NewTicker(time.Duration(p.cfg.PollIntervalMs) * time.Millisecond)
-	defer ticker.Stop()
+
+	base := time.Duration(p.cfg.PollIntervalMs) * time.Millisecond
+	if base < 10*time.Millisecond {
+		base = 10 * time.Millisecond
+	}
+	delay := base
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-ticker.C:
-			p.pollOnce()
+		case <-timer.C:
+			if p.pollOnce() > 0 {
+				delay = base
+			} else {
+				delay = nextPollDelay(delay, base, maxPollBackoff)
+			}
+			timer.Reset(delay)
 		}
 	}
 }
 
-func (p *Pipe) pollOnce() {
+func (p *Pipe) pollOnce() int {
 	p.lastKeyMu.Lock()
 	startAfter := p.lastKey
 	p.lastKeyMu.Unlock()
@@ -249,71 +281,94 @@ func (p *Pipe) pollOnce() {
 		if object.Err != nil {
 			continue
 		}
-		if time.Since(object.LastModified) > 30*time.Second {
-			_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, object.Key, minio.RemoveObjectOptions{})
-			continue
-		}
 		keys = append(keys, object.Key)
 	}
 
 	if len(keys) == 0 {
-		return
+		return 0
 	}
 
 	sort.Strings(keys)
 
+	delivered := 0
 	for _, key := range keys {
-		p.processFile(key)
+
+		if !p.processFile(key) {
+			break
+		}
 
 		p.lastKeyMu.Lock()
 		if key > p.lastKey {
 			p.lastKey = key
 		}
 		p.lastKeyMu.Unlock()
+		delivered++
 	}
+	return delivered
 }
 
-func (p *Pipe) processFile(key string) {
+func isMissingObject(err error) bool {
+	if err == nil {
+		return false
+	}
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
+}
+
+func (p *Pipe) processFile(key string) bool {
 	objReader, err := p.client.GetObject(p.ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{})
-		return
+		return isMissingObject(err)
 	}
 	data, err := io.ReadAll(objReader)
-	objReader.Close()
+	_ = objReader.Close()
+	if err != nil {
+		return isMissingObject(err)
+	}
 
-	_ = p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{})
-
-	if err != nil || len(data) == 0 {
-		return
+	if len(data) == 0 {
+		if err := p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
+			!isMissingObject(err) {
+			return false
+		}
+		return true
 	}
 
 	p.ctr.NetworkRecv.Add(int64(len(data)))
 
 	offset := 0
+	malformed := false
 	for offset+4 <= len(data) {
 		msgLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		offset += 4
 
-		if offset+msgLen > len(data) {
+		if msgLen < 0 || offset+msgLen > len(data) {
+			malformed = true
 			break
 		}
 
-		msgData := data[offset : offset+msgLen]
+		msg := data[offset : offset+msgLen]
 		offset += msgLen
 
-		out := make([]byte, len(msgData))
-		copy(out, msgData)
-
-		p.ctr.UsefulRecv.Add(int64(len(out)))
+		p.ctr.UsefulRecv.Add(int64(len(msg)))
 		p.ctr.MessagesRecv.Add(1)
 
 		select {
-		case p.recvCh <- out:
+		case p.recvCh <- msg:
 		case <-p.ctx.Done():
-			return
+			return false
 		}
 	}
+	if malformed {
+		p.logger.Warn("silo: dropping malformed object ", key)
+	}
+
+	if err := p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
+		!isMissingObject(err) {
+		p.logger.Warn("silo: remove delivered object ", key, ": ", err)
+		return false
+	}
+	return true
 }
 
 var _ transport.Pipe = (*Pipe)(nil)

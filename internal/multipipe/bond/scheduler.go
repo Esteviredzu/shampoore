@@ -76,6 +76,29 @@ func (s *scheduler) pickNonFull(exclude *subflow) *subflow {
 	return best
 }
 
+func (s *scheduler) pickAlive(exclude map[*subflow]struct{}) *subflow {
+	now := time.Now().UnixNano()
+	var best *subflow
+	bestDepth := int(^uint(0) >> 1)
+	for _, sf := range s.subflows {
+		if _, skip := exclude[sf]; skip {
+			continue
+		}
+		if sf.deadUntil.Load() > now {
+			continue
+		}
+		depth := len(sf.queue)
+		if depth >= cap(sf.queue) {
+			continue
+		}
+		if depth < bestDepth {
+			best = sf
+			bestDepth = depth
+		}
+	}
+	return best
+}
+
 func (s *scheduler) allDead() bool {
 	now := time.Now().UnixNano()
 	for _, sf := range s.subflows {

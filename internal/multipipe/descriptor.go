@@ -46,7 +46,8 @@ func init() {
 			"mux_flush_ms":        20,
 			"mux_flush_threshold": 12000,
 		},
-		Build: build,
+		Validate: validateTransport,
+		Build:    build,
 	})
 	if err != nil {
 		panic(err)
@@ -77,6 +78,14 @@ func (p *multiProvider) Stop(ctx context.Context) error {
 }
 
 func (p *multiProvider) Tunnel() *vp8.Tunnel { return nil }
+
+func (p *multiProvider) NotifyNetworkChanged() {
+	for _, pr := range p.providers {
+		if n, ok := pr.(interface{ NotifyNetworkChanged() }); ok {
+			n.NotifyNetworkChanged()
+		}
+	}
+}
 
 func build(
 	ctx context.Context,
@@ -268,4 +277,45 @@ func stopAll(outcomes []outcome) {
 			_ = o.res.Transport.Stop(context.Background())
 		}
 	}
+}
+
+func validateTransport(raw json.RawMessage) error {
+	cfg := config{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	if len(cfg.Transports) == 0 {
+		return fmt.Errorf("multipipe: at least one transport required")
+	}
+	switch cfg.Strategy {
+	case "", "flowmux", "bond":
+	default:
+		return fmt.Errorf("multipipe: unknown strategy %q (want flowmux|bond)", cfg.Strategy)
+	}
+	for i, spec := range cfg.Transports {
+		if spec.Type == "" {
+			return fmt.Errorf("multipipe: transport %d: type required", i)
+		}
+		d, ok := app.DescriptorFor(spec.Type)
+		if !ok {
+			return fmt.Errorf("multipipe: unknown transport type %q", spec.Type)
+		}
+		if d.Kind == "multi" {
+			return fmt.Errorf("multipipe: nested multi is not supported")
+		}
+		if err := spec.Advanced.ValidateTypes(); err != nil {
+			return fmt.Errorf("multipipe: transport %d (%s): advanced: %w", i, spec.Type, err)
+		}
+		if err := spec.Advanced.ValidateAgainstDefaults(d.Defaults); err != nil {
+			return fmt.Errorf("multipipe: transport %d (%s): advanced: %w", i, spec.Type, err)
+		}
+		if d.Validate != nil {
+			if err := d.Validate(spec.Transport); err != nil {
+				return fmt.Errorf("multipipe: transport %d (%s): %w", i, spec.Type, err)
+			}
+		}
+	}
+	return nil
 }

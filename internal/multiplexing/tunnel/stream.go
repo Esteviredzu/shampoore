@@ -7,13 +7,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const maxQueuedBytes = 64 * 1024 * 1024
 
 type TunnelStream struct {
 	mux      *TunnelMultiplexer
-	id       string
+	id       StreamID
+	idStr    string
 	metadata map[string]any
 
 	recvMu     sync.Mutex
@@ -29,28 +32,30 @@ type TunnelStream struct {
 	closeOnce sync.Once
 }
 
-func newTunnelStream(mux *TunnelMultiplexer, id string, metadata map[string]any) *TunnelStream {
+func newTunnelStream(mux *TunnelMultiplexer, id StreamID, metadata map[string]any) *TunnelStream {
 	s := &TunnelStream{
 		mux:      mux,
 		id:       id,
+		idStr:    uuid.UUID(id).String(),
 		metadata: metadata,
 	}
 	s.recvCond = sync.NewCond(&s.recvMu)
 	return s
 }
 
-func (s *TunnelStream) ID() string               { return s.id }
+func (s *TunnelStream) ID() string               { return s.idStr }
 func (s *TunnelStream) Metadata() map[string]any { return s.metadata }
 func (s *TunnelStream) Closed() bool             { return s.closed.Load() }
 
 func (s *TunnelStream) Read(b []byte) (int, error) {
+	s.recvMu.Lock()
 	if len(s.readBuf) > 0 {
 		n := copy(b, s.readBuf)
 		s.readBuf = s.readBuf[n:]
+		s.recvMu.Unlock()
 		return n, nil
 	}
 
-	s.recvMu.Lock()
 	for len(s.recvQueue) == 0 && !s.recvClosed {
 		s.recvCond.Wait()
 	}
@@ -66,12 +71,12 @@ func (s *TunnelStream) Read(b []byte) (int, error) {
 	s.recvQueue[0] = nil
 	s.recvQueue = s.recvQueue[1:]
 	s.recvBytes -= len(data)
-	s.recvMu.Unlock()
 
 	n := copy(b, data)
 	if n < len(data) {
 		s.readBuf = data[n:]
 	}
+	s.recvMu.Unlock()
 	return n, nil
 }
 
@@ -86,6 +91,7 @@ func (s *TunnelStream) Write(b []byte) (int, error) {
 }
 
 func (s *TunnelStream) Close() error {
+	var err error
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		s.recvMu.Lock()
@@ -95,9 +101,9 @@ func (s *TunnelStream) Close() error {
 		}
 		s.recvCond.Broadcast()
 		s.recvMu.Unlock()
-		_ = s.mux.closeStream(s.id)
+		err = s.mux.closeStream(s.id)
 	})
-	return nil
+	return err
 }
 
 func (s *TunnelStream) deliverData(data []byte) {
@@ -131,6 +137,20 @@ func (s *TunnelStream) deliverEOF(err error) {
 		s.recvMu.Lock()
 		s.recvClosed = true
 		s.recvErr = err
+		s.recvCond.Broadcast()
+		s.recvMu.Unlock()
+	})
+}
+
+func (s *TunnelStream) abort(err error) {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.recvMu.Lock()
+		s.recvClosed = true
+		s.recvErr = err
+		s.recvQueue = nil
+		s.recvBytes = 0
+		s.readBuf = nil
 		s.recvCond.Broadcast()
 		s.recvMu.Unlock()
 	})

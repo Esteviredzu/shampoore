@@ -11,6 +11,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 const (
@@ -136,10 +137,25 @@ func (c *BoardClient) Close() error {
 	return nil
 }
 
+func (c *BoardClient) NotifyNetworkChanged() {
+	c.mu.Lock()
+	ws := c.ws
+	closing := c.closing
+	c.mu.Unlock()
+	if ws == nil || closing {
+		return
+	}
+	c.logger.Info("yandex-board: network changed, reconnecting")
+	if err := ws.Close(websocket.StatusGoingAway, "network changed"); err != nil {
+		c.logger.Debug("yandex-board: close for reconnect: ", err)
+	}
+}
+
 func (c *BoardClient) establishConnection(ctx context.Context) error {
 	c.logger.Debug("connecting to Yandex Boards...")
 
 	opts := &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: netdial.NewHTTPTransport()},
 		HTTPHeader: http.Header{
 			"User-Agent":   []string{boardsUA},
 			"Cookie":       []string{c.creds.Cookie},

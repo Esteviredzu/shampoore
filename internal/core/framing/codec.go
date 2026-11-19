@@ -44,15 +44,34 @@ func EncodeFrameYUV(
 	payload []byte,
 	p *Palette,
 ) {
-	for i := 0; i < width*height; i++ {
-		yuv[i] = p.IdleBGY
+	activeW := cols * cellSize
+	activeH := rows * cellSize
+	if activeW > width {
+		activeW = width
 	}
+	if activeH > height {
+		activeH = height
+	}
+
+	if activeW < width {
+		for y := 0; y < activeH; y++ {
+			rowOff := y * width
+			fillRow(yuv[rowOff+activeW:rowOff+width], p.IdleBGY)
+		}
+	}
+	for y := activeH; y < height; y++ {
+		rowOff := y * width
+		fillRow(yuv[rowOff:rowOff+width], p.IdleBGY)
+	}
+
 	bits := p.BitsPerCell
 	for r := 0; r < rows; r++ {
 		for c := 0; c < cols; c++ {
 			idx := r*cols + c
 			if idx*bits/8 >= len(payload) {
-				break
+				fillYRect(yuv, width, c*cellSize, r*cellSize,
+					cellSize, cellSize, p.IdleBGY)
+				continue
 			}
 			val := getNBits(payload, idx*bits, bits)
 			fillYRect(yuv, width, c*cellSize, r*cellSize, cellSize, cellSize, p.Y[val])
@@ -60,16 +79,20 @@ func EncodeFrameYUV(
 	}
 }
 
-func DecodeFrameYUV(
-	yuv []byte,
+func DecodeFrameYUVInto(
+	dst, yuv []byte,
 	width, cols, rows, cellSize, payloadBytes int,
 	p *Palette,
 ) []byte {
+	if payloadBytes < 0 || len(dst) < payloadBytes {
+		return nil
+	}
 	if len(yuv) < width*rows*cellSize {
 		return nil
 	}
+	payload := dst[:payloadBytes]
+	clear(payload)
 	bits := p.BitsPerCell
-	payload := make([]byte, payloadBytes)
 	for r := 0; r < rows; r++ {
 		for c := 0; c < cols; c++ {
 			cx := c*cellSize + cellSize/2
@@ -83,11 +106,24 @@ func DecodeFrameYUV(
 	return payload
 }
 
+func DecodeFrameYUV(
+	yuv []byte,
+	width, cols, rows, cellSize, payloadBytes int,
+	p *Palette,
+) []byte {
+	payload := make([]byte, payloadBytes)
+	return DecodeFrameYUVInto(payload, yuv, width, cols, rows, cellSize, payloadBytes, p)
+}
+
+func fillRow(dst []byte, val byte) {
+	for i := range dst {
+		dst[i] = val
+	}
+}
+
 func fillYRect(dst []byte, width, x0, y0, w, h int, val byte) {
 	for y := y0; y < y0+h; y++ {
 		rowOff := y * width
-		for x := x0; x < x0+w; x++ {
-			dst[rowOff+x] = val
-		}
+		fillRow(dst[rowOff+x0:rowOff+x0+w], val)
 	}
 }

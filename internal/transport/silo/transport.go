@@ -8,12 +8,12 @@ import (
 )
 
 type siloTransport struct {
-	pipe           *Pipe
+	pipe           transport.Pipe
 	bytesDelivered atomic.Int64
 	bytesAcked     atomic.Int64
 }
 
-func newTransport(p *Pipe) *siloTransport {
+func newTransport(p transport.Pipe) *siloTransport {
 	return &siloTransport{pipe: p}
 }
 
@@ -41,7 +41,10 @@ func (t *siloTransport) BytesDelivered() int64 { return t.bytesDelivered.Load() 
 func (t *siloTransport) BytesAcked() int64     { return t.bytesAcked.Load() }
 
 func (t *siloTransport) WalkLayers() []transport.Layer {
-	return t.pipe.WalkLayers()
+	if tw, ok := t.pipe.(transport.Telemetry); ok {
+		return tw.WalkLayers()
+	}
+	return nil
 }
 
 var _ transport.Transport = (*siloTransport)(nil)

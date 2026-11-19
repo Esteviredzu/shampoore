@@ -1,24 +1,34 @@
 package tunnel
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-
-	"github.com/google/uuid"
+	"sync"
 )
 
 var frameMagic = [4]byte{'T', 'U', 'N', '1'}
 
 const (
-	frameVersion byte = 1
+	frameVersion byte = 2
 
 	frameTypeOpen  byte = 1
 	frameTypeData  byte = 2
 	frameTypeClose byte = 3
+	frameTypeReset byte = 4
 
-	FrameHeaderSize = 26
+	FrameHeaderSize = 30
+
+	frameOffMagic    = 0
+	frameOffVersion  = 4
+	frameOffType     = 5
+	frameOffStreamID = 6
+	frameOffLength   = 22
+	frameOffEpoch    = 26
 )
+
+type StreamID [16]byte
 
 type FrameType byte
 
@@ -26,13 +36,17 @@ const (
 	FrameOpen  FrameType = FrameType(frameTypeOpen)
 	FrameData  FrameType = FrameType(frameTypeData)
 	FrameClose FrameType = FrameType(frameTypeClose)
+
+	FrameReset FrameType = FrameType(frameTypeReset)
 )
 
 type TunnelFrame struct {
-	StreamID string
+	StreamID StreamID
 	Type     FrameType
 	Data     []byte
 	Metadata map[string]any
+
+	Epoch uint32
 }
 
 func EncodeFrame(f *TunnelFrame) ([]byte, error) {
@@ -65,27 +79,34 @@ func EncodeFrame(f *TunnelFrame) ([]byte, error) {
 		}
 		payload = nil
 
+	case FrameReset:
+		if len(f.Data) > 0 {
+			return nil, fmt.Errorf("tunnel: reset frame cannot contain data")
+		}
+		if len(f.Metadata) > 0 {
+			return nil, fmt.Errorf("tunnel: reset frame cannot contain metadata")
+		}
+		payload = nil
+
 	default:
 		return nil, fmt.Errorf("tunnel: unknown frame type: %d", byte(f.Type))
 	}
 
-	streamUUID, err := uuid.Parse(f.StreamID)
-	if err != nil {
-		return nil, fmt.Errorf("tunnel: invalid stream id: %w", err)
-	}
-
 	out := make([]byte, FrameHeaderSize+len(payload))
-	copy(out[0:4], frameMagic[:])
-	out[4] = frameVersion
-	out[5] = byte(f.Type)
-	copy(out[6:22], streamUUID[:])
-	binary.BigEndian.PutUint32(out[22:26], uint32(len(payload)))
-	copy(out[26:], payload)
+	copy(out[frameOffMagic:frameOffMagic+4], frameMagic[:])
+	out[frameOffVersion] = frameVersion
+	out[frameOffType] = byte(f.Type)
+	copy(out[frameOffStreamID:frameOffStreamID+len(f.StreamID)], f.StreamID[:])
+	binary.BigEndian.PutUint32(out[frameOffLength:frameOffLength+4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(out[frameOffEpoch:frameOffEpoch+4], f.Epoch)
+	copy(out[FrameHeaderSize:], payload)
 	return out, nil
 }
 
 type FrameDecoder struct {
+	mu  sync.Mutex
 	buf []byte
+	off int
 }
 
 func NewFrameDecoder() *FrameDecoder {
@@ -93,44 +114,59 @@ func NewFrameDecoder() *FrameDecoder {
 }
 
 func (d *FrameDecoder) Reset() {
+	d.mu.Lock()
 	d.buf = d.buf[:0]
+	d.off = 0
+	d.mu.Unlock()
 }
 
 func (d *FrameDecoder) Feed(data []byte) ([]*TunnelFrame, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.off > 0 {
+		n := copy(d.buf, d.buf[d.off:])
+		d.buf = d.buf[:n]
+		d.off = 0
+	}
 	d.buf = append(d.buf, data...)
 
 	var frames []*TunnelFrame
 
 	for {
-		if len(d.buf) < FrameHeaderSize {
+		avail := len(d.buf) - d.off
+		if avail < FrameHeaderSize {
 			break
 		}
 
-		if d.buf[0] != 'T' || d.buf[1] != 'U' ||
-			d.buf[2] != 'N' || d.buf[3] != '1' {
-			return frames, fmt.Errorf("tunnel: bad magic: %x", d.buf[0:4])
+		base := d.off
+		hdr := d.buf[base : base+FrameHeaderSize]
+
+		if !bytes.Equal(hdr[frameOffMagic:frameOffMagic+4], frameMagic[:]) {
+			return frames, fmt.Errorf("tunnel: bad magic: %x", hdr[frameOffMagic:frameOffMagic+4])
 		}
-		if d.buf[4] != frameVersion {
-			return frames, fmt.Errorf("tunnel: unsupported version: %d", d.buf[4])
+		if hdr[frameOffVersion] != frameVersion {
+			return frames, fmt.Errorf("tunnel: unsupported version: %d", hdr[frameOffVersion])
 		}
 
-		ftype := d.buf[5]
-		var streamUUID uuid.UUID
-		copy(streamUUID[:], d.buf[6:22])
-		payloadSize := binary.BigEndian.Uint32(d.buf[22:26])
+		ftype := hdr[frameOffType]
+		var streamID StreamID
+		copy(streamID[:], hdr[frameOffStreamID:frameOffStreamID+len(streamID)])
+		payloadSize := binary.BigEndian.Uint32(hdr[frameOffLength : frameOffLength+4])
+		epoch := binary.BigEndian.Uint32(hdr[frameOffEpoch : frameOffEpoch+4])
 
 		total := FrameHeaderSize + int(payloadSize)
-		if len(d.buf) < total {
+		if avail < total {
 			break
 		}
 
-		payload := make([]byte, payloadSize)
-		copy(payload, d.buf[FrameHeaderSize:total])
-
 		frame := &TunnelFrame{
-			StreamID: streamUUID.String(),
+			StreamID: streamID,
 			Type:     FrameType(ftype),
+			Epoch:    epoch,
 		}
+
+		payload := d.buf[base+FrameHeaderSize : base+total]
 
 		switch FrameType(ftype) {
 		case FrameOpen:
@@ -146,11 +182,19 @@ func (d *FrameDecoder) Feed(data []byte) ([]*TunnelFrame, error) {
 			frame.Metadata = meta
 
 		case FrameData:
-			frame.Data = payload
+			if len(payload) > 0 {
+
+				frame.Data = append([]byte(nil), payload...)
+			}
 
 		case FrameClose:
 			if len(payload) > 0 {
 				return frames, fmt.Errorf("tunnel: close frame has payload")
+			}
+
+		case FrameReset:
+			if len(payload) > 0 {
+				return frames, fmt.Errorf("tunnel: reset frame has payload")
 			}
 
 		default:
@@ -158,9 +202,13 @@ func (d *FrameDecoder) Feed(data []byte) ([]*TunnelFrame, error) {
 		}
 
 		frames = append(frames, frame)
+		d.off = base + total
+	}
 
-		remaining := copy(d.buf, d.buf[total:])
-		d.buf = d.buf[:remaining]
+	if d.off > 0 {
+		n := copy(d.buf, d.buf[d.off:])
+		d.buf = d.buf[:n]
+		d.off = 0
 	}
 
 	return frames, nil

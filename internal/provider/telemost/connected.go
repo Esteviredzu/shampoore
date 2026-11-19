@@ -36,14 +36,37 @@ func (s *signaling) ConnectedIPs() []string {
 		}
 	}
 
-	add(s.pubPC)
-	add(s.subPC)
+	s.pcMu.RLock()
+	pubPC, subPC := s.pubPC, s.subPC
+	s.pcMu.RUnlock()
+
+	add(pubPC)
+	add(subPC)
 	return ips
 }
 
 func (p *Pipe) ConnectedIPs() []string {
-	if p.sig == nil {
-		return nil
+	p.mu.RLock()
+	sig := p.sig
+	p.mu.RUnlock()
+
+	var out []string
+	seen := make(map[string]struct{})
+	if sig != nil {
+		for _, ip := range sig.ConnectedIPs() {
+			if _, ok := seen[ip]; ok {
+				continue
+			}
+			seen[ip] = struct{}{}
+			out = append(out, ip)
+		}
 	}
-	return p.sig.ConnectedIPs()
+	for _, ip := range p.bypass.list() {
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
 }

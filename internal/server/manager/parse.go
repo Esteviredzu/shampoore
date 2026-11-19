@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -32,9 +33,12 @@ func ParseConfigContent(content string) (*app.Settings, error) {
 		if err := json.Unmarshal(raw, &s); err != nil {
 			return nil, fmt.Errorf("invalid settings: %w", err)
 		}
-		if nameRaw, ok := probe["name"]; ok && s.Name == "" {
+		if nameRaw, ok := probe["name"]; ok {
 			var n string
-			if json.Unmarshal(nameRaw, &n) == nil && n != "" {
+			if err := json.Unmarshal(nameRaw, &n); err != nil {
+				return nil, fmt.Errorf(`invalid top-level "name": %w`, err)
+			}
+			if s.Name == "" && n != "" {
 				s.Name = n
 			}
 		}
@@ -60,11 +64,78 @@ func ValidateSettings(s *app.Settings) error {
 	if s == nil {
 		return fmt.Errorf("settings is required")
 	}
-	if s.Type == "" {
+	kind := strings.TrimSpace(s.Type)
+	if kind == "" {
 		return fmt.Errorf("settings.type is required")
 	}
-	if _, ok := app.DescriptorFor(s.Type); !ok {
-		return fmt.Errorf("unknown transport type %q", s.Type)
+	d, ok := app.DescriptorFor(kind)
+	if !ok {
+		return fmt.Errorf("unknown transport type %q", kind)
+	}
+	if d.Validate != nil {
+		if err := d.Validate(s.Transport); err != nil {
+			return fmt.Errorf("transport %q: %w", kind, err)
+		}
+		return nil
+	}
+	return validateRequiredFields(kind, s.Transport, d)
+}
+
+func validateRequiredFields(kind string, raw json.RawMessage, d app.Descriptor) error {
+	if len(d.Fields) == 0 {
+		return nil
+	}
+	if !isJSONObject(raw) {
+		return fmt.Errorf("transport %q: settings.transport must be a JSON object", kind)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("transport %q: settings.transport: %w", kind, err)
+	}
+	for _, f := range d.Fields {
+		if !f.Required {
+			continue
+		}
+		value, ok := fields[f.Key]
+		if !ok {
+			return fmt.Errorf("transport %q: field %q is required", kind, f.Key)
+		}
+		if err := validateFieldValue(f, value); err != nil {
+			return fmt.Errorf("transport %q: field %q: %w", kind, f.Key, err)
+		}
 	}
 	return nil
+}
+
+func validateFieldValue(f app.Field, raw json.RawMessage) error {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return fmt.Errorf("must not be null")
+	}
+	switch f.Type {
+	case app.FieldTypeText, app.FieldTypePassword:
+		var s string
+		if err := json.Unmarshal(value, &s); err != nil {
+			return fmt.Errorf("must be a string")
+		}
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("must not be empty")
+		}
+	case app.FieldTypeNumber:
+		var n float64
+		if err := json.Unmarshal(value, &n); err != nil {
+			return fmt.Errorf("must be a number")
+		}
+	case app.FieldTypeBool:
+		var b bool
+		if err := json.Unmarshal(value, &b); err != nil {
+			return fmt.Errorf("must be a boolean")
+		}
+	}
+	return nil
+}
+
+func isJSONObject(raw []byte) bool {
+	value := bytes.TrimSpace(raw)
+	return len(value) > 0 && value[0] == '{'
 }

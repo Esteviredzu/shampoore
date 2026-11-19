@@ -4,52 +4,79 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
-
-	"github.com/xjasonlyu/tun2socks/v2/engine"
+	"time"
 )
 
 var (
 	androidEngineMu sync.Mutex
-	androidEngineOn bool
+	androidEngine   *tunEngine
 )
 
-func StartTUNFD(ctx context.Context, fd int, mtu int) error {
+func StartTUNFD(ctx context.Context, fd int, mtu int) (<-chan error, error) {
 	if fd < 0 {
-		return fmt.Errorf("tun/android: invalid fd %d", fd)
+		return nil, fmt.Errorf("tun/android: invalid fd %d", fd)
 	}
 	if mtu <= 0 {
 		mtu = 1500
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	androidEngineMu.Lock()
-	if androidEngineOn {
+	if androidEngine != nil {
 		androidEngineMu.Unlock()
-		return fmt.Errorf("tun/android: engine already running")
+		return nil, fmt.Errorf("tun/android: engine already running")
 	}
-	androidEngineOn = true
+	eng, err := newTunEngine(fd, mtu)
+	if err != nil {
+		androidEngineMu.Unlock()
+		return nil, err
+	}
+	androidEngine = eng
 	androidEngineMu.Unlock()
 
-	defer func() {
+	log.Printf("tun/android: started on fd=%d, mtu=%d", fd, mtu)
+
+	done := make(chan error, 1)
+	go func() {
+		var runErr error
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				runErr = ctx.Err()
+				break loop
+			case <-ticker.C:
+				if !fdAlive(fd) {
+					runErr = errors.New("tun/android: descriptor closed")
+					break loop
+				}
+			}
+		}
+
+		log.Println("tun/android: stopping")
+		eng.stop()
+
 		androidEngineMu.Lock()
-		androidEngineOn = false
+		if androidEngine == eng {
+			androidEngine = nil
+		}
 		androidEngineMu.Unlock()
+
+		done <- runErr
+		close(done)
 	}()
 
-	key := &engine.Key{
-		Device:   fmt.Sprintf("fd://%d", fd),
-		MTU:      mtu,
-		Proxy:    "mux://",
-		LogLevel: "error",
-	}
-	engine.Insert(key)
-	engine.Start()
-	defer engine.Stop()
-
-	log.Printf("tun/android: started on fd=%d, mtu=%d", fd, mtu)
-	<-ctx.Done()
-	log.Println("tun/android: stopping")
-	return nil
+	return done, nil
 }

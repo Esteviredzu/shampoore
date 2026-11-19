@@ -161,7 +161,9 @@ func (m *Manager) loadFile(path string) error {
 		return errors.New("no settings")
 	}
 
-	settings.ApplyDefaults()
+	if err := settings.ApplyDefaults(); err != nil {
+		return err
+	}
 	if settings.Name == "" {
 		settings.Name = strings.TrimSuffix(filepath.Base(path), ".json")
 	}
@@ -172,7 +174,9 @@ func (m *Manager) loadFile(path string) error {
 				var b bool
 				if json.Unmarshal(enabledRaw, &b) == nil && b {
 					if !m.state.IsEnabled(settings.Name) {
-						_ = m.state.Set(settings.Name, true)
+						if err := m.state.Set(settings.Name, true); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -245,6 +249,10 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	settings := me.settings
 	me.settingsMu.Unlock()
 
+	if err := ValidateSettings(settings); err != nil {
+		return fmt.Errorf("validate settings: %w", err)
+	}
+
 	logger := logging.New("cfg:"+me.Name, true)
 	logger.AddSink(me.logRing)
 
@@ -270,11 +278,15 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 
 	if err := mux.Start(ctx); err != nil {
 		cancel()
-		_ = rt.Stop(context.Background())
+		if stopErr := rt.Stop(context.Background()); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop runtime: ", stopErr)
+		}
 		return fmt.Errorf("mux start: %w", err)
 	}
 	if err := rt.Start(ctx); err != nil {
-		_ = mux.Stop(context.Background())
+		if stopErr := mux.Stop(context.Background()); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop mux: ", stopErr)
+		}
 		cancel()
 		return fmt.Errorf("runtime start: %w", err)
 	}
@@ -292,8 +304,12 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		me.mu.Unlock()
 		handler.Stop()
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = mux.Stop(stopCtx)
-		_ = rt.Stop(stopCtx)
+		if stopErr := mux.Stop(stopCtx); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop mux: ", stopErr)
+		}
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop runtime: ", stopErr)
+		}
 		stopCancel()
 		cancel()
 		return nil
@@ -336,10 +352,14 @@ func (m *Manager) stopEntry(me *ManagedEntry) {
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopCancel()
 	if mux != nil {
-		_ = mux.Stop(stopCtx)
+		if err := mux.Stop(stopCtx); err != nil {
+			m.logger.Warn("manager: ", me.Name, ": stop mux: ", err)
+		}
 	}
 	if rt != nil {
-		_ = rt.Stop(stopCtx)
+		if err := rt.Stop(stopCtx); err != nil {
+			m.logger.Warn("manager: ", me.Name, ": stop runtime: ", err)
+		}
 	}
 }
 
@@ -565,7 +585,9 @@ func (m *Manager) Add(name, template, content string) error {
 	if err := writeSettingsFile(path, settings); err != nil {
 		return err
 	}
-	_ = m.state.Set(name, true)
+	if err := m.state.Set(name, true); err != nil {
+		return err
+	}
 	return m.loadFile(path)
 }
 
@@ -592,12 +614,17 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 	if err := entry.Settings.ApplyDefaults(); err != nil {
 		return err
 	}
+	if err := ValidateSettings(entry.Settings); err != nil {
+		return err
+	}
 
 	m.stopEntry(me)
 
 	if newName != name {
 		newPath := filepath.Join(filepath.Dir(me.FilePath), sanitizeName(newName)+".json")
-		os.Remove(me.FilePath)
+		if err := os.Remove(me.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("update %q: remove old config: %w", name, err)
+		}
 		me.FilePath = newPath
 		me.Name = newName
 
@@ -607,9 +634,13 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 		m.mu.Unlock()
 
 		wasEnabled := m.state.IsEnabled(name)
-		m.state.Remove(name)
+		if err := m.state.Remove(name); err != nil {
+			return fmt.Errorf("update %q: state: %w", name, err)
+		}
 		if wasEnabled {
-			m.state.Set(newName, true)
+			if err := m.state.Set(newName, true); err != nil {
+				return fmt.Errorf("update %q: state: %w", newName, err)
+			}
 		}
 	}
 
@@ -642,9 +673,13 @@ func (m *Manager) Remove(name string) error {
 
 	m.stopEntry(me)
 	if me.FilePath != "" {
-		_ = os.Remove(me.FilePath)
+		if err := os.Remove(me.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %q: %w", name, err)
+		}
 	}
-	_ = m.state.Remove(name)
+	if err := m.state.Remove(name); err != nil {
+		return fmt.Errorf("remove %q: state: %w", name, err)
+	}
 	return nil
 }
 
@@ -686,20 +721,29 @@ func (m *Manager) Restart(name string) error {
 	m.stopEntry(me)
 
 	if me.FilePath != "" {
-		if data, err := os.ReadFile(me.FilePath); err == nil {
-			if settings, err := ParseConfigContent(string(data)); err == nil && settings != nil {
-				settings.ApplyDefaults()
-				if settings.Name == "" {
-					settings.Name = name
-				}
-				me.settingsMu.Lock()
-				me.settings = settings
-				me.settingsMu.Unlock()
-				me.mu.Lock()
-				me.updatedAt = time.Now()
-				me.mu.Unlock()
-			}
+		data, err := os.ReadFile(me.FilePath)
+		if err != nil {
+			return fmt.Errorf("restart %q: read config: %w", name, err)
 		}
+		settings, err := ParseConfigContent(string(data))
+		if err != nil {
+			return fmt.Errorf("restart %q: %w", name, err)
+		}
+		if settings == nil {
+			return fmt.Errorf("restart %q: no settings", name)
+		}
+		if err := settings.ApplyDefaults(); err != nil {
+			return fmt.Errorf("restart %q: %w", name, err)
+		}
+		if settings.Name == "" {
+			settings.Name = name
+		}
+		me.settingsMu.Lock()
+		me.settings = settings
+		me.settingsMu.Unlock()
+		me.mu.Lock()
+		me.updatedAt = time.Now()
+		me.mu.Unlock()
 	}
 
 	if m.startAll || m.state.IsEnabled(name) {
@@ -739,7 +783,17 @@ func writeSettingsFile(path string, s *app.Settings) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writeFile0600(path, data)
+}
+
+func writeFile0600(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return nil
 }
 
 func validName(s string) bool {

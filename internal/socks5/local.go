@@ -8,6 +8,9 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
@@ -33,16 +36,34 @@ const (
 	repHostUnreachable      = 0x04
 	repCommandNotSupported  = 0x07
 	repAddressNotSupported  = 0x08
+
+	maxConcurrentConns   = 1024
+	defaultHandshakeTime = 10 * time.Second
+	defaultRequestTime   = 10 * time.Second
+	defaultHalfCloseIdle = 5 * time.Second
 )
 
 type LocalServer struct {
-	listen       string
-	mux          multiplexing.StreamMultiplexer
-	logger       logging.ContextLogger
-	ipv4Only     bool
+	listen   string
+	mux      multiplexing.StreamMultiplexer
+	logger   logging.ContextLogger
+	ipv4Only bool
+
+	cfgMu        sync.RWMutex
 	filter       *geofilter.Filter
 	blockUnknown bool
-	ln           net.Listener
+
+	lnMu sync.Mutex
+	ln   net.Listener
+
+	sem chan struct{}
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
+
+	handshakeTimeout time.Duration
+	requestTimeout   time.Duration
+	halfCloseIdle    time.Duration
 }
 
 func NewLocalServer(listen string, m multiplexing.StreamMultiplexer, log logging.ContextLogger, ipv4Only bool) *LocalServer {
@@ -51,28 +72,57 @@ func NewLocalServer(listen string, m multiplexing.StreamMultiplexer, log logging
 		mux:      m,
 		logger:   log,
 		ipv4Only: ipv4Only,
+		sem:      make(chan struct{}, maxConcurrentConns),
+		stopCh:   make(chan struct{}),
 	}
 }
 
 func (s *LocalServer) SetGeoFilter(filter *geofilter.Filter, blockUnknown bool) {
+	s.cfgMu.Lock()
 	s.filter = filter
 	s.blockUnknown = blockUnknown
+	s.cfgMu.Unlock()
 }
 
 func (s *LocalServer) routeFor(ip net.IP) (bypass bool, block bool) {
-	if s.filter == nil {
+	s.cfgMu.RLock()
+	filter := s.filter
+	blockUnknown := s.blockUnknown
+	s.cfgMu.RUnlock()
+	if filter == nil {
 		return false, false
 	}
-	if action, ok := s.filter.MatchAction(ip); ok {
+	if action, ok := filter.MatchAction(ip); ok {
 		if action == geofilter.ActionBypass {
 			return true, false
 		}
 		return false, true
 	}
-	if s.blockUnknown {
+	if blockUnknown {
 		return false, true
 	}
 	return false, false
+}
+
+func (s *LocalServer) handshakeDeadline() time.Duration {
+	if s.handshakeTimeout > 0 {
+		return s.handshakeTimeout
+	}
+	return defaultHandshakeTime
+}
+
+func (s *LocalServer) requestDeadline() time.Duration {
+	if s.requestTimeout > 0 {
+		return s.requestTimeout
+	}
+	return defaultRequestTime
+}
+
+func (s *LocalServer) idleTimeout() time.Duration {
+	if s.halfCloseIdle > 0 {
+		return s.halfCloseIdle
+	}
+	return defaultHalfCloseIdle
 }
 
 func (s *LocalServer) ListenAndServe(ctx context.Context) error {
@@ -80,13 +130,22 @@ func (s *LocalServer) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.lnMu.Lock()
 	s.ln = ln
+	s.lnMu.Unlock()
 	s.logger.Info("socks5: listening on ", s.listen)
 
 	go func() {
 		<-ctx.Done()
 		ln.Close()
 	}()
+
+	if s.sem == nil {
+		s.sem = make(chan struct{}, maxConcurrentConns)
+	}
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -96,25 +155,52 @@ func (s *LocalServer) ListenAndServe(ctx context.Context) error {
 			}
 			return err
 		}
-		go s.handle(ctx, conn)
+		select {
+		case s.sem <- struct{}{}:
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil
+		case <-s.stopCh:
+			_ = conn.Close()
+			return nil
+		}
+		go func(c net.Conn) {
+			defer func() { <-s.sem }()
+			s.handle(ctx, c)
+		}(conn)
 	}
 }
 
 func (s *LocalServer) Stop() {
-	if s.ln != nil {
-		s.ln.Close()
+	s.stopOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	})
+	s.lnMu.Lock()
+	ln := s.ln
+	s.lnMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
 	}
 }
 
 func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
+	if d := s.handshakeDeadline(); d > 0 {
+		_ = conn.SetDeadline(time.Now().Add(d))
+	}
 	if err := s.negotiate(conn); err != nil {
 		s.logger.Warn("socks5: negotiate: ", err)
 		return
 	}
 
+	if d := s.requestDeadline(); d > 0 {
+		_ = conn.SetDeadline(time.Now().Add(d))
+	}
 	host, port, err := s.readRequest(conn)
+	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		s.logger.Warn("socks5: request: ", err)
 		return
@@ -146,7 +232,11 @@ func (s *LocalServer) handle(ctx context.Context, conn net.Conn) {
 		s.sendReply(conn, repGeneralFailure)
 		return
 	}
-	defer stream.Close()
+	defer func() {
+		if err := stream.Close(); err != nil {
+			s.logger.Debug("socks5: close stream: ", err)
+		}
+	}()
 
 	if err := s.sendReply(conn, repSuccess); err != nil {
 		return
@@ -195,7 +285,11 @@ func (s *LocalServer) handleDirect(ctx context.Context, conn net.Conn, host stri
 		s.sendReply(conn, repGeneralFailure)
 		return
 	}
-	defer direct.Close()
+	defer func() {
+		if err := direct.Close(); err != nil {
+			s.logger.Debug("socks5: close direct conn: ", err)
+		}
+	}()
 
 	if err := s.sendReply(conn, repSuccess); err != nil {
 		return
@@ -204,21 +298,131 @@ func (s *LocalServer) handleDirect(ctx context.Context, conn net.Conn, host stri
 }
 
 func (s *LocalServer) pipe(ctx context.Context, conn net.Conn, remote net.Conn) {
+	idle := s.idleTimeout()
+
 	stopWatch := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close()
-			remote.Close()
+			_ = conn.Close()
+			_ = remote.Close()
 		case <-stopWatch:
 		}
 	}()
 	defer close(stopWatch)
 
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(remote, conn); done <- struct{}{} }()
-	go func() { io.Copy(conn, remote); done <- struct{}{} }()
+	var halfClosed atomic.Bool
+
+	var idleMu sync.Mutex
+	var idleTimer *time.Timer
+	idleArmed := false
+	touch := func() {
+		idleMu.Lock()
+		if idleArmed && idleTimer != nil {
+			idleTimer.Reset(idle)
+		}
+		idleMu.Unlock()
+	}
+	armIdle := func() {
+		idleMu.Lock()
+		idleArmed = true
+		idleTimer = time.AfterFunc(idle, func() {
+			_ = conn.Close()
+			_ = remote.Close()
+		})
+		idleMu.Unlock()
+	}
+	defer func() {
+		idleMu.Lock()
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
+		idleArmed = false
+		idleMu.Unlock()
+	}()
+
+	copyHalf := func(dst, src net.Conn) error {
+		buf, put := getCopyBuf(copyBufSize)
+		defer put()
+		for {
+			if halfClosed.Load() {
+				_ = src.SetReadDeadline(time.Now().Add(idle))
+			}
+			n, err := src.Read(buf)
+			if n > 0 {
+				if werr := writeAll(dst, buf[:n]); werr != nil {
+					return werr
+				}
+				touch()
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	type direction int
+	const (
+		dirClient direction = iota
+		dirRemote
+	)
+	done := make(chan direction, 2)
+
+	go func() {
+		err := copyHalf(remote, conn)
+		if err != nil && ctx.Err() == nil {
+			s.logger.Debug("socks5: copy client->remote: ", err)
+		}
+		closeWriteConn(remote)
+		done <- dirClient
+	}()
+	go func() {
+		err := copyHalf(conn, remote)
+		if err != nil && ctx.Err() == nil {
+			s.logger.Debug("socks5: copy remote->client: ", err)
+		}
+		closeWriteConn(conn)
+		done <- dirRemote
+	}()
+
 	<-done
+	halfClosed.Store(true)
+	armIdle()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		_ = conn.Close()
+		_ = remote.Close()
+		<-done
+	}
+}
+
+func writeAll(dst net.Conn, p []byte) error {
+	for len(p) > 0 {
+		n, err := dst.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func closeWriteConn(c net.Conn) {
+	if c == nil {
+		return
+	}
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 func (s *LocalServer) negotiate(conn net.Conn) error {

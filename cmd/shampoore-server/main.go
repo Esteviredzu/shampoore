@@ -80,16 +80,6 @@ func main() {
 	if err := filter.LoadDir(*rulesDir); err != nil {
 		logger.Warn("server: rules load: ", err)
 	}
-	hasEnabled := false
-	for _, r := range filter.Rules() {
-		if r.Enabled {
-			hasEnabled = true
-			break
-		}
-	}
-	if !hasEnabled {
-		filter.EnableAll()
-	}
 
 	for _, r := range filter.Rules() {
 		logger.Info("server: rule loaded: ", r.Name, " cidrs=", len(r.CIDRs), " enabled=", r.Enabled)

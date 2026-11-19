@@ -54,7 +54,8 @@ type Pipe struct {
 
 	ctx      context.Context
 	cancel   context.CancelFunc
-	started  bool
+	startMu  sync.Mutex
+	started  atomic.Bool
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 
@@ -62,6 +63,9 @@ type Pipe struct {
 
 	keyframe   []byte
 	frameCount int
+	idleFrame  []byte
+	dataBuf    []byte
+	frameBuf   []byte
 
 	stFrames     atomic.Int64
 	stBytes      atomic.Int64
@@ -70,6 +74,8 @@ type Pipe struct {
 	stRecvMsgs   atomic.Int64
 	stDrops      atomic.Int64
 	stKeyframes  atomic.Int64
+	stBadLen     atomic.Int64
+	stSendErr    atomic.Int64
 
 	ctr transport.Counters
 }
@@ -106,7 +112,9 @@ func New(ch channel.MediaChannel, cfg Config, logger logging.ContextLogger) *Pip
 }
 
 func (p *Pipe) Start(ctx context.Context) error {
-	if p.started {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	if p.started.Load() {
 		return nil
 	}
 	kf, err := generateVP8Keyframe(keyframeW, keyframeH)
@@ -117,10 +125,19 @@ func (p *Pipe) Start(ctx context.Context) error {
 		return errors.New("raw: empty keyframe")
 	}
 	p.keyframe = kf
+
+	idle := make([]byte, fakeVP8Hdr+payloadHdr)
+	copy(idle, fakePFrameHeader)
+	binary.LittleEndian.PutUint32(idle[fakeVP8Hdr:fakeVP8Hdr+4], 0)
+	binary.LittleEndian.PutUint32(idle[fakeVP8Hdr+4:fakeVP8Hdr+8], crc32.ChecksumIEEE(nil))
+	p.idleFrame = idle
+	p.dataBuf = make([]byte, 0, p.maxData)
+	p.frameBuf = make([]byte, 0, p.cfg.FrameSize)
+
 	p.logger.Info("raw: keyframe ready; size=", len(kf), " gop=", p.cfg.GOP)
 
 	p.ctx, p.cancel = context.WithCancel(ctx)
-	p.started = true
+	p.started.Store(true)
 	p.wg.Add(2)
 	go p.sendLoop()
 	go p.recvLoop()
@@ -131,9 +148,12 @@ func (p *Pipe) Start(ctx context.Context) error {
 }
 
 func (p *Pipe) Stop(ctx context.Context) error {
+	p.startMu.Lock()
+	cancel := p.cancel
+	p.startMu.Unlock()
 	p.stopOnce.Do(func() {
-		if p.cancel != nil {
-			p.cancel()
+		if cancel != nil {
+			cancel()
 		}
 	})
 	p.wg.Wait()
@@ -149,7 +169,7 @@ func (p *Pipe) WalkLayers() []transport.Layer {
 }
 
 func (p *Pipe) SendMessage(ctx context.Context, data []byte, key string) error {
-	if !p.started {
+	if !p.started.Load() {
 		return errors.New("raw: not started")
 	}
 	if len(data) == 0 {
@@ -229,7 +249,10 @@ func (p *Pipe) sendLoop() {
 			if p.ctx.Err() != nil {
 				return
 			}
-			p.logger.Warn("raw: send error: ", err)
+			n := p.stSendErr.Add(1)
+			if n <= 5 || n%300 == 0 {
+				p.logger.Warn("raw: send error (total=", n, "): ", err)
+			}
 		}
 	}
 }
@@ -264,50 +287,36 @@ func (p *Pipe) emitKeyframe() error {
 	}
 	p.ctr.NetworkSent.Add(int64(len(p.keyframe)))
 	p.ctr.FramesSent.Add(1)
-	n := p.stFrames.Add(1)
-	k := p.stKeyframes.Add(1)
-	p.logger.Debug("raw: SEND KEYFRAME #", k,
-		" vp8=", len(p.keyframe), " total_frames=", n)
+	p.stFrames.Add(1)
+	p.stKeyframes.Add(1)
 	return nil
 }
 
 func (p *Pipe) sendIdle() error {
-	payload := make([]byte, payloadHdr)
-	binary.LittleEndian.PutUint32(payload[0:4], 0)
-	binary.LittleEndian.PutUint32(payload[4:8], crc32.ChecksumIEEE(nil))
-
-	frame := make([]byte, fakeVP8Hdr+len(payload))
-	copy(frame, fakePFrameHeader)
-	copy(frame[fakeVP8Hdr:], payload)
-
-	if err := p.ch.WriteRawVP8(frame); err != nil {
+	if err := p.ch.WriteRawVP8(p.idleFrame); err != nil {
 		return err
 	}
-	p.ctr.NetworkSent.Add(int64(len(frame)))
+	p.ctr.NetworkSent.Add(int64(len(p.idleFrame)))
 	p.ctr.FramesSent.Add(1)
-	n := p.stFrames.Add(1)
-	if n <= 5 || n%300 == 0 {
-		p.logger.Debug("raw: SEND idle #", n, " vp8=", len(frame))
-	}
+	p.stFrames.Add(1)
 	return nil
 }
 
 func (p *Pipe) emitPFrame(batch [][]byte) error {
-	data := make([]byte, 0, p.maxData)
+	data := p.dataBuf[:0]
 	for _, m := range batch {
 		n := len(m)
 		data = append(data, byte(n), byte(n>>8))
 		data = append(data, m...)
 	}
 
-	payload := make([]byte, payloadHdr+len(data))
-	binary.LittleEndian.PutUint32(payload[0:4], uint32(len(data)))
-	binary.LittleEndian.PutUint32(payload[4:8], crc32.ChecksumIEEE(data))
-	copy(payload[payloadHdr:], data)
-
-	frame := make([]byte, fakeVP8Hdr+len(payload))
-	copy(frame, fakePFrameHeader)
-	copy(frame[fakeVP8Hdr:], payload)
+	frame := p.frameBuf[:0]
+	frame = append(frame, fakePFrameHeader...)
+	var hdr [payloadHdr]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(data)))
+	binary.LittleEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(data))
+	frame = append(frame, hdr[:]...)
+	frame = append(frame, data...)
 
 	if err := p.ch.WriteRawVP8(frame); err != nil {
 		return err
@@ -318,10 +327,8 @@ func (p *Pipe) emitPFrame(batch [][]byte) error {
 	p.ctr.FramesSent.Add(1)
 	p.ctr.MessagesSent.Add(int64(len(batch)))
 
-	n := p.stFrames.Add(1)
+	p.stFrames.Add(1)
 	p.stBytes.Add(int64(len(data)))
-	p.logger.Debug("raw: SEND P-frame #", n,
-		" msgs=", len(batch), " data=", len(data), " vp8=", len(frame))
 	return nil
 }
 
@@ -350,11 +357,8 @@ func (p *Pipe) recvLoop() {
 		p.ctr.NetworkRecv.Add(int64(len(raw)))
 
 		if (raw[0] & 0x01) == 0 {
-			rf := p.stRecvFrames.Add(1)
+			p.stRecvFrames.Add(1)
 			p.ctr.FramesRecv.Add(1)
-			if rf <= 5 || rf%300 == 0 {
-				p.logger.Debug("raw: RECV KEYFRAME #", rf, " raw=", len(raw))
-			}
 			continue
 		}
 
@@ -368,8 +372,12 @@ func (p *Pipe) recvLoop() {
 		}
 
 		if int(length) > len(payload)-payloadHdr {
-			p.logger.Warn("raw: BAD-LEN raw=", len(raw),
-				" length=", length, " avail=", len(payload)-payloadHdr)
+			n := p.stBadLen.Add(1)
+			if n <= 5 || n%300 == 0 {
+				p.logger.Warn("raw: bad length raw=", len(raw),
+					" length=", length, " avail=", len(payload)-payloadHdr,
+					" total=", n)
+			}
 			continue
 		}
 		crcGot := binary.LittleEndian.Uint32(payload[4:8])
@@ -404,16 +412,12 @@ func (p *Pipe) recvLoop() {
 				return
 			}
 		}
-		rf := p.stRecvFrames.Add(1)
+		p.stRecvFrames.Add(1)
 		p.ctr.FramesRecv.Add(1)
 		p.ctr.UsefulRecv.Add(int64(len(data)))
 		p.ctr.MessagesRecv.Add(int64(n))
 		p.stRecvBytes.Add(int64(len(data)))
 		p.stRecvMsgs.Add(int64(n))
-		if n > 0 {
-			p.logger.Debug("raw: RECV P-frame #", rf,
-				" msgs=", n, " data=", len(data), " raw=", len(raw))
-		}
 	}
 }
 

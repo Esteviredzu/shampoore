@@ -6,9 +6,11 @@ import (
 	"errors"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 var defaults = app.Values{
@@ -56,10 +58,18 @@ func init() {
 				Required: false,
 				Hint:     "Add random padding to hide message sizes",
 			},
+			{
+				Key:      "allow_insecure_ws",
+				Label:    "Allow insecure ws://",
+				Type:     app.FieldTypeBool,
+				Required: false,
+				Hint:     "Allow plaintext ws:// URLs (encryption stays optional)",
+			},
 		},
 		Defaults:  defaults,
 		DecodeURL: decodeURL,
 		EncodeURL: encodeURL,
+		Validate:  validate,
 		Build:     build,
 	})
 	if err != nil {
@@ -68,11 +78,12 @@ func init() {
 }
 
 type Config struct {
-	ServerURL string `json:"server_url"`
-	Room      string `json:"room"`
-	Password  string `json:"password"`
-	Batch     bool   `json:"batch,omitempty"`
-	Padding   bool   `json:"padding,omitempty"`
+	ServerURL       string `json:"server_url"`
+	Room            string `json:"room"`
+	Password        string `json:"password"`
+	Batch           bool   `json:"batch,omitempty"`
+	Padding         bool   `json:"padding,omitempty"`
+	AllowInsecureWS bool   `json:"allow_insecure_ws,omitempty"`
 }
 
 func decodeURL(q url.Values) (json.RawMessage, error) {
@@ -84,12 +95,14 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	}
 	batch, _ := strconv.ParseBool(q.Get("batch"))
 	padding, _ := strconv.ParseBool(q.Get("padding"))
+	allowInsecure, _ := strconv.ParseBool(q.Get("allow_insecure_ws"))
 	return json.Marshal(Config{
-		ServerURL: serverURL,
-		Room:      room,
-		Password:  password,
-		Batch:     batch,
-		Padding:   padding,
+		ServerURL:       serverURL,
+		Room:            room,
+		Password:        password,
+		Batch:           batch,
+		Padding:         padding,
+		AllowInsecureWS: allowInsecure,
 	})
 }
 
@@ -115,6 +128,9 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	if cfg.Padding {
 		q.Set("padding", "1")
 	}
+	if cfg.AllowInsecureWS {
+		q.Set("allow_insecure_ws", "1")
+	}
 	return nil
 }
 
@@ -135,6 +151,9 @@ func build(
 	if cfg.ServerURL == "" || cfg.Room == "" || cfg.Password == "" {
 		return nil, errors.New("raw_ws: server_url, room and password are required")
 	}
+	if err := validateSecureServerURL(cfg.ServerURL, cfg.AllowInsecureWS); err != nil {
+		return nil, err
+	}
 
 	wsURL, err := buildWSURL(cfg.ServerURL, cfg.Room)
 	if err != nil {
@@ -147,11 +166,25 @@ func build(
 
 	bypass := []string{}
 	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Host != "" {
-		bypass = append(bypass, u.Host)
+		bypass = append(bypass, u.Hostname())
+		bypass = append(bypass, netdial.ResolveIPv4(ctx, u.Hostname())...)
 	}
 
 	return &app.BuildResult{
 		Transport:   t,
 		BypassHosts: bypass,
 	}, nil
+}
+
+func validate(raw json.RawMessage) error {
+	cfg := Config{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(cfg.ServerURL) == "" || strings.TrimSpace(cfg.Room) == "" || strings.TrimSpace(cfg.Password) == "" {
+		return errors.New("raw_ws: server_url, room and password are required")
+	}
+	return validateSecureServerURL(cfg.ServerURL, cfg.AllowInsecureWS)
 }

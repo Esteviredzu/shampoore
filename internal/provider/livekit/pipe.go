@@ -25,6 +25,7 @@ type Pipe struct {
 
 	recvCh chan []byte
 
+	ctxMu     sync.Mutex
 	ctx       context.Context
 	cancel    context.CancelFunc
 	started   atomic.Bool
@@ -33,6 +34,7 @@ type Pipe struct {
 
 	bytesSent atomic.Int64
 	bytesRecv atomic.Int64
+	dropped   atomic.Int64
 
 	ctr transport.Counters
 }
@@ -74,7 +76,9 @@ func (p *Pipe) Start(ctx context.Context) error {
 	if !p.started.CompareAndSwap(false, true) {
 		return nil
 	}
+	p.ctxMu.Lock()
 	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.ctxMu.Unlock()
 	return nil
 }
 
@@ -88,6 +92,7 @@ func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 		return
 	default:
 	}
+
 	select {
 	case p.recvCh <- data:
 		n := int64(len(data))
@@ -95,9 +100,12 @@ func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 		p.ctr.NetworkRecv.Add(n)
 		p.ctr.MessagesRecv.Add(1)
 		p.ctr.FramesRecv.Add(1)
-	case <-p.closed:
+	default:
+		p.dropped.Add(1)
 	}
 }
+
+func (p *Pipe) Dropped() int64 { return p.dropped.Load() }
 
 func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 	if len(data) > maxPacketSize {
@@ -162,8 +170,11 @@ func (p *Pipe) WalkLayers() []transport.Layer {
 
 func (p *Pipe) Stop(_ context.Context) error {
 	p.closeOnce.Do(func() {
-		if p.cancel != nil {
-			p.cancel()
+		p.ctxMu.Lock()
+		cancel := p.cancel
+		p.ctxMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 		close(p.closed)
 	})

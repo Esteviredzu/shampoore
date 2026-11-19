@@ -30,11 +30,28 @@
   <p id="msg" class="row-msg"></p>
 
 <script>
-const token = localStorage.getItem('panel_token') || '';
-const headers = token ? { 'X-Panel-Token': token } : {};
+function esc(value) {
+  return String(value).replace(/[&<>"'`]/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;'
+  }[ch]));
+}
+
+async function request(path, opts = {}) {
+  opts.credentials = 'same-origin';
+  const res = await fetch(path, opts);
+  if (res.status === 401) {
+    window.location.replace('/login');
+    throw new Error('unauthorized');
+  }
+  return res;
+}
 
 async function load() {
-  const res = await fetch('/api/rules', { headers });
+  const res = await request('/api/rules');
+  if (!res.ok) {
+    document.getElementById('rows').innerHTML = '<tr><td colspan="4">Failed to load rules.</td></tr>';
+    return;
+  }
   const rules = await res.json();
   const tbody = document.getElementById('rows');
   if (!rules.length) {
@@ -45,11 +62,11 @@ async function load() {
   for (const r of rules) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${r.name}</td>
+      <td>${esc(r.name)}</td>
       <td>${(r.cidrs || []).length}</td>
       <td><span class="pill ${r.enabled ? 'on' : 'off'}">${r.enabled ? 'enabled' : 'disabled'}</span></td>
       <td>
-        <button data-name="${r.name}" data-on="${r.enabled ? '0' : '1'}">${r.enabled ? 'Disable' : 'Enable'}</button>
+        <button data-name="${esc(r.name)}" data-on="${r.enabled ? '0' : '1'}">${r.enabled ? 'Disable' : 'Enable'}</button>
       </td>`;
     tbody.appendChild(tr);
   }
@@ -58,7 +75,7 @@ async function load() {
       const name = b.dataset.name;
       const on = b.dataset.on === '1';
       const url = `/api/rules/${encodeURIComponent(name)}/${on ? 'enable' : 'disable'}`;
-      const r = await fetch(url, { method: 'POST', headers });
+      const r = await request(url, { method: 'POST' });
       if (!r.ok) {
         document.getElementById('msg').textContent = 'Error: ' + (await r.text());
       }
@@ -68,7 +85,7 @@ async function load() {
 }
 
 document.getElementById('apply').addEventListener('click', async () => {
-  const r = await fetch('/api/rules/apply', { method: 'POST', headers });
+  const r = await request('/api/rules/apply', { method: 'POST' });
   const j = await r.json();
   document.getElementById('msg').textContent = j.ok
     ? (j.restarted ? 'Server restarted with new rules.' : 'Server was offline, changes will apply on next start.')
@@ -76,7 +93,9 @@ document.getElementById('apply').addEventListener('click', async () => {
   await load();
 });
 
-load();
+load().catch(e => {
+  document.getElementById('msg').textContent = 'Error: ' + e.message;
+});
 </script>
 </body>
 </html>

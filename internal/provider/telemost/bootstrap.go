@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
 const (
@@ -61,8 +63,9 @@ func bootstrap(ctx context.Context, cfg *Config) (*bootstrapResult, error) {
 		return nil, err
 	}
 	httpClient := &http.Client{
-		Timeout: httpTimeout,
-		Jar:     jar,
+		Timeout:   httpTimeout,
+		Jar:       jar,
+		Transport: netdial.NewHTTPTransport(),
 	}
 
 	instID := newUUID()

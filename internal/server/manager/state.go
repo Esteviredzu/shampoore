@@ -2,6 +2,8 @@ package manager
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,8 +20,15 @@ type State struct {
 func LoadState(dir string) (*State, error) {
 	path := filepath.Join(dir, StateFileName)
 	s := &State{path: path, data: map[string]bool{}}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &s.data)
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &s.data); err != nil {
+			return nil, fmt.Errorf("state: parse %s: %w", path, err)
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return nil, fmt.Errorf("state: read %s: %w", path, err)
 	}
 	if s.data == nil {
 		s.data = map[string]bool{}
@@ -50,12 +59,14 @@ func (s *State) Remove(name string) error {
 
 func (s *State) saveLocked() error {
 	if len(s.data) == 0 {
-		_ = os.Remove(s.path)
+		if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("state: remove %s: %w", s.path, err)
+		}
 		return nil
 	}
 	data, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0644)
+	return writeFile0600(s.path, data)
 }

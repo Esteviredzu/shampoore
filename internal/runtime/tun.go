@@ -144,8 +144,8 @@ func StartTUN(ctx context.Context, cfg TUNConfig, m multiplexing.StreamMultiplex
 	return nil
 }
 
-func StartTUNFD(ctx context.Context, fd int, mtu int) error {
-	return errors.New("tun/linux: StartTUNFD is not supported; use StartTUN")
+func StartTUNFD(ctx context.Context, fd int, mtu int) (<-chan error, error) {
+	return nil, errors.New("tun/linux: StartTUNFD is not supported; use StartTUN")
 }
 
 func setupRoutes(cfg TUNConfig, orig originalRoute, bypassIPs []string) (func(), error) {

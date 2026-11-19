@@ -53,6 +53,7 @@ type YandexPipe struct {
 	receiveErr error
 	resetCh    chan struct{}
 
+	flushMu        sync.Mutex
 	outboundMu     sync.Mutex
 	outboundBuf    map[string]string
 	outboundOrder  []string
@@ -75,6 +76,12 @@ type YandexPipe struct {
 	statsTicker  *time.Ticker
 
 	ctr transport.Counters
+}
+
+type outboundBatch struct {
+	orderLen int
+	ids      []string
+	values   []string
 }
 
 func NewYandexPipe(client *BoardClient, logger logging.ContextLogger, cfg PipeConfig) *YandexPipe {
@@ -124,11 +131,7 @@ func (p *YandexPipe) Stop(ctx context.Context) error {
 	p.cancel()
 	p.flushCloseMu.Do(func() { close(p.flushDone) })
 
-	p.outboundMu.Lock()
-	if len(p.outboundBuf) > 0 {
-		_ = p.flushOutboundLocked(context.Background())
-	}
-	p.outboundMu.Unlock()
+	_ = p.flushOutbound(context.Background())
 
 	p.deleteMu.Lock()
 	if len(p.deleteBuf) > 0 {
@@ -141,6 +144,12 @@ func (p *YandexPipe) Stop(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (p *YandexPipe) NotifyNetworkChanged() {
+	if p.client != nil {
+		p.client.NotifyNetworkChanged()
+	}
 }
 
 func (p *YandexPipe) SessionID() string   { return p.session }
@@ -214,57 +223,101 @@ func (p *YandexPipe) outboundFlushLoop() {
 		case <-p.flushDone:
 			return
 		case <-p.outboundTicker.C:
-			p.outboundMu.Lock()
-			if len(p.outboundBuf) > 0 {
-				_ = p.flushOutboundLocked(context.Background())
-			}
-			p.outboundMu.Unlock()
+			_ = p.flushOutbound(context.Background())
 		}
 	}
 }
 
-func (p *YandexPipe) flushOutboundLocked(ctx context.Context) error {
-	if len(p.outboundBuf) == 0 {
-		return nil
-	}
-
+func (p *YandexPipe) snapshotOutbound() outboundBatch {
 	batchSize := p.cfg.SendBatch
 	if batchSize <= 0 {
 		batchSize = 32
 	}
 
-	for len(p.outboundOrder) > 0 {
-		n := batchSize
-		if n > len(p.outboundOrder) {
-			n = len(p.outboundOrder)
+	p.outboundMu.Lock()
+	defer p.outboundMu.Unlock()
+
+	n := batchSize
+	if n > len(p.outboundOrder) {
+		n = len(p.outboundOrder)
+	}
+	batch := outboundBatch{orderLen: n}
+	if n == 0 {
+		return batch
+	}
+	batch.ids = make([]string, 0, n)
+	batch.values = make([]string, 0, n)
+	for _, id := range p.outboundOrder[:n] {
+		value, ok := p.outboundBuf[id]
+		if !ok {
+			continue
+		}
+		batch.ids = append(batch.ids, id)
+		batch.values = append(batch.values, value)
+	}
+	return batch
+}
+
+func (p *YandexPipe) ackOutbound(batch outboundBatch) {
+	p.outboundMu.Lock()
+	defer p.outboundMu.Unlock()
+
+	order := p.outboundOrder
+	n := batch.orderLen
+	if n > len(order) {
+		n = len(order)
+	}
+	tail := order[n:]
+	copy(order, tail)
+	order = order[:len(tail)]
+
+	for i, id := range batch.ids {
+		cur, ok := p.outboundBuf[id]
+		if !ok {
+			continue
+		}
+		if cur == batch.values[i] {
+			delete(p.outboundBuf, id)
+			continue
+		}
+		order = append(order, id)
+	}
+
+	p.outboundOrder = order
+	if len(order) == 0 {
+		p.outboundOrder = nil
+	}
+}
+
+func (p *YandexPipe) flushOutbound(ctx context.Context) error {
+
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	for {
+		batch := p.snapshotOutbound()
+		if batch.orderLen == 0 {
+			return nil
+		}
+		if len(batch.ids) == 0 {
+			p.ackOutbound(batch)
+			continue
 		}
 
-		objects := make([]map[string]any, 0, n)
-		valueChanges := make(map[string]bool, n)
-		ids := make([]string, 0, n)
+		objects := make([]map[string]any, 0, len(batch.ids))
+		valueChanges := make(map[string]bool, len(batch.ids))
 		var wire int64
-
-		for _, id := range p.outboundOrder[:n] {
-			value, ok := p.outboundBuf[id]
-			if !ok {
-				continue
-			}
+		for i, id := range batch.ids {
 			obj := createBoardObject(
-				id, value,
+				id, batch.values[i],
 				p.client.creds.Participant,
 				p.client.creds.Dashboard,
 			)
 			objects = append(objects, obj)
 			valueChanges[id] = false
-			ids = append(ids, id)
 			if b, err := json.Marshal(obj); err == nil {
 				wire += int64(len(b))
 			}
-		}
-
-		if len(objects) == 0 {
-			p.outboundOrder = p.outboundOrder[n:]
-			continue
 		}
 
 		cnt := len(objects)
@@ -276,16 +329,8 @@ func (p *YandexPipe) flushOutboundLocked(ctx context.Context) error {
 
 		p.ctr.NetworkSent.Add(wire)
 		p.ctr.FramesSent.Add(int64(cnt))
-
-		for _, id := range ids {
-			delete(p.outboundBuf, id)
-		}
-		p.outboundOrder = p.outboundOrder[n:]
-		if len(p.outboundOrder) == 0 {
-			p.outboundOrder = nil
-		}
+		p.ackOutbound(batch)
 	}
-	return nil
 }
 
 func (p *YandexPipe) receiveLoop() {

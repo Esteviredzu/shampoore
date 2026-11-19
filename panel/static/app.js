@@ -33,6 +33,7 @@ const state = {
   document.getElementById('btn-backup').addEventListener('click', () => {
     window.location.href = '/api/backup';
   });
+  document.getElementById('btn-logout').addEventListener('click', logout);
   document.getElementById('search').addEventListener('input', e => { state.search = e.target.value.toLowerCase(); render(); });
 
   await load();
@@ -113,15 +114,23 @@ window.changeSort = (sort) => {
   render();
 };
 
-const TOKEN = () => localStorage.getItem('shampoore_token') || '';
 async function api(path, opts = {}) {
+  opts.credentials = 'same-origin';
   opts.headers = Object.assign({ 'Accept': 'application/json' }, opts.headers || {});
-  if (TOKEN()) opts.headers['X-Panel-Token'] = TOKEN();
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    window.location.replace('/login');
+    throw new Error('unauthorized');
+  }
   const text = await res.text();
   let body = {}; try { body = text ? JSON.parse(text) : {}; } catch { body = { error: text }; }
   if (!res.ok) throw new Error(body.error || res.statusText);
   return body;
+}
+
+async function logout() {
+  try { await api('/api/logout', { method: 'POST' }); } catch (e) {}
+  window.location.replace('/login');
 }
 
 async function load() {

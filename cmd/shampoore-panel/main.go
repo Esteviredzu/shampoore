@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 func main() {
 	sockPath := flag.String("socket", "/tmp/shampoore.sock", "control socket of shampoore-server")
 	listen := flag.String("listen", "127.0.0.1:8080", "panel HTTP listen")
-	token := flag.String("token", "", "optional X-Panel-Token for /api/*")
+	token := flag.String("token", "", "panel access token; generated and logged when empty")
 	configsDir := flag.String("configs-dir", "./configs", "directory with managed configs")
 	rulesDir := flag.String("rules-dir", "./rules", "directory with geoip rule files")
 	autoStart := flag.Bool("auto-start-server", false,
@@ -34,6 +35,15 @@ func main() {
 	flag.Parse()
 
 	logger := logging.New("panel", true)
+
+	tokenValue, err := panel.EnsureToken(*token)
+	if err != nil {
+		logger.Error("panel: ", err)
+		os.Exit(1)
+	}
+	if strings.TrimSpace(*token) == "" {
+		logger.Info("panel: generated access token: ", tokenValue)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -46,9 +56,15 @@ func main() {
 	sup := panel.NewSupervisor(*sockPath, *configsDir, *rulesDir)
 	client := control.NewClient(*sockPath)
 
-	api := panel.New(client, sup, logger, *token, *configsDir, filter, *rulesDir)
+	api := panel.New(client, sup, logger, tokenValue, *configsDir, filter, *rulesDir)
 
-	srv := &http.Server{Addr: *listen, Handler: api.Handler()}
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		logger.Info("panel: listening on http://", *listen)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -62,7 +78,7 @@ func main() {
 			if err := sup.Start(); err != nil {
 				logger.Warn("panel: auto-start server failed: ", err)
 			} else {
-				logger.Info("panel: server auto-started")
+				logger.Info("panel: server start initiated")
 			}
 		}()
 	}
@@ -71,7 +87,9 @@ func main() {
 	logger.Info("panel: stopping")
 
 	shCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = srv.Shutdown(shCtx)
+	if err := srv.Shutdown(shCtx); err != nil {
+		logger.Warn("panel: shutdown: ", err)
+	}
 	c()
 	logger.Info("panel: stopped")
 }

@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	resetCooldown    = 2 * time.Second
-	maxPendingOutput = 4096
+	resetCooldown         = 2 * time.Second
+	maxPendingOutput      = 4096
+	maxPendingOutputBytes = 8 << 20
 )
 
 type Config struct {
@@ -37,6 +38,8 @@ type Config struct {
 	FECParityShards int
 
 	EncryptionPassword string
+
+	Role string
 }
 
 func DefaultConfig() Config {
@@ -65,23 +68,26 @@ type Session struct {
 	kcpMu       sync.Mutex
 	lastResetAt time.Time
 
-	outCount int
-	outMu    sync.Mutex
+	outMu          sync.Mutex
+	outCount       int
+	pendingOutput  []pendingChunk
+	pendingBytes   int
+	pendingDropped uint64
 
-	pendingOutput []pendingChunk
+	flushMu sync.Mutex
 
 	bytesDelivered atomic.Int64
 	bytesSent      atomic.Int64
 
 	ctr transport.Counters
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	started bool
-
-	mu     sync.Mutex
-	closed bool
+	mu       sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
+	started  bool
+	starting bool
+	closed   bool
+	wg       sync.WaitGroup
 }
 
 func NewSession(
@@ -97,7 +103,7 @@ func NewSession(
 	}
 
 	if cfg.EncryptionPassword != "" {
-		wrapped, err := security.WrapPipe(pipe, cfg.EncryptionPassword, logger)
+		wrapped, err := security.WrapPipeWithRole(pipe, cfg.EncryptionPassword, cfg.Role, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +195,13 @@ func (s *Session) WalkLayers() []transport.Layer {
 }
 
 func (s *Session) output(buf []byte, size int) {
+	if size <= 0 {
+		return
+	}
 	maxChunk := s.pipe.MaxMessageSize()
+	if maxChunk <= 0 {
+		maxChunk = size
+	}
 
 	start := 0
 	for start < size {
@@ -222,61 +234,126 @@ func (s *Session) output(buf []byte, size int) {
 			log.Printf("[kcp] output #%d size=%d", n, end-start)
 		}
 
-		key := uuid.NewString()
-		if err := s.pipe.SendMessage(s.ctx, data, key); err != nil {
-			s.outMu.Lock()
-			if len(s.pendingOutput) >= maxPendingOutput {
-				s.outMu.Unlock()
-				s.logger.Warn("kcp: pendingOutput overflow; dropping chunk (KCP will retransmit)")
-			} else {
-				s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
-				s.outMu.Unlock()
-				s.logger.Debug("kcp: output deferred: ", err)
-			}
-			continue
-		}
-		s.ctr.NetworkSent.Add(int64(len(data)))
+		s.enqueuePending(data, uuid.NewString())
 		start = end
 	}
 }
 
-func (s *Session) flushPendingOutput() {
+func (s *Session) enqueuePending(data []byte, key string) {
 	s.outMu.Lock()
-	if len(s.pendingOutput) == 0 {
+	if len(s.pendingOutput) >= maxPendingOutput ||
+		s.pendingBytes+len(data) > maxPendingOutputBytes {
+		s.pendingDropped++
+		dropped := s.pendingDropped
+		s.outMu.Unlock()
+
+		if dropped == 1 || dropped%1000 == 0 {
+			s.logger.Warn("kcp: pendingOutput overflow; dropped chunks=", dropped,
+				" (KCP will retransmit)")
+		}
+		return
+	}
+	s.pendingOutput = append(s.pendingOutput, pendingChunk{data: data, key: key})
+	s.pendingBytes += len(data)
+	s.outMu.Unlock()
+}
+
+func (s *Session) requeuePending(p pendingChunk) {
+	s.outMu.Lock()
+	if len(s.pendingOutput) >= maxPendingOutput ||
+		s.pendingBytes+len(p.data) > maxPendingOutputBytes {
+		s.pendingDropped++
 		s.outMu.Unlock()
 		return
 	}
-	batch := s.pendingOutput
-	s.pendingOutput = nil
+	s.pendingOutput = append([]pendingChunk{p}, s.pendingOutput...)
+	s.pendingBytes += len(p.data)
 	s.outMu.Unlock()
+}
 
-	for i, p := range batch {
-		if err := s.pipe.SendMessage(s.ctx, p.data, p.key); err != nil {
-			s.outMu.Lock()
-			s.pendingOutput = append(batch[i:], s.pendingOutput...)
+func (s *Session) flushPendingOutput() {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	ctx := s.sessionContext()
+	for {
+		s.outMu.Lock()
+		if len(s.pendingOutput) == 0 {
 			s.outMu.Unlock()
+			return
+		}
+		p := s.pendingOutput[0]
+		s.pendingOutput[0] = pendingChunk{}
+		s.pendingOutput = s.pendingOutput[1:]
+		s.pendingBytes -= len(p.data)
+		s.outMu.Unlock()
+
+		if err := s.pipe.SendMessage(ctx, p.data, p.key); err != nil {
+			s.requeuePending(p)
+			s.logger.Debug("kcp: output deferred: ", err)
 			return
 		}
 		s.ctr.NetworkSent.Add(int64(len(p.data)))
 	}
 }
 
+func (s *Session) clearPendingOutput() {
+	s.outMu.Lock()
+	s.pendingOutput = nil
+	s.pendingBytes = 0
+	s.outMu.Unlock()
+}
+
+func (s *Session) sessionContext() context.Context {
+	s.mu.Lock()
+	ctx := s.ctx
+	s.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 func (s *Session) Start(ctx context.Context) error {
-	if s.started {
+	s.mu.Lock()
+	if s.started || s.starting {
+		s.mu.Unlock()
 		return nil
 	}
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("kcp: session closed")
+	}
+	s.starting = true
+	s.mu.Unlock()
+
 	if err := s.pipe.Start(ctx); err != nil {
+		s.mu.Lock()
+		s.starting = false
+		s.mu.Unlock()
 		return err
 	}
 
+	s.mu.Lock()
+	if s.closed {
+		s.starting = false
+		s.mu.Unlock()
+		if err := s.pipe.Stop(context.Background()); err != nil {
+			s.logger.Warn("kcp: pipe stop after aborted start: ", err)
+		}
+		return errors.New("kcp: session closed during start")
+	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.started = true
+	s.starting = false
+
+	s.wg.Add(2)
+	s.mu.Unlock()
 
 	s.logger.Info("kcp: started; conv=", s.conv,
 		" mtu=", s.cfg.MTU,
 		" window=", s.cfg.Window)
 
-	s.wg.Add(2)
 	go s.recvLoop()
 	go s.updateLoop()
 	return nil
@@ -304,6 +381,12 @@ func (s *Session) Reset() error {
 
 	s.logger.Info("kcp: session reset; conv=", s.conv)
 	return nil
+}
+
+func (s *Session) NotifyNetworkChanged() {
+	if n, ok := s.pipe.(interface{ NotifyNetworkChanged() }); ok {
+		n.NotifyNetworkChanged()
+	}
 }
 
 func (s *Session) recvLoop() {
@@ -337,6 +420,8 @@ func (s *Session) recvLoop() {
 		if ret < 0 {
 			s.logger.Warn("kcp: Input failed with code ", ret, " for ", len(data), " bytes")
 		}
+
+		s.flushPendingOutput()
 	}
 }
 
@@ -354,6 +439,8 @@ func (s *Session) updateLoop() {
 			s.kcpMu.Lock()
 			s.kcp.Update()
 			s.kcpMu.Unlock()
+
+			s.flushPendingOutput()
 		}
 	}
 }
@@ -368,6 +455,13 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 	default:
 	}
 
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return errors.New("kcp: session closed")
+	}
+
 	s.kcpMu.Lock()
 	ret := s.kcp.Send(data)
 	s.kcpMu.Unlock()
@@ -376,6 +470,8 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 	}
 	s.bytesSent.Add(int64(len(data)))
 	s.ctr.UsefulSent.Add(int64(len(data)))
+
+	s.flushPendingOutput()
 	return nil
 }
 
@@ -438,13 +534,19 @@ func (s *Session) Stop(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	cancel := s.cancel
 	s.mu.Unlock()
 
-	if s.cancel != nil {
-		s.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	s.wg.Wait()
-	return s.pipe.Stop(ctx)
+
+	s.flushMu.Lock()
+	s.clearPendingOutput()
+	err := s.pipe.Stop(ctx)
+	s.flushMu.Unlock()
+	return err
 }
 
 var _ transport.Transport = (*Session)(nil)

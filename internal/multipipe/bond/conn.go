@@ -3,6 +3,7 @@ package bond
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type tubeLike interface {
@@ -24,11 +26,28 @@ const (
 	samplePeriod    = 2 * time.Second
 	enqueueDeadline = 30 * time.Second
 	enqueueWaitTick = 200 * time.Millisecond
+
+	maxReorderChunks  = 1024
+	defaultGapTimeout = 5 * time.Second
+	minGapTick        = 10 * time.Millisecond
+
+	maxConsecutiveResets = 8
 )
+
+var errSubflowReceiveStopped = errors.New("subflow receive stopped")
 
 type queuedChunk struct {
 	seq  uint32
 	data []byte
+}
+
+type connOptions struct {
+	maxReorder int
+	gapTimeout time.Duration
+}
+
+func defaultConnOptions() connOptions {
+	return connOptions{maxReorder: maxReorderChunks, gapTimeout: defaultGapTimeout}
 }
 
 type BondConn struct {
@@ -39,15 +58,26 @@ type BondConn struct {
 	maxPayload int
 	logger     logging.ContextLogger
 
+	maxReorder int
+	gapTimeout time.Duration
+
 	sendSeq atomic.Uint32
 	recvSeq uint32
 
 	readySignal chan struct{}
 
-	mu      sync.Mutex
-	reorder map[uint32][]byte
-	readCh  chan []byte
-	readBuf []byte
+	mu       sync.Mutex
+	reorder  map[uint32][]byte
+	gapSince time.Time
+	readCh   chan []byte
+	readBuf  []byte
+
+	readers atomic.Int32
+
+	failOnce sync.Once
+	failErr  error
+	failed   chan struct{}
+	readErr  chan error
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -60,6 +90,23 @@ func NewBondConn(
 	tubes []tubeLike,
 	logger logging.ContextLogger,
 ) *BondConn {
+	return newBondConn(ctx, names, tubes, logger, defaultConnOptions())
+}
+
+func newBondConn(
+	ctx context.Context,
+	names []string,
+	tubes []tubeLike,
+	logger logging.ContextLogger,
+	opts connOptions,
+) *BondConn {
+	if opts.maxReorder <= 0 {
+		opts.maxReorder = maxReorderChunks
+	}
+	if opts.gapTimeout <= 0 {
+		opts.gapTimeout = defaultGapTimeout
+	}
+
 	c, cancel := context.WithCancel(ctx)
 
 	maxPayload := 65535
@@ -81,12 +128,17 @@ func NewBondConn(
 		sched:       newScheduler(names, tubes),
 		maxPayload:  maxPayload,
 		logger:      logger,
+		maxReorder:  opts.maxReorder,
+		gapTimeout:  opts.gapTimeout,
 		readySignal: make(chan struct{}, 1),
 		reorder:     make(map[uint32][]byte),
 		readCh:      make(chan []byte, 512),
+		failed:      make(chan struct{}),
+		readErr:     make(chan error, 1),
 		closed:      make(chan struct{}),
 	}
 
+	bc.readers.Store(int32(len(bc.sched.subflows)))
 	for _, sf := range bc.sched.subflows {
 		bc.wg.Add(1)
 		go bc.readLoop(sf)
@@ -95,8 +147,46 @@ func NewBondConn(
 	}
 	bc.wg.Add(1)
 	go bc.statsLoop()
+	bc.wg.Add(1)
+	go bc.gapLoop()
 
 	return bc
+}
+
+func (bc *BondConn) fail(reason error) {
+	if reason == nil {
+		return
+	}
+	bc.failOnce.Do(func() {
+		if bc.logger != nil {
+			bc.logger.Warn("bond: session reset: ", reason)
+		}
+		bc.failErr = fmt.Errorf("%w: %v", transport.ErrTransportReset, reason)
+		select {
+		case bc.readErr <- bc.failErr:
+		default:
+		}
+		close(bc.failed)
+		bc.cancel()
+	})
+}
+
+func (bc *BondConn) terminalErr() error {
+	select {
+	case <-bc.failed:
+		return bc.failErr
+	default:
+		return nil
+	}
+}
+
+func (bc *BondConn) isClosed() bool {
+	select {
+	case <-bc.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (bc *BondConn) MaxPayload() int { return bc.maxPayload }
@@ -108,6 +198,8 @@ func (bc *BondConn) workerLoop(sf *subflow) {
 	for {
 		select {
 		case <-bc.closed:
+			return
+		case <-bc.failed:
 			return
 		case chunk := <-sf.queue:
 			select {
@@ -125,80 +217,170 @@ func (bc *BondConn) sendChunk(sf *subflow, chunk queuedChunk) {
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(chunk.data)))
 	copy(buf[frameHeaderSize:], chunk.data)
 
-	ctx, cancel := context.WithTimeout(bc.ctx, writeTimeout)
-	err := sf.tube.Send(ctx, buf)
-	cancel()
-	if err == nil {
-		sf.sentBytes.Add(int64(len(chunk.data)))
-		bc.sched.MarkAlive(sf)
-		return
-	}
+	tried := map[*subflow]struct{}{sf: {}}
+	path := sf
+	var lastErr error
 
-	bc.sched.MarkDead(sf, err)
-	if bc.logger != nil {
-		bc.logger.Warn("bond: send on ", sf.name, " failed: ", err)
-	}
+	for {
+		if bc.terminalErr() != nil || bc.isClosed() {
+			return
+		}
 
-	alt := bc.sched.pickNonFull(sf)
-	if alt == nil {
-		if bc.logger != nil {
-			bc.logger.Warn("bond: chunk seq=", chunk.seq,
-				" lost (no other alive path)")
+		ctx, cancel := context.WithTimeout(bc.ctx, writeTimeout)
+		err := path.tube.Send(ctx, buf)
+		cancel()
+		if err == nil {
+			path.sentBytes.Add(int64(len(chunk.data)))
+			bc.sched.MarkAlive(path)
+			return
 		}
-		return
-	}
-	ctx2, cancel2 := context.WithTimeout(bc.ctx, writeTimeout)
-	err2 := alt.tube.Send(ctx2, buf)
-	cancel2()
-	if err2 != nil {
-		bc.sched.MarkDead(alt, err2)
+
+		lastErr = err
+		bc.sched.MarkDead(path, err)
 		if bc.logger != nil {
-			bc.logger.Warn("bond: chunk seq=", chunk.seq,
-				" lost (retry on ", alt.name, " failed: ", err2, ")")
+			bc.logger.Warn("bond: send on ", path.name, " failed: ", err)
 		}
-		return
+
+		alt := bc.sched.pickAlive(tried)
+		if alt == nil {
+			bc.fail(fmt.Errorf(
+				"bond: chunk seq=%d lost: no alive subflow could deliver it (last error: %v)",
+				chunk.seq, lastErr))
+			return
+		}
+		tried[alt] = struct{}{}
+		path = alt
 	}
-	alt.sentBytes.Add(int64(len(chunk.data)))
-	bc.sched.MarkAlive(alt)
 }
 
 func (bc *BondConn) readLoop(sf *subflow) {
 	defer bc.wg.Done()
+	defer func() {
+
+		bc.sched.MarkDead(sf, errSubflowReceiveStopped)
+		if bc.readers.Add(-1) == 0 && bc.terminalErr() == nil && !bc.isClosed() {
+			bc.fail(errors.New("bond: all subflows stopped receiving"))
+		}
+	}()
+
+	resets := 0
 	for {
 		data, err := sf.tube.Receive(bc.ctx)
 		if err != nil {
+			if errors.Is(err, transport.ErrTransportReset) && bc.ctx.Err() == nil {
+
+				if bc.logger != nil {
+					bc.logger.Warn("bond: subflow ", sf.name, " transport reset: ", err)
+				}
+				resets++
+				if resets > maxConsecutiveResets {
+
+					bc.fail(fmt.Errorf("bond: subflow %s keeps resetting without delivering data", sf.name))
+					return
+				}
+				continue
+			}
 			return
 		}
+		resets = 0
+
 		seq, payload, err := decodeFrame(data)
 		if err != nil {
-			continue
+
+			bc.fail(fmt.Errorf("bond: bad frame from %s: %w", sf.name, err))
+			return
+		}
+		bc.deliver(seq, payload)
+	}
+}
+
+func (bc *BondConn) deliver(seq uint32, payload []byte) {
+	bc.mu.Lock()
+
+	if seq < bc.recvSeq {
+		bc.mu.Unlock()
+		return
+	}
+	if _, exists := bc.reorder[seq]; exists {
+		bc.mu.Unlock()
+		return
+	}
+	if seq != bc.recvSeq && len(bc.reorder) >= bc.maxReorder {
+		expected := bc.recvSeq
+		bc.mu.Unlock()
+		bc.fail(fmt.Errorf("bond: reorder buffer overflow at seq=%d (expected %d)", seq, expected))
+		return
+	}
+
+	bc.reorder[seq] = payload
+	if seq != bc.recvSeq && bc.gapSince.IsZero() {
+		bc.gapSince = time.Now()
+	}
+
+	for {
+		next, ok := bc.reorder[bc.recvSeq]
+		if !ok {
+			break
+		}
+		delete(bc.reorder, bc.recvSeq)
+		bc.recvSeq++
+		select {
+		case bc.readCh <- next:
+		case <-bc.closed:
+			bc.mu.Unlock()
+			return
+		case <-bc.failed:
+			bc.mu.Unlock()
+			return
+		}
+	}
+
+	if len(bc.reorder) == 0 {
+		bc.gapSince = time.Time{}
+	}
+	bc.mu.Unlock()
+}
+
+func (bc *BondConn) gapLoop() {
+	defer bc.wg.Done()
+
+	tick := bc.gapTimeout / 4
+	if tick < minGapTick {
+		tick = minGapTick
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bc.closed:
+			return
+		case <-bc.failed:
+			return
+		case <-ticker.C:
 		}
 
 		bc.mu.Lock()
-		if seq < bc.recvSeq {
-			bc.mu.Unlock()
-			continue
-		}
-		if _, exists := bc.reorder[seq]; exists {
-			bc.mu.Unlock()
-			continue
-		}
-		bc.reorder[seq] = payload
-		for {
-			next, ok := bc.reorder[bc.recvSeq]
-			if !ok {
-				break
-			}
-			delete(bc.reorder, bc.recvSeq)
-			bc.recvSeq++
-			select {
-			case bc.readCh <- next:
-			case <-bc.closed:
-				bc.mu.Unlock()
-				return
-			}
+		var (
+			since    time.Time
+			expected uint32
+			buffered int
+		)
+		if len(bc.reorder) > 0 && !bc.gapSince.IsZero() {
+			since = bc.gapSince
+			expected = bc.recvSeq
+			buffered = len(bc.reorder)
 		}
 		bc.mu.Unlock()
+
+		if since.IsZero() {
+			continue
+		}
+		if time.Since(since) > bc.gapTimeout {
+			bc.fail(fmt.Errorf("bond: chunk seq=%d lost after %s (buffered %d chunks)",
+				expected, bc.gapTimeout, buffered))
+			return
+		}
 	}
 }
 
@@ -217,6 +399,9 @@ func decodeFrame(data []byte) (uint32, []byte, error) {
 func (bc *BondConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if err := bc.terminalErr(); err != nil {
+		return 0, err
 	}
 	select {
 	case <-bc.closed:
@@ -252,6 +437,8 @@ func (bc *BondConn) enqueue(chunk queuedChunk, deadline time.Time) error {
 		select {
 		case <-bc.closed:
 			return net.ErrClosed
+		case <-bc.failed:
+			return bc.failErr
 		default:
 		}
 
@@ -274,6 +461,8 @@ func (bc *BondConn) enqueue(chunk queuedChunk, deadline time.Time) error {
 		select {
 		case <-bc.closed:
 			return net.ErrClosed
+		case <-bc.failed:
+			return bc.failErr
 		case <-bc.readySignal:
 		case <-time.After(enqueueWaitTick):
 		}
@@ -281,15 +470,27 @@ func (bc *BondConn) enqueue(chunk queuedChunk, deadline time.Time) error {
 }
 
 func (bc *BondConn) Read(p []byte) (int, error) {
-	return bc.ReadContext(bc.ctx, p)
+
+	return bc.readContext(context.Background(), p)
 }
 
 func (bc *BondConn) ReadContext(ctx context.Context, p []byte) (int, error) {
+	return bc.readContext(ctx, p)
+}
+
+func (bc *BondConn) readContext(ctx context.Context, p []byte) (int, error) {
 	if len(bc.readBuf) > 0 {
 		n := copy(p, bc.readBuf)
 		bc.readBuf = bc.readBuf[n:]
 		return n, nil
 	}
+
+	select {
+	case err := <-bc.readErr:
+		return 0, err
+	default:
+	}
+
 	select {
 	case data, ok := <-bc.readCh:
 		if !ok {
@@ -300,6 +501,9 @@ func (bc *BondConn) ReadContext(ctx context.Context, p []byte) (int, error) {
 			bc.readBuf = data[n:]
 		}
 		return n, nil
+	case err := <-bc.readErr:
+
+		return 0, err
 	case <-bc.closed:
 		return 0, net.ErrClosed
 	case <-ctx.Done():
@@ -316,6 +520,8 @@ func (bc *BondConn) statsLoop() {
 	for {
 		select {
 		case <-bc.closed:
+			return
+		case <-bc.failed:
 			return
 		case <-ticker.C:
 		}
@@ -353,19 +559,22 @@ func joinStrings(parts []string, sep string) string {
 
 func (bc *BondConn) Close() error {
 	bc.closeOnce.Do(func() {
-		drainDeadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(drainDeadline) {
-			empty := true
-			for _, sf := range bc.sched.subflows {
-				if len(sf.queue) > 0 {
-					empty = false
+
+		if bc.terminalErr() == nil {
+			drainDeadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(drainDeadline) {
+				empty := true
+				for _, sf := range bc.sched.subflows {
+					if len(sf.queue) > 0 {
+						empty = false
+						break
+					}
+				}
+				if empty {
 					break
 				}
+				time.Sleep(20 * time.Millisecond)
 			}
-			if empty {
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
 		}
 		close(bc.closed)
 		bc.cancel()

@@ -48,6 +48,8 @@ type Descriptor struct {
 	DecodeURL func(q url.Values) (json.RawMessage, error)
 	EncodeURL func(raw json.RawMessage, q url.Values) error
 
+	Validate func(raw json.RawMessage) error
+
 	Defaults Values
 
 	Build Builder
