@@ -18,19 +18,16 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
 )
 
-// PanelClient reports traffic and receives the active user list.
 type PanelClient interface {
 	Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta) ([]auth.UserSpec, error)
 }
 
-// ControlClient talks to the local shampoore-server control socket.
 type ControlClient interface {
 	Usage() ([]manager.UsageEntry, error)
 	List() ([]manager.EntryView, error)
 	Update(name string, entry manager.ConfigEntry) error
 }
 
-// Config configures the exit-node synchronization worker.
 type Config struct {
 	PanelURL      string
 	NodeID        int64
@@ -41,7 +38,6 @@ type Config struct {
 	Interval      time.Duration
 }
 
-// Agent periodically syncs users and traffic with the control plane.
 type Agent struct {
 	cfg     Config
 	panel   PanelClient
@@ -60,7 +56,6 @@ type stateFile struct {
 	Entries map[string]baseline `json:"entries"`
 }
 
-// New creates an agent using the real control socket and HTTP panel client.
 func New(cfg Config) *Agent {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 30 * time.Second
@@ -76,7 +71,6 @@ func New(cfg Config) *Agent {
 	}
 }
 
-// NewWithClients is used by tests.
 func NewWithClients(cfg Config, panel PanelClient, ctrl ControlClient) *Agent {
 	a := New(cfg)
 	if panel != nil {
@@ -90,7 +84,6 @@ func NewWithClients(cfg Config, panel PanelClient, ctrl ControlClient) *Agent {
 
 func stateKey(config, userID string) string { return config + "\x00" + userID }
 
-// Run blocks until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
 	a.loadState()
 	for {
@@ -108,7 +101,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// SyncOnce performs one usage-report and user-refresh cycle.
 func (a *Agent) SyncOnce(ctx context.Context) error {
 	if a.panel == nil || a.control == nil {
 		return fmt.Errorf("nodeagent: clients are not configured")
@@ -209,7 +201,6 @@ func (a *Agent) applyUsers(users []auth.UserSpec) ([]string, error) {
 	return updated, nil
 }
 
-// patchUsers updates transport.users when the config is a multiuser server.
 func patchUsers(settings *app.Settings, users []auth.UserSpec) (bool, error) {
 	if settings == nil || len(settings.Transport) == 0 {
 		return false, nil

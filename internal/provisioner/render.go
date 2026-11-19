@@ -18,7 +18,6 @@ import (
 //go:embed templates
 var templateFS embed.FS
 
-// RenderOptions controls node config rendering.
 type RenderOptions struct {
 	PanelURL string
 }
@@ -40,7 +39,6 @@ type exitData struct {
 	ConfigFiles   []string
 }
 
-// RenderRelay renders the relay node stack (Caddy, WS relay, LiveKit, MinIO).
 func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
 	if !node.IsRelay {
 		return nil, fmt.Errorf("provisioner: node %q is not a relay", node.Name)
@@ -77,7 +75,6 @@ func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
 	return renderTemplates("templates/relay/*.tmpl", data)
 }
 
-// RenderExit renders the exit node server, agent and multiuser configs.
 func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelstore.Node, opts RenderOptions) ([]File, error) {
 	if !node.IsExit {
 		return nil, fmt.Errorf("provisioner: node %q is not an exit", node.Name)
@@ -139,7 +136,6 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 	return out, nil
 }
 
-// mergeRoleFiles combines relay and exit outputs for nodes that host both roles.
 func mergeRoleFiles(relayFiles, exitFiles []File) ([]File, error) {
 	var relayCompose, exitCompose []byte
 	out := make([]File, 0, len(relayFiles)+len(exitFiles))

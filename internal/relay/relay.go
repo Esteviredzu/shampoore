@@ -19,7 +19,6 @@ const (
 	defaultWriteTimeout   = 10 * time.Second
 )
 
-// Server is a lightweight password protected WebSocket room relay.
 type Server struct {
 	password       string
 	maxMessageSize int64
@@ -35,7 +34,6 @@ type client struct {
 	mu   sync.Mutex
 }
 
-// New creates a relay server. An empty password disables authentication.
 func New(password string) *Server {
 	return &Server{
 		password:       strings.TrimSpace(password),
@@ -50,7 +48,6 @@ func New(password string) *Server {
 	}
 }
 
-// SetMaxMessageSize changes the per-client read limit.
 func (s *Server) SetMaxMessageSize(n int64) {
 	if n > 0 {
 		s.maxMessageSize = n
@@ -183,14 +180,12 @@ func (s *Server) broadcast(room string, from *client, msgType int, data []byte) 
 	}
 }
 
-// RoomSize reports how many clients are currently in a room (for tests/metrics).
 func (s *Server) RoomSize(room string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.rooms[room])
 }
 
-// CloseAll closes every connected client.
 func (s *Server) CloseAll() {
 	s.mu.Lock()
 	var all []*client
@@ -206,7 +201,6 @@ func (s *Server) CloseAll() {
 	}
 }
 
-// Run starts an HTTP server until ctx is cancelled.
 func (s *Server) Run(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

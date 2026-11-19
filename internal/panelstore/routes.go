@@ -54,7 +54,6 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 	return nil
 }
 
-// CreateRoute creates a route after validating both endpoints.
 func (s *Store) CreateRoute(ctx context.Context, r Route) (Route, error) {
 	if err := s.validateRoute(ctx, &r); err != nil {
 		return Route{}, err
@@ -76,7 +75,6 @@ func (s *Store) CreateRoute(ctx context.Context, r Route) (Route, error) {
 	return r, nil
 }
 
-// GetRoute returns a route by ID.
 func (s *Store) GetRoute(ctx context.Context, id int64) (Route, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+routeColumns+` FROM routes WHERE id = ?`, id)
 	r, err := scanRoute(row)
@@ -89,7 +87,6 @@ func (s *Store) GetRoute(ctx context.Context, id int64) (Route, error) {
 	return r, nil
 }
 
-// ListRoutes returns all routes ordered by ID.
 func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+routeColumns+` FROM routes ORDER BY id`)
 	if err != nil {
@@ -110,7 +107,6 @@ func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
 	return out, nil
 }
 
-// ListRoutesForExit returns enabled routes terminating on the given node.
 func (s *Store) ListRoutesForExit(ctx context.Context, exitNodeID int64) ([]Route, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+routeColumns+` FROM routes WHERE exit_node_id = ? AND enabled = 1 ORDER BY id`, exitNodeID)
@@ -132,7 +128,6 @@ func (s *Store) ListRoutesForExit(ctx context.Context, exitNodeID int64) ([]Rout
 	return out, nil
 }
 
-// UpdateRoute updates a route.
 func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
 	if _, err := s.GetRoute(ctx, r.ID); err != nil {
 		return Route{}, err
@@ -156,7 +151,6 @@ func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
 	return r, nil
 }
 
-// DeleteRoute removes a route.
 func (s *Store) DeleteRoute(ctx context.Context, id int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

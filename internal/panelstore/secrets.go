@@ -23,7 +23,6 @@ func randomBase64(n int) (string, error) {
 	return base64.StdEncoding.EncodeToString(buf), nil
 }
 
-// ensureSecrets fills generated_secrets_json and node_secret when empty.
 func ensureSecrets(n *Node) error {
 	if n.NodeSecret == "" {
 		secret, err := randomHex(32)
@@ -68,9 +67,7 @@ func ensureSecrets(n *Node) error {
 	if gen["tunnel_id"] == "" {
 		gen["tunnel_id"] = "shampoore"
 	}
-	// MinIO does not know about separate S3 credentials unless an extra user is
-	// provisioned. Reusing the generated root credentials keeps the rendered
-	// silo config functional out of the box.
+
 	if gen["s3_access_key"] == "" {
 		gen["s3_access_key"] = gen["minio_root_user"]
 	}

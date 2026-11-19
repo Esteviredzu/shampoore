@@ -2,7 +2,6 @@ package manager
 
 import "sort"
 
-// UsageEntry is a per-config, per-user traffic snapshot.
 type UsageEntry struct {
 	Config        string `json:"config"`
 	UserID        string `json:"user_id"`
@@ -10,7 +9,6 @@ type UsageEntry struct {
 	DownloadBytes int64  `json:"download_bytes"`
 }
 
-// Usage returns cumulative traffic counters from every running multiuser config.
 func (m *Manager) Usage() []UsageEntry {
 	m.mu.Lock()
 	entries := make([]*ManagedEntry, 0, len(m.entries))

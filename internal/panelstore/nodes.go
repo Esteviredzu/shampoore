@@ -94,7 +94,6 @@ func validateNode(n *Node) error {
 	return nil
 }
 
-// CreateNode inserts a node and generates its secrets.
 func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
 	if err := validateNode(&n); err != nil {
 		return Node{}, err
@@ -133,7 +132,6 @@ func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
 	return n, nil
 }
 
-// GetNode returns a node by ID.
 func (s *Store) GetNode(ctx context.Context, id int64) (Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes WHERE id = ?`, id)
 	n, err := scanNode(row)
@@ -146,7 +144,6 @@ func (s *Store) GetNode(ctx context.Context, id int64) (Node, error) {
 	return n, nil
 }
 
-// FindNodeBySecret returns a node by its node_secret.
 func (s *Store) FindNodeBySecret(ctx context.Context, secret string) (Node, error) {
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
@@ -163,7 +160,6 @@ func (s *Store) FindNodeBySecret(ctx context.Context, secret string) (Node, erro
 	return n, nil
 }
 
-// ListNode returns all nodes ordered by name.
 func (s *Store) ListNode(ctx context.Context) ([]Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY name`)
 	if err != nil {
@@ -184,7 +180,6 @@ func (s *Store) ListNode(ctx context.Context) ([]Node, error) {
 	return out, nil
 }
 
-// UpdateNode updates a node. Secret material is preserved unless explicitly provided.
 func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	existing, err := s.GetNode(ctx, n.ID)
 	if err != nil {
@@ -249,7 +244,6 @@ func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	return n, nil
 }
 
-// DeleteNode removes a node and its routes.
 func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -264,7 +258,6 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 	return nil
 }
 
-// SetNodeStatus updates the deployment status and last error.
 func (s *Store) SetNodeStatus(ctx context.Context, id int64, status, lastErr string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -281,7 +274,6 @@ func (s *Store) SetNodeStatus(ctx context.Context, id int64, status, lastErr str
 	return nil
 }
 
-// TouchNode marks a node as online after a successful sync.
 func (s *Store) TouchNode(ctx context.Context, id int64) error {
 	return s.SetNodeStatus(ctx, id, NodeStatusOnline, "")
 }

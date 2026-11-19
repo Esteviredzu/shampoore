@@ -78,7 +78,6 @@ func normalizeUser(u *User) error {
 	return nil
 }
 
-// CreateUser inserts a subscription user.
 func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 	if err := normalizeUser(&u); err != nil {
 		return User{}, err
@@ -103,7 +102,6 @@ func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 	return u, nil
 }
 
-// GetUser returns a user by ID.
 func (s *Store) GetUser(ctx context.Context, id string) (User, error) {
 	normalized, err := auth.NormalizeUserID(id)
 	if err != nil {
@@ -120,7 +118,6 @@ func (s *Store) GetUser(ctx context.Context, id string) (User, error) {
 	return u, nil
 }
 
-// FindUserBySubToken returns a user by subscription token.
 func (s *Store) FindUserBySubToken(ctx context.Context, token string) (User, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -137,7 +134,6 @@ func (s *Store) FindUserBySubToken(ctx context.Context, token string) (User, err
 	return u, nil
 }
 
-// ListUsers returns all users ordered by ID.
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM users ORDER BY id`)
 	if err != nil {
@@ -158,7 +154,6 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	return out, nil
 }
 
-// UpdateUser updates subscription metadata without resetting traffic counters.
 func (s *Store) UpdateUser(ctx context.Context, u User) (User, error) {
 	existing, err := s.GetUser(ctx, u.ID)
 	if err != nil {
@@ -205,7 +200,6 @@ func (s *Store) UpdateUser(ctx context.Context, u User) (User, error) {
 	return u, nil
 }
 
-// DeleteUser removes a user.
 func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	normalized, err := auth.NormalizeUserID(id)
 	if err != nil {
@@ -224,7 +218,6 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	return nil
 }
 
-// AddTraffic atomically applies upload/download deltas for users.
 func (s *Store) AddTraffic(ctx context.Context, deltas []TrafficDelta) error {
 	if len(deltas) == 0 {
 		return nil
@@ -276,7 +269,6 @@ func (s *Store) AddTraffic(ctx context.Context, deltas []TrafficDelta) error {
 	return nil
 }
 
-// ResetUserTraffic zeroes a user's counters.
 func (s *Store) ResetUserTraffic(ctx context.Context, id string) error {
 	normalized, err := auth.NormalizeUserID(id)
 	if err != nil {
@@ -297,7 +289,6 @@ func (s *Store) ResetUserTraffic(ctx context.Context, id string) error {
 	return nil
 }
 
-// ActiveUsers returns users that may currently use the service.
 func (s *Store) ActiveUsers(ctx context.Context, now time.Time) ([]User, error) {
 	users, err := s.ListUsers(ctx)
 	if err != nil {
@@ -313,7 +304,6 @@ func (s *Store) ActiveUsers(ctx context.Context, now time.Time) ([]User, error) 
 	return out, nil
 }
 
-// ActiveUsersForExit returns active users that may route through exitNodeID.
 func (s *Store) ActiveUsersForExit(ctx context.Context, exitNodeID int64, now time.Time) ([]User, error) {
 	routes, err := s.ListRoutesForExit(ctx, exitNodeID)
 	if err != nil {

@@ -26,14 +26,12 @@ var (
 	ErrInvalid  = errors.New("panelstore: invalid")
 )
 
-// Transport describes one enabled service on a node.
 type Transport struct {
 	Type    string `json:"type"`
 	Domain  string `json:"domain"`
 	Enabled bool   `json:"enabled"`
 }
 
-// Node is a managed VPS that runs either the relay stack or the exit server.
 type Node struct {
 	ID               int64             `json:"id"`
 	Name             string            `json:"name"`
@@ -53,7 +51,6 @@ type Node struct {
 	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
-// EnabledTransport returns the first enabled transport of the given type.
 func (n Node) EnabledTransport(kind string) (Transport, bool) {
 	for _, tr := range n.Transports {
 		if tr.Enabled && tr.Type == kind && strings.TrimSpace(tr.Domain) != "" {
@@ -63,7 +60,6 @@ func (n Node) EnabledTransport(kind string) (Transport, bool) {
 	return Transport{}, false
 }
 
-// Route binds an entry node transport to an exit node.
 type Route struct {
 	ID            int64  `json:"id"`
 	Name          string `json:"name"`
@@ -73,7 +69,6 @@ type Route struct {
 	Enabled       bool   `json:"enabled"`
 }
 
-// User is a subscription user.
 type User struct {
 	ID                string    `json:"id"`
 	Name              string    `json:"name"`
@@ -86,10 +81,8 @@ type User struct {
 	AllowedRouteIDs   []int64   `json:"allowed_route_ids"`
 }
 
-// UsedBytes returns total accounted traffic.
 func (u User) UsedBytes() int64 { return u.UsedUploadBytes + u.UsedDownloadBytes }
 
-// Active reports whether the user may use the service at now.
 func (u User) Active(now time.Time) bool {
 	if !u.Enabled {
 		return false
@@ -103,7 +96,6 @@ func (u User) Active(now time.Time) bool {
 	return true
 }
 
-// RouteAllowed reports whether the user may use the route.
 func (u User) RouteAllowed(routeID int64) bool {
 	if len(u.AllowedRouteIDs) == 0 {
 		return true
@@ -116,7 +108,6 @@ func (u User) RouteAllowed(routeID int64) bool {
 	return false
 }
 
-// TrafficDelta is an incremental traffic report from a node.
 type TrafficDelta struct {
 	UserID        string `json:"user_id"`
 	UploadBytes   int64  `json:"upload_bytes"`

@@ -88,7 +88,6 @@ func TestSyncOnceReportsDeltasAndUpdatesUsers(t *testing.T) {
 		t.Fatalf("users not applied: %+v", tr["users"])
 	}
 
-	// Updating a config restarts the server, so its counters reset to zero.
 	ctrl.usage = []manager.UsageEntry{
 		{Config: "route-1", UserID: "alice"},
 		{Config: "route-2", UserID: "alice", UploadBytes: 50, DownloadBytes: 50},

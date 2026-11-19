@@ -14,13 +14,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store is a concurrency-safe SQLite backed control-plane store.
 type Store struct {
 	db *sql.DB
 
-	// writeMu serializes write transactions. database/sql is safe on its own,
-	// but serializing writers keeps SQLite's single-writer semantics explicit
-	// and avoids SQLITE_BUSY under load.
 	writeMu sync.Mutex
 }
 
@@ -71,7 +67,6 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_nodes_secret ON nodes(node_secret);`,
 }
 
-// Open opens (and migrates) a SQLite database. Use ":memory:" for tests.
 func Open(ctx context.Context, path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -154,7 +149,6 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the database.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil

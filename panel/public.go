@@ -12,7 +12,6 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
-// PublicHandler exposes only subscriptions and node synchronization.
 func (a *API) PublicHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sub/{sub_token}", a.subscription)

@@ -81,7 +81,7 @@ func TestDirectLocalServerWithoutMux(t *testing.T) {
 	if head[0] != socksVersion || head[1] != repSuccess {
 		t.Fatalf("connect reply = %v", head)
 	}
-	// Consume BND.ADDR/BND.PORT.
+
 	bound := make([]byte, 6)
 	if _, err := io.ReadFull(conn, bound); err != nil {
 		t.Fatal(err)

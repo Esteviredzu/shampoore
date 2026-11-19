@@ -13,7 +13,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// NodeStore is the subset of panelstore used by the provisioner.
 type NodeStore interface {
 	GetNode(ctx context.Context, id int64) (panelstore.Node, error)
 	ListNode(ctx context.Context) ([]panelstore.Node, error)
@@ -21,7 +20,6 @@ type NodeStore interface {
 	ListRoutesForExit(ctx context.Context, exitNodeID int64) ([]panelstore.Route, error)
 }
 
-// Options configures rendering and deployment.
 type Options struct {
 	PanelURL        string
 	LocalBinDir     string
@@ -30,7 +28,6 @@ type Options struct {
 	HostKeyCallback ssh.HostKeyCallback
 }
 
-// Provisioner renders node configuration and deploys it over SSH.
 type Provisioner struct {
 	store NodeStore
 	opts  Options
@@ -40,7 +37,6 @@ func New(store NodeStore, opts Options) *Provisioner {
 	return &Provisioner{store: store, opts: opts}
 }
 
-// Step is one deployment action with captured output.
 type Step struct {
 	Name    string `json:"name"`
 	Command string `json:"command,omitempty"`
@@ -48,7 +44,6 @@ type Step struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// DeployResult is returned to the panel and shown to the operator.
 type DeployResult struct {
 	NodeID  int64  `json:"node_id"`
 	Success bool   `json:"success"`
@@ -138,7 +133,6 @@ func findBinary(name, explicitDir string) (string, error) {
 	return "", fmt.Errorf("provisioner: binary %q not found (build it with release.sh or set LocalBinDir)", name)
 }
 
-// DeployNode renders the node role and runs the deployment over SSH.
 func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*DeployResult, error) {
 	if p == nil || p.store == nil {
 		return nil, errors.New("provisioner: store is not configured")

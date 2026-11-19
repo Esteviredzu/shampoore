@@ -14,7 +14,6 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
-// HTTPPanel is the control-plane client used on exit nodes.
 type HTTPPanel struct {
 	BaseURL string
 	Secret  string

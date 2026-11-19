@@ -17,14 +17,12 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
-// File is one file uploaded to a node.
 type File struct {
 	Name string
 	Mode int64
 	Data []byte
 }
 
-// Remote is a minimal command/upload transport used by DeployNode.
 type Remote interface {
 	Run(ctx context.Context, command string) (string, error)
 	Upload(ctx context.Context, dir string, files []File, sudo bool) error
