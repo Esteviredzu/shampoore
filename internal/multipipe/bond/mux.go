@@ -62,10 +62,19 @@ type Mux struct {
 	conn  *BondConn
 	inner multiplexing.StreamMultiplexer
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	started bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	mu         sync.Mutex
+	started    bool
+	userID     string
+	exitNodeID string
+}
+
+func (m *Mux) SetIdentity(userID, exitNodeID string) {
+	m.mu.Lock()
+	m.userID = userID
+	m.exitNodeID = exitNodeID
+	m.mu.Unlock()
 }
 
 func NewMux(
@@ -129,6 +138,8 @@ func (m *Mux) Start(ctx context.Context) error {
 	cfg := tunnel.Config{
 		FlushThreshold: aggregate,
 		FlushInterval:  20 * time.Millisecond,
+		UserID:         m.userID,
+		ExitNodeID:     m.exitNodeID,
 	}
 	m.inner = tunnel.New(ct, m.logger, cfg)
 	if err := m.inner.Start(m.ctx); err != nil {

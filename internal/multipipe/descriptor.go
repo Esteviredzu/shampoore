@@ -161,6 +161,8 @@ func build(
 		fmCfg := flowmux.DefaultConfig()
 		fmCfg.FlushThreshold = eff.Int("mux_flush_threshold", 12000)
 		fmCfg.FlushInterval = time.Duration(eff.Int("mux_flush_ms", 20)) * time.Millisecond
+		fmCfg.UserID = s.UserID
+		fmCfg.ExitNodeID = s.ExitNodeID
 
 		fm, err := flowmux.New(transports, names, logger, fmCfg)
 		if err != nil {
@@ -177,6 +179,7 @@ func build(
 			stopAll(outcomes)
 			return nil, fmt.Errorf("multipipe: bond: %w", err)
 		}
+		bm.SetIdentity(s.UserID, s.ExitNodeID)
 		result.StreamMux = bm
 		logger.Info("multipipe: bond enabled, subflows=", len(transports))
 		return result, nil
@@ -240,6 +243,8 @@ func buildOne(
 		Transport:          spec.Transport,
 		Advanced:           spec.Advanced,
 		EncryptionPassword: s.EncryptionPassword,
+		UserID:             s.UserID,
+		ExitNodeID:         s.ExitNodeID,
 		IPv4Only:           app.IPv4Only,
 	}
 	subEff := d.Defaults.Merge(sub.Advanced)

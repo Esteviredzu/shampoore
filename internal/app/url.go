@@ -66,6 +66,12 @@ func ParseURL(raw string) (*Settings, error) {
 	if v := q.Get("pw"); v != "" {
 		s.EncryptionPassword = v
 	}
+	if v := q.Get("user_id"); v != "" {
+		s.UserID = v
+	}
+	if v := q.Get("exit_node_id"); v != "" {
+		s.ExitNodeID = v
+	}
 	if u.Fragment != "" {
 		s.Name = u.Fragment
 	}
@@ -114,6 +120,12 @@ func EncodeURL(s *Settings) (string, error) {
 	q.Set("type", kind)
 	if s.EncryptionPassword != "" {
 		q.Set("pw", s.EncryptionPassword)
+	}
+	if s.UserID != "" {
+		q.Set("user_id", s.UserID)
+	}
+	if s.ExitNodeID != "" {
+		q.Set("exit_node_id", s.ExitNodeID)
 	}
 
 	if err := d.EncodeURL(s.Transport, q); err != nil {

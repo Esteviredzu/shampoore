@@ -28,9 +28,13 @@ func BuildRuntime(
 	rt := NewRuntime(res.Transport, res.Provider, res.BypassHosts, res.Side)
 	rt.StreamMux = res.StreamMux
 	rt.ConnectedIPs = res.ConnectedIPs
+	rt.UserRegistry = res.UserRegistry
+	rt.SessionServer = res.SessionServer
 	rt.MuxConfig = MuxConfig{
 		FlushMs:        eff.Int("mux_flush_ms", 20),
 		FlushThreshold: eff.Int("mux_flush_threshold", 12000),
+		UserID:         s.UserID,
+		ExitNodeID:     s.ExitNodeID,
 	}
 	return rt, nil
 }

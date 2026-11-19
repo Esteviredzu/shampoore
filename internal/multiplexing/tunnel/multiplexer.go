@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/transport"
@@ -32,6 +34,11 @@ var errWriterStopped = errors.New("tunnel: writer stopped")
 type Config struct {
 	FlushThreshold int
 	FlushInterval  time.Duration
+
+	UserID     string
+	ExitNodeID string
+
+	Registry *auth.UserRegistry
 }
 
 func DefaultConfig() Config {
@@ -63,6 +70,12 @@ type TunnelMultiplexer struct {
 	remoteEpochSet bool
 	retiredEpochs  map[uint32]struct{}
 	retiredOrder   []uint32
+
+	authorized   bool
+	sessionUser  string
+	sessionExit  string
+	authRejected bool
+	authRequired bool
 
 	incoming chan multiplexing.Stream
 
@@ -153,6 +166,11 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 	m.retiredEpochs = make(map[uint32]struct{})
 	m.retiredOrder = nil
 	m.writerDone = writerDone
+	m.authorized = false
+	m.sessionUser = ""
+	m.sessionExit = ""
+	m.authRejected = false
+	m.authRequired = m.cfg.Registry != nil && m.cfg.Registry.Active()
 	m.mu.Unlock()
 
 	m.started = true
@@ -160,7 +178,133 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 	m.wg.Add(2)
 	go m.receiveLoop()
 	go m.writeLoop(muxCtx, writerDone)
+
+	if m.hasClientIdentity() {
+		helloCtx, helloCancel := context.WithTimeout(muxCtx, 2*time.Second)
+		m.sendHello(helloCtx)
+		helloCancel()
+	}
 	return nil
+}
+
+func (m *TunnelMultiplexer) hasClientIdentity() bool {
+	return strings.TrimSpace(m.cfg.UserID) != "" || strings.TrimSpace(m.cfg.ExitNodeID) != ""
+}
+
+func (m *TunnelMultiplexer) requiresHelloLocked() bool {
+	if m.cfg.Registry == nil {
+		return false
+	}
+	if m.cfg.Registry.Active() {
+
+		m.authRequired = true
+	}
+	return m.authRequired
+}
+
+func (m *TunnelMultiplexer) sendHello(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	frame := &TunnelFrame{
+		Type: FrameHello,
+		Hello: &Hello{
+			UserID:     m.cfg.UserID,
+			ExitNodeID: m.cfg.ExitNodeID,
+		},
+	}
+	if err := m.enqueueFrame(ctx, frame); err != nil {
+		m.logger.Warn("tunnel: send hello: ", err)
+		return
+	}
+	if err := m.flushOutbound(ctx); err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, errWriterStopped) {
+		m.logger.Debug("tunnel: flush hello: ", err)
+	}
+}
+
+func (m *TunnelMultiplexer) sendErrorFrame(ctx context.Context, code string, reason error) {
+	if ctx == nil {
+		return
+	}
+	message := ""
+	if reason != nil {
+		message = reason.Error()
+	}
+	if err := m.enqueueFrame(ctx, &TunnelFrame{
+		Type:  FrameError,
+		Error: &ErrorFrame{Code: code, Message: message},
+	}); err != nil {
+		m.logger.Debug("tunnel: send error frame: ", err)
+		return
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), closeFlushTimeout)
+	defer cancel()
+	if err := m.flushOutbound(flushCtx); err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, errWriterStopped) {
+		m.logger.Debug("tunnel: flush error frame: ", err)
+	}
+}
+
+func (m *TunnelMultiplexer) sendReset(ctx context.Context, epoch uint32) {
+	if ctx == nil {
+		return
+	}
+	if err := m.enqueueFrame(ctx, &TunnelFrame{
+		StreamID: StreamID{},
+		Type:     FrameReset,
+	}); err != nil {
+		m.logger.Warn("tunnel: announce session reset (epoch ", epoch, "): ", err)
+		return
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), closeFlushTimeout)
+	defer cancel()
+	_ = m.flushOutbound(flushCtx)
+}
+
+func (m *TunnelMultiplexer) rejectSession(code string, reason error) {
+	m.mu.Lock()
+	if m.closed || m.authRejected {
+		m.mu.Unlock()
+		return
+	}
+	m.authRejected = true
+	m.authorized = false
+	m.sessionUser = ""
+	m.sessionExit = ""
+	ctx := m.ctx
+	epoch := m.epoch.Load()
+	m.mu.Unlock()
+
+	if reason != nil {
+		m.logger.Warn("tunnel: rejecting session: ", reason)
+	}
+	m.sendErrorFrame(ctx, code, reason)
+	m.closeAllStreams(reason)
+	m.sendReset(ctx, epoch)
+}
+
+func authErrorCode(err error) string {
+	switch {
+	case errors.Is(err, auth.ErrUserNotFound):
+		return "unknown_user"
+	case errors.Is(err, auth.ErrUserDisabled):
+		return "user_disabled"
+	case errors.Is(err, auth.ErrUserExpired):
+		return "user_expired"
+	case errors.Is(err, auth.ErrTrafficLimitExceeded):
+		return "traffic_limit"
+	case errors.Is(err, auth.ErrExitNotAllowed):
+		return "exit_forbidden"
+	case errors.Is(err, auth.ErrUserIDRequired):
+		return "user_required"
+	default:
+		return "unauthorized"
+	}
 }
 
 func drainIncomingStreams(ch chan multiplexing.Stream) {
@@ -240,6 +384,10 @@ func (m *TunnelMultiplexer) OpenStream(
 		m.mu.Unlock()
 		return nil, fmt.Errorf("tunnel: multiplexer is closed")
 	}
+	if m.authRejected {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("tunnel: session was rejected")
+	}
 
 	if m.ctx == nil {
 		m.mu.Unlock()
@@ -294,10 +442,17 @@ func (m *TunnelMultiplexer) writeData(id StreamID, data []byte) error {
 	m.mu.Lock()
 	_, ok := m.streams[id]
 	closed := m.closed
+	rejected := m.authRejected
 	ctx := m.ctx
+	user := m.sessionUser
+	authorized := m.authorized
+	needHello := m.requiresHelloLocked()
 	m.mu.Unlock()
 	if closed {
 		return io.ErrClosedPipe
+	}
+	if rejected {
+		return fmt.Errorf("tunnel: session was rejected")
 	}
 	if ctx == nil {
 		return fmt.Errorf("tunnel: multiplexer is not started")
@@ -306,11 +461,19 @@ func (m *TunnelMultiplexer) writeData(id StreamID, data []byte) error {
 		return fmt.Errorf("tunnel: stream not found: %s", uuid.UUID(id))
 	}
 	m.ctr.UsefulSent.Add(int64(len(data)))
-	return m.enqueueFrame(ctx, &TunnelFrame{
+	if err := m.enqueueFrame(ctx, &TunnelFrame{
 		StreamID: id,
 		Type:     FrameData,
 		Data:     data,
-	})
+	}); err != nil {
+		return err
+	}
+	if needHello && authorized {
+		if err := m.cfg.Registry.AddTraffic(user, 0, int64(len(data))); err != nil {
+			m.rejectSession(authErrorCode(err), err)
+		}
+	}
+	return nil
 }
 
 func (m *TunnelMultiplexer) closeStream(id StreamID) error {
@@ -651,6 +814,10 @@ func (m *TunnelMultiplexer) handleTransportReset() {
 	}
 	epoch := nextSessionEpoch(m.epoch.Load())
 	m.epoch.Store(epoch)
+	m.authorized = false
+	m.sessionUser = ""
+	m.sessionExit = ""
+	m.authRejected = false
 	ctx := m.ctx
 	m.mu.Unlock()
 
@@ -665,11 +832,9 @@ func (m *TunnelMultiplexer) handleTransportReset() {
 		m.logger.Warn("tunnel: cannot announce session reset: multiplexer not started")
 		return
 	}
-	if err := m.enqueueFrame(ctx, &TunnelFrame{
-		StreamID: StreamID{},
-		Type:     FrameReset,
-	}); err != nil {
-		m.logger.Warn("tunnel: announce session reset (epoch ", epoch, "): ", err)
+	m.sendReset(ctx, epoch)
+	if m.hasClientIdentity() {
+		m.sendHello(ctx)
 	}
 }
 
@@ -723,10 +888,23 @@ func (m *TunnelMultiplexer) retireEpochLocked(epoch uint32) {
 
 func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 	switch f.Type {
+	case FrameHello:
+		m.handleHello(f)
+
 	case FrameOpen:
 		m.mu.Lock()
 		if m.closed {
 			m.mu.Unlock()
+			return
+		}
+		if m.requiresHelloLocked() && !m.authorized {
+			ctx := m.ctx
+			rejected := m.authRejected
+			m.mu.Unlock()
+			if !rejected {
+				m.sendErrorFrame(ctx, "hello_required",
+					errors.New("tunnel: hello frame is required before opening streams"))
+			}
 			return
 		}
 		if _, exists := m.streams[f.StreamID]; exists {
@@ -735,11 +913,12 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 		}
 		stream := newTunnelStream(m, f.StreamID, f.Metadata)
 		m.streams[f.StreamID] = stream
+		ctx := m.ctx
 		m.mu.Unlock()
 
 		select {
 		case m.incoming <- stream:
-		case <-m.ctx.Done():
+		case <-ctx.Done():
 			m.mu.Lock()
 			delete(m.streams, f.StreamID)
 			m.mu.Unlock()
@@ -749,8 +928,20 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 	case FrameData:
 		m.mu.Lock()
 		stream := m.streams[f.StreamID]
+		user := m.sessionUser
+		authorized := m.authorized
+		needHello := m.requiresHelloLocked()
 		m.mu.Unlock()
+		if needHello && !authorized {
+			return
+		}
 		if stream != nil {
+			if needHello {
+				if err := m.cfg.Registry.AddTraffic(user, int64(len(f.Data)), 0); err != nil {
+					m.rejectSession(authErrorCode(err), err)
+					return
+				}
+			}
 			m.ctr.UsefulRecv.Add(int64(len(f.Data)))
 			stream.deliverData(f.Data)
 		}
@@ -767,7 +958,63 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 	case FrameReset:
 
 		m.logger.Debug("tunnel: session reset frame (epoch ", f.Epoch, ")")
+
+	case FrameError:
+		var errInfo ErrorFrame
+		if f.Error != nil {
+			errInfo = *f.Error
+		}
+		err := fmt.Errorf("tunnel: session error %q: %s", errInfo.Code, errInfo.Message)
+		m.logger.Warn(err)
+		m.closeAllStreams(err)
 	}
+}
+
+func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
+	registry := m.cfg.Registry
+	if registry == nil {
+
+		return
+	}
+
+	m.mu.Lock()
+	required := m.requiresHelloLocked()
+	m.mu.Unlock()
+	if !registry.Active() {
+		if required {
+
+			m.rejectSession("unknown_user", auth.ErrUserNotFound)
+		}
+		return
+	}
+	var hello Hello
+	if f.Hello != nil {
+		hello = *f.Hello
+	}
+
+	userID, err := auth.NormalizeUserID(hello.UserID)
+	if err != nil {
+		m.rejectSession(authErrorCode(err), err)
+		return
+	}
+	exitNodeID := strings.TrimSpace(hello.ExitNodeID)
+	if err := registry.Authorize(userID, exitNodeID); err != nil {
+		m.rejectSession(authErrorCode(err), err)
+		return
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.authorized = true
+	m.sessionUser = userID
+	m.sessionExit = exitNodeID
+	m.authRejected = false
+	m.mu.Unlock()
+
+	m.logger.Info("tunnel: authorized user ", userID)
 }
 
 func (m *TunnelMultiplexer) closeAllStreams(err error) {

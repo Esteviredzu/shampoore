@@ -21,29 +21,39 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
-type Pipe struct {
-	cfg    *Config
-	logger logging.ContextLogger
-	client *minio.Client
-
-	writePrefix string
-	readPrefix  string
-
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
-
-	sendCh chan []byte
-	recvCh chan []byte
-
-	lastKeyMu sync.Mutex
-	lastKey   string
-
-	ctr transport.Counters
-	wg  sync.WaitGroup
+type objectStore interface {
+	BucketExists(ctx context.Context, bucket string) (bool, error)
+	PutObject(ctx context.Context, bucket, object string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	GetObject(ctx context.Context, bucket, object string, opts minio.GetObjectOptions) (io.ReadCloser, error)
+	RemoveObject(ctx context.Context, bucket, object string, opts minio.RemoveObjectOptions) error
+	ListObjects(ctx context.Context, bucket string, opts minio.ListObjectsOptions) <-chan minio.ObjectInfo
 }
 
-func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
+type minioStore struct {
+	client *minio.Client
+}
+
+func (s *minioStore) BucketExists(ctx context.Context, bucket string) (bool, error) {
+	return s.client.BucketExists(ctx, bucket)
+}
+
+func (s *minioStore) PutObject(ctx context.Context, bucket, object string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return s.client.PutObject(ctx, bucket, object, reader, size, opts)
+}
+
+func (s *minioStore) GetObject(ctx context.Context, bucket, object string, opts minio.GetObjectOptions) (io.ReadCloser, error) {
+	return s.client.GetObject(ctx, bucket, object, opts)
+}
+
+func (s *minioStore) RemoveObject(ctx context.Context, bucket, object string, opts minio.RemoveObjectOptions) error {
+	return s.client.RemoveObject(ctx, bucket, object, opts)
+}
+
+func (s *minioStore) ListObjects(ctx context.Context, bucket string, opts minio.ListObjectsOptions) <-chan minio.ObjectInfo {
+	return s.client.ListObjects(ctx, bucket, opts)
+}
+
+func newMinioStore(cfg *Config) (objectStore, error) {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -66,22 +76,50 @@ func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, err
 	if err != nil {
 		return nil, fmt.Errorf("silo: create client: %w", err)
 	}
+	return &minioStore{client: cl}, nil
+}
 
-	exists, err := cl.BucketExists(context.Background(), cfg.Bucket)
+type Pipe struct {
+	cfg    *Config
+	logger logging.ContextLogger
+	store  objectStore
+
+	writePrefix string
+	readPrefix  string
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started bool
+
+	sendCh chan []byte
+	recvCh chan []byte
+
+	lastKeyMu sync.Mutex
+	lastKey   string
+
+	ctr transport.Counters
+	wg  sync.WaitGroup
+}
+
+func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
+	store, err := newMinioStore(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newPipeWithStore(cfg, role, logger, store)
+}
+
+func newPipeWithStore(cfg *Config, role string, logger logging.ContextLogger, store objectStore) (*Pipe, error) {
+	exists, err := store.BucketExists(context.Background(), cfg.Bucket)
 	if err != nil || !exists {
 		return nil, fmt.Errorf("silo: bucket %q unavailable: %v", cfg.Bucket, err)
 	}
 
-	writePrefix := fmt.Sprintf("%s/c2s/", cfg.TunnelID)
-	readPrefix := fmt.Sprintf("%s/s2c/", cfg.TunnelID)
-	if role == "server" {
-		writePrefix, readPrefix = readPrefix, writePrefix
-	}
-
+	writePrefix, readPrefix := buildPrefixes(cfg, role)
 	return &Pipe{
 		cfg:         cfg,
 		logger:      logger,
-		client:      cl,
+		store:       store,
 		writePrefix: writePrefix,
 		readPrefix:  readPrefix,
 		sendCh:      make(chan []byte, 4096),
@@ -150,7 +188,7 @@ func (p *Pipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (p *Pipe) DeleteMessage(ctx context.Context, key string) error {
-	return p.client.RemoveObject(ctx, p.cfg.Bucket, p.writePrefix+key, minio.RemoveObjectOptions{})
+	return p.store.RemoveObject(ctx, p.cfg.Bucket, p.writePrefix+key, minio.RemoveObjectOptions{})
 }
 
 func (p *Pipe) sendLoop() {
@@ -204,7 +242,7 @@ func (p *Pipe) upload(buf []byte) {
 	objName := fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), rand.Int63())
 	fullKey := p.writePrefix + objName
 
-	_, err := p.client.PutObject(p.ctx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
+	_, err := p.store.PutObject(p.ctx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
 		ContentType: "application/octet-stream",
 	})
 	if err != nil {
@@ -275,7 +313,7 @@ func (p *Pipe) pollOnce() int {
 	}
 
 	var keys []string
-	objectCh := p.client.ListObjects(p.ctx, p.cfg.Bucket, opts)
+	objectCh := p.store.ListObjects(p.ctx, p.cfg.Bucket, opts)
 
 	for object := range objectCh {
 		if object.Err != nil {
@@ -316,7 +354,7 @@ func isMissingObject(err error) bool {
 }
 
 func (p *Pipe) processFile(key string) bool {
-	objReader, err := p.client.GetObject(p.ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
+	objReader, err := p.store.GetObject(p.ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return isMissingObject(err)
 	}
@@ -327,7 +365,7 @@ func (p *Pipe) processFile(key string) bool {
 	}
 
 	if len(data) == 0 {
-		if err := p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
+		if err := p.store.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
 			!isMissingObject(err) {
 			return false
 		}
@@ -363,7 +401,7 @@ func (p *Pipe) processFile(key string) bool {
 		p.logger.Warn("silo: dropping malformed object ", key)
 	}
 
-	if err := p.client.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
+	if err := p.store.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
 		!isMissingObject(err) {
 		p.logger.Warn("silo: remove delivered object ", key, ": ", err)
 		return false

@@ -34,6 +34,9 @@ func init() {
 		DecodeURL: func(url.Values) (json.RawMessage, error) {
 			return json.RawMessage(`{"key":"value"}`), nil
 		},
+		EncodeURL: func(json.RawMessage, url.Values) error {
+			return nil
+		},
 		Build: testBuild,
 	}); err != nil {
 		panic(err)
@@ -164,5 +167,58 @@ func TestParseURLValidatesAdvanced(t *testing.T) {
 	}
 	if _, err := ParseURL("shampoore://?type=urltest&a.num=abc"); err == nil {
 		t.Fatal("expected error for malformed advanced value")
+	}
+}
+
+func TestSettingsMultiuserIdentity(t *testing.T) {
+	s, err := decodeSettings(t, `{
+		"type":"unittest",
+		"user_id":"alice",
+		"exit_node_id":"exit-1"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.UserID != "alice" || s.ExitNodeID != "exit-1" {
+		t.Fatalf("unexpected identity: %+v", s)
+	}
+
+	if _, err := decodeSettings(t, `{"type":"unittest","user_id":42}`); err == nil {
+		t.Fatal("numeric user_id was accepted")
+	}
+	if _, err := decodeSettings(t, `{"type":"unittest","exit_node_id":null}`); err == nil {
+		t.Fatal("null exit_node_id was accepted")
+	}
+}
+
+func TestSettingsLegacyConfigWithoutIdentity(t *testing.T) {
+	s, err := decodeSettings(t, `{"type":"unittest","transport":{"key":"value"}}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.UserID != "" || s.ExitNodeID != "" {
+		t.Fatalf("legacy config gained an identity: %+v", s)
+	}
+}
+
+func TestParseURLKeepsMultiuserIdentity(t *testing.T) {
+	s, err := ParseURL("shampoore://?type=urltest&user_id=alice&exit_node_id=exit-1")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	if s.UserID != "alice" || s.ExitNodeID != "exit-1" {
+		t.Fatalf("identity was lost: %+v", s)
+	}
+
+	encoded, err := EncodeURL(s)
+	if err != nil {
+		t.Fatalf("encode url: %v", err)
+	}
+	roundTrip, err := ParseURL(encoded)
+	if err != nil {
+		t.Fatalf("parse encoded url: %v", err)
+	}
+	if roundTrip.UserID != "alice" || roundTrip.ExitNodeID != "exit-1" {
+		t.Fatalf("identity was lost after round trip: %+v", roundTrip)
 	}
 }

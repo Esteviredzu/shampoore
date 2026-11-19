@@ -17,6 +17,8 @@ const (
 	frameTypeData  byte = 2
 	frameTypeClose byte = 3
 	frameTypeReset byte = 4
+	frameTypeHello byte = 5
+	frameTypeError byte = 6
 
 	FrameHeaderSize = 30
 
@@ -38,13 +40,28 @@ const (
 	FrameClose FrameType = FrameType(frameTypeClose)
 
 	FrameReset FrameType = FrameType(frameTypeReset)
+	FrameHello FrameType = FrameType(frameTypeHello)
+	FrameError FrameType = FrameType(frameTypeError)
 )
+
+type Hello struct {
+	UserID     string `json:"user_id,omitempty"`
+	ExitNodeID string `json:"exit_node_id,omitempty"`
+}
+
+type ErrorFrame struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
 
 type TunnelFrame struct {
 	StreamID StreamID
 	Type     FrameType
 	Data     []byte
 	Metadata map[string]any
+
+	Hello *Hello
+	Error *ErrorFrame
 
 	Epoch uint32
 }
@@ -87,6 +104,40 @@ func EncodeFrame(f *TunnelFrame) ([]byte, error) {
 			return nil, fmt.Errorf("tunnel: reset frame cannot contain metadata")
 		}
 		payload = nil
+
+	case FrameHello:
+		if len(f.Data) > 0 {
+			return nil, fmt.Errorf("tunnel: hello frame cannot contain data")
+		}
+		if len(f.Metadata) > 0 {
+			return nil, fmt.Errorf("tunnel: hello frame cannot contain metadata")
+		}
+		hello := f.Hello
+		if hello == nil {
+			hello = &Hello{}
+		}
+		b, err := json.Marshal(hello)
+		if err != nil {
+			return nil, fmt.Errorf("tunnel: marshal hello: %w", err)
+		}
+		payload = b
+
+	case FrameError:
+		if len(f.Data) > 0 {
+			return nil, fmt.Errorf("tunnel: error frame cannot contain data")
+		}
+		if len(f.Metadata) > 0 {
+			return nil, fmt.Errorf("tunnel: error frame cannot contain metadata")
+		}
+		errInfo := f.Error
+		if errInfo == nil {
+			errInfo = &ErrorFrame{}
+		}
+		b, err := json.Marshal(errInfo)
+		if err != nil {
+			return nil, fmt.Errorf("tunnel: marshal error frame: %w", err)
+		}
+		payload = b
 
 	default:
 		return nil, fmt.Errorf("tunnel: unknown frame type: %d", byte(f.Type))
@@ -196,6 +247,24 @@ func (d *FrameDecoder) Feed(data []byte) ([]*TunnelFrame, error) {
 			if len(payload) > 0 {
 				return frames, fmt.Errorf("tunnel: reset frame has payload")
 			}
+
+		case FrameHello:
+			var hello Hello
+			if len(payload) > 0 {
+				if err := json.Unmarshal(payload, &hello); err != nil {
+					return frames, fmt.Errorf("tunnel: decode hello: %w", err)
+				}
+			}
+			frame.Hello = &hello
+
+		case FrameError:
+			var errInfo ErrorFrame
+			if len(payload) > 0 {
+				if err := json.Unmarshal(payload, &errInfo); err != nil {
+					return frames, fmt.Errorf("tunnel: decode error frame: %w", err)
+				}
+			}
+			frame.Error = &errInfo
 
 		default:
 			return frames, fmt.Errorf("tunnel: unknown frame type: %d", ftype)

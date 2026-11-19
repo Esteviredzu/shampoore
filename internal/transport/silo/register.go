@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
@@ -31,6 +32,8 @@ func init() {
 			{Key: "bucket", Label: "Bucket Name", Type: app.FieldTypeText, Required: true},
 			{Key: "access_key", Label: "Access Key", Type: app.FieldTypeText, Required: true},
 			{Key: "secret_key", Label: "Secret Key", Type: app.FieldTypePassword, Required: true},
+			{Key: "user_id", Label: "User ID", Type: app.FieldTypeText, Required: false, Hint: "Isolate objects under users/<user_id>/"},
+			{Key: "multiuser", Label: "Multiuser server", Type: app.FieldTypeBool, Required: false, Hint: "Server only: serve every users/<user_id>/ prefix"},
 		},
 		Defaults:  defaults,
 		EncodeURL: encodeURL,
@@ -63,12 +66,10 @@ func build(
 			return nil, err
 		}
 	}
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+	if cfg.UserID == "" {
+		cfg.UserID = s.UserID
 	}
-
-	pipe, err := NewPipe(&cfg, role, logger)
-	if err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -78,6 +79,44 @@ func build(
 			return nil, errors.New("silo: settings and transport encryption passwords differ")
 		}
 		password = cfg.EncryptionPassword
+	}
+
+	host := cfg.Endpoint
+	if h, _, err := net.SplitHostPort(cfg.Endpoint); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	bypass := []string{}
+	if host != "" {
+		bypass = append(bypass, host)
+		bypass = append(bypass, netdial.ResolveIPv4(ctx, host)...)
+	}
+
+	if role == "server" && cfg.Multiuser {
+		registry, err := buildUserRegistry(cfg.Users)
+		if err != nil {
+			return nil, err
+		}
+		store, err := newMinioStore(&cfg)
+		if err != nil {
+			return nil, err
+		}
+		srv := newMultiServer(cfg, logger, registry, password, store, app.Values{
+			"mux_flush_ms":        eff.Int("mux_flush_ms", 20),
+			"mux_flush_threshold": eff.Int("mux_flush_threshold", 12000),
+		})
+		logger.Info("silo: multiuser server ready (endpoint=", cfg.Endpoint,
+			", bucket=", cfg.Bucket, ", users=", len(cfg.Users), ")")
+		return &app.BuildResult{
+			SessionServer: srv,
+			UserRegistry:  registry,
+			BypassHosts:   bypass,
+		}, nil
+	}
+
+	pipe, err := NewPipe(&cfg, role, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	var secured transport.Pipe = pipe
@@ -94,18 +133,8 @@ func build(
 		return nil, err
 	}
 
-	logger.Info("silo: ready (endpoint=", cfg.Endpoint, ", bucket=", cfg.Bucket, ", role=", role, ")")
-
-	host := cfg.Endpoint
-	if h, _, err := net.SplitHostPort(cfg.Endpoint); err == nil {
-		host = h
-	}
-	host = strings.Trim(host, "[]")
-	bypass := []string{}
-	if host != "" {
-		bypass = append(bypass, host)
-		bypass = append(bypass, netdial.ResolveIPv4(ctx, host)...)
-	}
+	logger.Info("silo: ready (endpoint=", cfg.Endpoint, ", bucket=", cfg.Bucket,
+		", role=", role, ", user=", cfg.UserID, ")")
 
 	return &app.BuildResult{
 		Transport:   newTransport(secured),
@@ -120,6 +149,8 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	cfg.AccessKey = q.Get("access_key")
 	cfg.SecretKey = q.Get("secret_key")
 	cfg.EncryptionPassword = q.Get("encryption_password")
+	cfg.UserID = q.Get("user_id")
+	cfg.Multiuser, _ = strconv.ParseBool(q.Get("multiuser"))
 	return json.Marshal(cfg)
 }
 
@@ -134,6 +165,12 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	q.Set("secret_key", cfg.SecretKey)
 	if cfg.EncryptionPassword != "" {
 		q.Set("encryption_password", cfg.EncryptionPassword)
+	}
+	if cfg.UserID != "" {
+		q.Set("user_id", cfg.UserID)
+	}
+	if cfg.Multiuser {
+		q.Set("multiuser", "1")
 	}
 	return nil
 }

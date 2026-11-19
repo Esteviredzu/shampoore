@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
@@ -65,6 +67,20 @@ func init() {
 				Required: false,
 				Hint:     "Allow plaintext ws:// URLs (encryption stays optional)",
 			},
+			{
+				Key:      "user_id",
+				Label:    "User ID",
+				Type:     app.FieldTypeText,
+				Required: false,
+				Hint:     "Multiuser mode: joins the room <room>-<user_id>",
+			},
+			{
+				Key:      "multiuser",
+				Label:    "Multiuser server",
+				Type:     app.FieldTypeBool,
+				Required: false,
+				Hint:     "Server only: run one isolated room session per active user",
+			},
 		},
 		Defaults:  defaults,
 		DecodeURL: decodeURL,
@@ -78,12 +94,15 @@ func init() {
 }
 
 type Config struct {
-	ServerURL       string `json:"server_url"`
-	Room            string `json:"room"`
-	Password        string `json:"password"`
-	Batch           bool   `json:"batch,omitempty"`
-	Padding         bool   `json:"padding,omitempty"`
-	AllowInsecureWS bool   `json:"allow_insecure_ws,omitempty"`
+	ServerURL       string          `json:"server_url"`
+	Room            string          `json:"room"`
+	Password        string          `json:"password"`
+	Batch           bool            `json:"batch,omitempty"`
+	Padding         bool            `json:"padding,omitempty"`
+	AllowInsecureWS bool            `json:"allow_insecure_ws,omitempty"`
+	UserID          string          `json:"user_id,omitempty"`
+	Multiuser       bool            `json:"multiuser,omitempty"`
+	Users           []auth.UserSpec `json:"users,omitempty"`
 }
 
 func decodeURL(q url.Values) (json.RawMessage, error) {
@@ -96,6 +115,7 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	batch, _ := strconv.ParseBool(q.Get("batch"))
 	padding, _ := strconv.ParseBool(q.Get("padding"))
 	allowInsecure, _ := strconv.ParseBool(q.Get("allow_insecure_ws"))
+	multiuser, _ := strconv.ParseBool(q.Get("multiuser"))
 	return json.Marshal(Config{
 		ServerURL:       serverURL,
 		Room:            room,
@@ -103,6 +123,8 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 		Batch:           batch,
 		Padding:         padding,
 		AllowInsecureWS: allowInsecure,
+		UserID:          q.Get("user_id"),
+		Multiuser:       multiuser,
 	})
 }
 
@@ -131,6 +153,12 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	if cfg.AllowInsecureWS {
 		q.Set("allow_insecure_ws", "1")
 	}
+	if cfg.UserID != "" {
+		q.Set("user_id", cfg.UserID)
+	}
+	if cfg.Multiuser {
+		q.Set("multiuser", "1")
+	}
 	return nil
 }
 
@@ -154,21 +182,49 @@ func build(
 	if err := validateSecureServerURL(cfg.ServerURL, cfg.AllowInsecureWS); err != nil {
 		return nil, err
 	}
+	if cfg.UserID == "" {
+		cfg.UserID = s.UserID
+	}
+	if cfg.UserID != "" {
+		normalized, err := auth.NormalizeUserID(cfg.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("raw_ws: %w", err)
+		}
+		cfg.UserID = normalized
+	}
 
-	wsURL, err := buildWSURL(cfg.ServerURL, cfg.Room)
+	wsURL, err := buildWSURL(cfg.ServerURL, roomForUser(cfg.Room, cfg.UserID))
 	if err != nil {
 		return nil, err
 	}
-
-	t := newTransport(cfg, logger)
-	logger.Info("raw_ws: ready (url=", wsURL, " max_msg=", t.MaxMessageSize(),
-		" batch=", cfg.Batch, " padding=", cfg.Padding, ")")
 
 	bypass := []string{}
 	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Host != "" {
 		bypass = append(bypass, u.Hostname())
 		bypass = append(bypass, netdial.ResolveIPv4(ctx, u.Hostname())...)
 	}
+
+	if role == "server" && cfg.Multiuser {
+		registry, err := buildUserRegistry(cfg.Users)
+		if err != nil {
+			return nil, err
+		}
+		srv := newMultiServer(cfg, logger, registry, app.Values{
+			"mux_flush_ms":        eff.Int("mux_flush_ms", 20),
+			"mux_flush_threshold": eff.Int("mux_flush_threshold", 12000),
+		})
+		logger.Info("raw_ws: multiuser server ready (room=", cfg.Room,
+			" users=", len(cfg.Users), ")")
+		return &app.BuildResult{
+			SessionServer: srv,
+			UserRegistry:  registry,
+			BypassHosts:   bypass,
+		}, nil
+	}
+
+	t := newTransport(cfg, logger)
+	logger.Info("raw_ws: ready (url=", wsURL, " max_msg=", t.MaxMessageSize(),
+		" batch=", cfg.Batch, " padding=", cfg.Padding, " user=", cfg.UserID, ")")
 
 	return &app.BuildResult{
 		Transport:   t,

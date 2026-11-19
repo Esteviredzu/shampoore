@@ -32,6 +32,9 @@ type Config struct {
 	FlushInterval  time.Duration
 	SampleInterval time.Duration
 	StatsTTL       time.Duration
+
+	UserID     string
+	ExitNodeID string
 }
 
 func DefaultConfig() Config {
@@ -111,6 +114,8 @@ func New(
 		tm := tunnel.New(transports[i], logger, tunnel.Config{
 			FlushThreshold: cfg.FlushThreshold,
 			FlushInterval:  cfg.FlushInterval,
+			UserID:         cfg.UserID,
+			ExitNodeID:     cfg.ExitNodeID,
 		})
 		m.subflows = append(m.subflows, &subflow{
 			name:         names[i],

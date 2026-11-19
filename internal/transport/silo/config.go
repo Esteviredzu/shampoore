@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/Esteviredzu/shampoore/internal/auth"
 )
 
 type Config struct {
@@ -13,6 +15,11 @@ type Config struct {
 	Bucket    string `json:"bucket"`
 	UseSSL    bool   `json:"use_ssl"`
 	TunnelID  string `json:"tunnel_id"`
+
+	UserID string `json:"user_id,omitempty"`
+
+	Multiuser bool            `json:"multiuser,omitempty"`
+	Users     []auth.UserSpec `json:"users,omitempty"`
 
 	EncryptionPassword string `json:"encryption_password,omitempty"`
 
@@ -48,6 +55,11 @@ func (c *Config) Validate() error {
 	if c.TunnelID == "" {
 		c.TunnelID = "default"
 	}
+	userID, err := sanitizeUserID(c.UserID)
+	if err != nil {
+		return err
+	}
+	c.UserID = userID
 	if c.EncryptionPassword != "" && strings.TrimSpace(c.EncryptionPassword) == "" {
 		return errors.New("silo: encryption_password must not be blank")
 	}

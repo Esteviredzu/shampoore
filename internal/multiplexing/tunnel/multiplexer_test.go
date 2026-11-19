@@ -3,12 +3,14 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
@@ -436,5 +438,292 @@ func TestConcurrentStartStop(t *testing.T) {
 
 	if err := m.Stop(context.Background()); err != nil {
 		t.Fatalf("final stop: %v", err)
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, what string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if fn() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func registryConfig(t *testing.T, registry *auth.UserRegistry) Config {
+	t.Helper()
+	cfg := testConfig()
+	cfg.Registry = registry
+	return cfg
+}
+
+func sendFrameToMux(t *testing.T, tr *fakeTransport, f *TunnelFrame) {
+	t.Helper()
+	if f.Epoch == 0 {
+		f.Epoch = 1
+	}
+	encoded, err := EncodeFrame(f)
+	if err != nil {
+		t.Fatalf("encode frame: %v", err)
+	}
+	tr.recvCh <- encoded
+}
+
+func TestOpenRejectedBeforeHello(t *testing.T) {
+	registry := auth.NewRegistry()
+	if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := newFakeTransport()
+	m := New(tr, testLogger{}, registryConfig(t, registry))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	firstID := StreamID(uuid.New())
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: firstID,
+		Type:     FrameOpen,
+		Metadata: map[string]any{"host": "example.com", "port": float64(443)},
+	})
+
+	errFrame := waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameError && f.Error != nil && f.Error.Code == "hello_required"
+	})
+	if errFrame == nil {
+		t.Fatal("expected hello_required error frame")
+	}
+
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer acceptCancel()
+	if _, err := m.AcceptStream(acceptCtx); err == nil {
+		t.Fatal("stream was accepted before hello")
+	}
+
+	m.mu.Lock()
+	if len(m.streams) != 0 {
+		t.Fatalf("stream map is not empty: %d", len(m.streams))
+	}
+	m.mu.Unlock()
+
+	sendFrameToMux(t, tr, &TunnelFrame{Type: FrameHello, Hello: &Hello{UserID: "alice", ExitNodeID: "exit-1"}})
+	waitFor(t, time.Second, "authorization", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.authorized
+	})
+
+	secondID := StreamID(uuid.New())
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: secondID,
+		Type:     FrameOpen,
+		Metadata: map[string]any{"host": "example.com", "port": float64(443)},
+	})
+	acceptCtx2, acceptCancel2 := context.WithTimeout(ctx, 2*time.Second)
+	defer acceptCancel2()
+	stream, err := m.AcceptStream(acceptCtx2)
+	if err != nil {
+		t.Fatalf("accept after hello: %v", err)
+	}
+	if stream.ID() != uuid.UUID(secondID).String() {
+		t.Fatalf("unexpected stream id: %s", stream.ID())
+	}
+}
+
+func TestUnauthorizedHelloRejectsSession(t *testing.T) {
+	registry := auth.NewRegistry()
+	if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := newFakeTransport()
+	m := New(tr, testLogger{}, registryConfig(t, registry))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	sendFrameToMux(t, tr, &TunnelFrame{Type: FrameHello, Hello: &Hello{UserID: "bob"}})
+	waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameError && f.Error != nil && f.Error.Code == "unknown_user"
+	})
+	waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameReset
+	})
+
+	m.mu.Lock()
+	rejected := m.authRejected
+	authorized := m.authorized
+	m.mu.Unlock()
+	if !rejected || authorized {
+		t.Fatalf("unexpected auth state: rejected=%v authorized=%v", rejected, authorized)
+	}
+
+	openID := StreamID(uuid.New())
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: openID,
+		Type:     FrameOpen,
+		Metadata: map[string]any{"host": "example.com", "port": float64(443)},
+	})
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer acceptCancel()
+	if _, err := m.AcceptStream(acceptCtx); err == nil {
+		t.Fatal("stream was accepted for a rejected session")
+	}
+}
+
+func TestTrafficAccounting(t *testing.T) {
+	registry := auth.NewRegistry()
+	if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := newFakeTransport()
+	m := New(tr, testLogger{}, registryConfig(t, registry))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	sendFrameToMux(t, tr, &TunnelFrame{Type: FrameHello, Hello: &Hello{UserID: "alice", ExitNodeID: "exit-1"}})
+	waitFor(t, time.Second, "authorization", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.authorized
+	})
+
+	streamID := StreamID(uuid.New())
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: streamID,
+		Type:     FrameOpen,
+		Metadata: map[string]any{"host": "example.com", "port": float64(443)},
+	})
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer acceptCancel()
+	stream, err := m.AcceptStream(acceptCtx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	payload := []byte("upload!")
+	sendFrameToMux(t, tr, &TunnelFrame{StreamID: streamID, Type: FrameData, Data: payload})
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+
+	waitFor(t, time.Second, "upload accounting", func() bool {
+		info, ok := registry.Get("alice")
+		return ok && info.Usage.UploadBytes == int64(len(payload))
+	})
+
+	reply := []byte("download")
+	if _, err := stream.Write(reply); err != nil {
+		t.Fatalf("write reply: %v", err)
+	}
+	waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameData && f.StreamID == streamID
+	})
+	waitFor(t, time.Second, "download accounting", func() bool {
+		info, ok := registry.Get("alice")
+		return ok && info.Usage.DownloadBytes == int64(len(reply))
+	})
+}
+
+func TestClientSendsHelloOnStartAndAfterReset(t *testing.T) {
+	tr := newFakeTransport()
+	cfg := testConfig()
+	cfg.UserID = "alice"
+	cfg.ExitNodeID = "exit-1"
+	m := New(tr, testLogger{}, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	hello := waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameHello && f.Hello != nil && f.Hello.UserID == "alice"
+	})
+	if hello.Hello.ExitNodeID != "exit-1" {
+		t.Fatalf("unexpected exit node: %q", hello.Hello.ExitNodeID)
+	}
+
+	tr.clearSent()
+	tr.errCh <- transport.ErrTransportReset
+
+	waitForFrame(t, tr, 2*time.Second, func(f *TunnelFrame) bool { return f.Type == FrameReset })
+	waitForFrame(t, tr, 2*time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameHello && f.Hello != nil && f.Hello.UserID == "alice"
+	})
+}
+
+func TestTrafficLimitRejectsSession(t *testing.T) {
+	registry := auth.NewRegistry()
+	if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: true, TrafficLimitBytes: 5}); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := newFakeTransport()
+	m := New(tr, testLogger{}, registryConfig(t, registry))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	sendFrameToMux(t, tr, &TunnelFrame{Type: FrameHello, Hello: &Hello{UserID: "alice"}})
+	waitFor(t, time.Second, "authorization", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.authorized
+	})
+
+	streamID := StreamID(uuid.New())
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: streamID,
+		Type:     FrameOpen,
+		Metadata: map[string]any{"host": "example.com", "port": float64(443)},
+	})
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer acceptCancel()
+	stream, err := m.AcceptStream(acceptCtx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	sendFrameToMux(t, tr, &TunnelFrame{
+		StreamID: streamID,
+		Type:     FrameData,
+		Data:     []byte("0123456789"),
+	})
+
+	errFrame := waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool {
+		return f.Type == FrameError && f.Error != nil && f.Error.Code == "traffic_limit"
+	})
+	if errFrame == nil {
+		t.Fatal("expected traffic_limit error frame")
+	}
+	waitForFrame(t, tr, time.Second, func(f *TunnelFrame) bool { return f.Type == FrameReset })
+
+	buf := make([]byte, 1)
+	if _, err := stream.Read(buf); err == nil {
+		t.Fatal("stream was not closed after exceeding the traffic limit")
 	}
 }

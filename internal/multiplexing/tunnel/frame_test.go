@@ -84,6 +84,59 @@ func TestFrameRoundTripWithEpoch(t *testing.T) {
 	}
 }
 
+func TestHelloAndErrorFramesRoundTrip(t *testing.T) {
+	cases := []*TunnelFrame{
+		{
+			Type:  FrameHello,
+			Epoch: 7,
+			Hello: &Hello{UserID: "alice", ExitNodeID: "exit-1"},
+		},
+		{
+			Type:  FrameError,
+			Epoch: 8,
+			Error: &ErrorFrame{Code: "exit_forbidden", Message: "not allowed"},
+		},
+	}
+
+	for _, frame := range cases {
+		encoded, err := EncodeFrame(frame)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		decoder := NewFrameDecoder()
+		frames, err := decoder.Feed(encoded)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(frames) != 1 {
+			t.Fatalf("expected 1 frame, got %d", len(frames))
+		}
+		got := frames[0]
+		if got.Type != frame.Type || got.Epoch != frame.Epoch || got.StreamID != frame.StreamID {
+			t.Fatalf("frame mismatch: %+v != %+v", got, frame)
+		}
+		switch frame.Type {
+		case FrameHello:
+			if got.Hello == nil || got.Hello.UserID != frame.Hello.UserID || got.Hello.ExitNodeID != frame.Hello.ExitNodeID {
+				t.Fatalf("hello mismatch: %+v", got.Hello)
+			}
+		case FrameError:
+			if got.Error == nil || got.Error.Code != frame.Error.Code || got.Error.Message != frame.Error.Message {
+				t.Fatalf("error mismatch: %+v", got.Error)
+			}
+		}
+	}
+}
+
+func TestHelloFrameRejectsDataAndMetadata(t *testing.T) {
+	if _, err := EncodeFrame(&TunnelFrame{Type: FrameHello, Data: []byte("x")}); err == nil {
+		t.Fatal("hello frame with data was accepted")
+	}
+	if _, err := EncodeFrame(&TunnelFrame{Type: FrameError, Metadata: map[string]any{"x": 1}}); err == nil {
+		t.Fatal("error frame with metadata was accepted")
+	}
+}
+
 func TestFrameDecoderSplitFeed(t *testing.T) {
 	id := StreamID(uuid.New())
 	first, err := EncodeFrame(&TunnelFrame{

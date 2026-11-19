@@ -18,6 +18,9 @@ const (
 type Settings struct {
 	Name string `json:"name,omitempty"`
 
+	UserID     string `json:"user_id,omitempty"`
+	ExitNodeID string `json:"exit_node_id,omitempty"`
+
 	Type      string          `json:"type,omitempty"`
 	Transport json.RawMessage `json:"transport,omitempty"`
 
@@ -42,6 +45,8 @@ func (s *Settings) EffectiveAdvanced() Values {
 
 var settingsFields = map[string]struct{}{
 	"name":                {},
+	"user_id":             {},
+	"exit_node_id":        {},
 	"type":                {},
 	"transport":           {},
 	"encryption_password": {},
@@ -128,6 +133,16 @@ func (s *Settings) UnmarshalJSON(data []byte) error {
 	if v, ok := raw["name"]; ok {
 		if err := decodeStrictField(v, &tmp.Name); err != nil {
 			return fieldError("name", err)
+		}
+	}
+	if v, ok := raw["user_id"]; ok {
+		if err := decodeStrictField(v, &tmp.UserID); err != nil {
+			return fieldError("user_id", err)
+		}
+	}
+	if v, ok := raw["exit_node_id"]; ok {
+		if err := decodeStrictField(v, &tmp.ExitNodeID); err != nil {
+			return fieldError("exit_node_id", err)
 		}
 	}
 	if v, ok := raw["encryption_password"]; ok {

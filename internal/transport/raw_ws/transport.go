@@ -166,7 +166,7 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 	if err := validateSecureServerURL(t.cfg.ServerURL, t.cfg.AllowInsecureWS); err != nil {
 		return false, err
 	}
-	wsURL, err := buildWSURL(t.cfg.ServerURL, t.cfg.Room)
+	wsURL, err := buildWSURL(t.cfg.ServerURL, roomForUser(t.cfg.Room, t.cfg.UserID))
 	if err != nil {
 		return false, err
 	}

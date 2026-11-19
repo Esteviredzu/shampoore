@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
@@ -22,6 +23,10 @@ type Runtime struct {
 	ConnectedIPs func() []string
 	MuxConfig    MuxConfig
 	sideServices []SideService
+
+	UserRegistry *auth.UserRegistry
+
+	SessionServer SessionServer
 
 	mu      sync.Mutex
 	started bool

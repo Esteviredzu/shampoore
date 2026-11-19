@@ -281,6 +281,8 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		muxCfg := tunnel.Config{
 			FlushThreshold: rt.MuxConfig.FlushThreshold,
 			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+			UserID:         rt.MuxConfig.UserID,
+			ExitNodeID:     rt.MuxConfig.ExitNodeID,
 		}
 		mux = tunnel.New(rt.Transport, lg, muxCfg)
 	}

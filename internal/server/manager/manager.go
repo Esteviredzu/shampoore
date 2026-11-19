@@ -55,10 +55,11 @@ type ManagedEntry struct {
 	updatedAt  time.Time
 	generation uint64
 
-	rt      *app.Runtime
-	mux     multiplexing.StreamMultiplexer
-	handler *socks5.RemoteHandler
-	cancel  context.CancelFunc
+	rt       *app.Runtime
+	mux      multiplexing.StreamMultiplexer
+	handler  *socks5.RemoteHandler
+	sessions app.SessionServer
+	cancel   context.CancelFunc
 
 	statsMu    sync.Mutex
 	statsAgg   *transport.StatsAggregator
@@ -264,6 +265,13 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		return fmt.Errorf("build runtime: %w", err)
 	}
 
+	if rt.SessionServer != nil {
+		if err := m.startSessionServer(me, rt, ctx, cancel, gen, logger); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	var mux multiplexing.StreamMultiplexer
 	if rt.StreamMux != nil {
 		mux = rt.StreamMux
@@ -272,6 +280,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		muxCfg := tunnel.Config{
 			FlushThreshold: rt.MuxConfig.FlushThreshold,
 			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
+			Registry:       rt.UserRegistry,
 		}
 		mux = tunnel.New(rt.Transport, logger, muxCfg)
 	}
@@ -323,16 +332,74 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	return nil
 }
 
+func (m *Manager) startSessionServer(
+	me *ManagedEntry,
+	rt *app.Runtime,
+	ctx context.Context,
+	cancel context.CancelFunc,
+	gen uint64,
+	logger *logging.Logger,
+) error {
+	sessions := rt.SessionServer
+	sessions.SetSessionHandler(func(sctx context.Context, mux multiplexing.StreamMultiplexer) error {
+		handler := socks5.NewRemoteHandler(sctx, mux, logger, 8000, app.IPv4Only)
+		handler.SetGeoFilter(m.filter, m.blockUnknown)
+		err := handler.Run()
+		handler.Stop()
+		return err
+	})
+
+	if err := sessions.Start(ctx); err != nil {
+		cancel()
+		if stopErr := rt.Stop(context.Background()); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop runtime: ", stopErr)
+		}
+		return fmt.Errorf("session server start: %w", err)
+	}
+	if err := rt.Start(ctx); err != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = sessions.Stop(stopCtx)
+		stopCancel()
+		cancel()
+		return fmt.Errorf("runtime start: %w", err)
+	}
+
+	me.mu.Lock()
+	if me.generation != gen {
+		me.mu.Unlock()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if stopErr := sessions.Stop(stopCtx); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop session server: ", stopErr)
+		}
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			logger.Warn("manager: ", me.Name, ": stop runtime: ", stopErr)
+		}
+		stopCancel()
+		cancel()
+		return nil
+	}
+	me.rt = rt
+	me.sessions = sessions
+	me.cancel = cancel
+	me.statsAgg = transport.NewStatsAggregator()
+	me.mu.Unlock()
+
+	logger.Info("manager: ", me.Name, " multiuser session server running")
+	return nil
+}
+
 func (m *Manager) stopEntry(me *ManagedEntry) {
 	me.mu.Lock()
 	me.generation++
 	cancel := me.cancel
 	handler := me.handler
 	mux := me.mux
+	sessions := me.sessions
 	rt := me.rt
 	me.cancel = nil
 	me.handler = nil
 	me.mux = nil
+	me.sessions = nil
 	me.rt = nil
 	me.statsAgg = nil
 	me.status = StatusStopped
@@ -354,6 +421,11 @@ func (m *Manager) stopEntry(me *ManagedEntry) {
 	if mux != nil {
 		if err := mux.Stop(stopCtx); err != nil {
 			m.logger.Warn("manager: ", me.Name, ": stop mux: ", err)
+		}
+	}
+	if sessions != nil {
+		if err := sessions.Stop(stopCtx); err != nil {
+			m.logger.Warn("manager: ", me.Name, ": stop session server: ", err)
 		}
 	}
 	if rt != nil {
