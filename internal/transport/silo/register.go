@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
@@ -40,6 +41,12 @@ func init() {
 		DecodeURL: decodeURL,
 		Validate:  validate,
 		Build:     build,
+
+		Aliases:                 []string{"silo"},
+		BuildSubscriptionConfig: buildSubscriptionConfig,
+		BuildServerConfig:       buildServerConfig,
+		RelayUpstream:           "minio:9000",
+		RelaySecrets:            []string{"minio_root_user", "minio_root_password", "s3_bucket"},
 	})
 	if err != nil {
 		panic(err)
@@ -183,4 +190,61 @@ func validate(raw json.RawMessage) error {
 		}
 	}
 	return cfg.Validate()
+}
+
+func routeTunnelID(p app.RouteParams) string {
+	if p.RouteID > 0 {
+		return "route-" + strconv.FormatInt(p.RouteID, 10)
+	}
+	if name := strings.TrimSpace(p.RouteName); name != "" {
+		return name
+	}
+	return "route"
+}
+
+func routeSiloConfig(p app.RouteParams, server bool) Config {
+	cfg := DefaultConfig()
+	cfg.Endpoint = app.HostOnly(p.Domain)
+	cfg.AccessKey = p.Secret("s3_access_key")
+	cfg.SecretKey = p.Secret("s3_secret_key")
+	cfg.Bucket = p.Secret("s3_bucket")
+	cfg.UseSSL = !strings.HasPrefix(strings.ToLower(strings.TrimSpace(p.Domain)), "http://")
+	cfg.TunnelID = routeTunnelID(p)
+	cfg.EncryptionPassword = p.Secret("encryption_password")
+	if server {
+		cfg.Multiuser = true
+		cfg.Users = make([]auth.UserSpec, 0)
+	} else {
+		cfg.UserID = p.UserID
+	}
+	return cfg
+}
+
+func buildSubscriptionConfig(p app.RouteParams) (app.Settings, error) {
+	return siloSettings(routeSiloConfig(p, false), p, false)
+}
+
+func buildServerConfig(p app.RouteParams) (app.Settings, error) {
+	return siloSettings(routeSiloConfig(p, true), p, true)
+}
+
+func siloSettings(cfg Config, p app.RouteParams, server bool) (app.Settings, error) {
+	if err := cfg.Validate(); err != nil {
+		return app.Settings{}, err
+	}
+	raw, err := app.MarshalTransportOptions(cfg, server)
+	if err != nil {
+		return app.Settings{}, err
+	}
+	out := app.Settings{
+		Name:      p.RouteName,
+		Type:      "silo",
+		Transport: raw,
+	}
+	if !server {
+		out.UserID = p.UserID
+	}
+	out.ExitNodeID = p.ExitNodeID
+	out.EncryptionPassword = p.Secret("encryption_password")
+	return out, nil
 }

@@ -1,5 +1,19 @@
 {
   "app": { "title": "Shampoore Panel" },
+  "nav": {
+    "configs": "Agordoj",
+    "nodes": "Serviloj",
+    "routes": "Itineroj",
+    "users": "Uzantoj"
+  },
+  "fleet": {
+    "nodesTitle": "Serviloj (nodoj)",
+    "addNode": "Aldoni nodon",
+    "routesTitle": "Itineroj",
+    "addRoute": "Aldoni itineron",
+    "usersTitle": "Uzantoj",
+    "addUser": "Aldoni uzanton"
+  },
   "server": {
     "checking": "Kontrolante…",
     "running": "Servilo funkcias",

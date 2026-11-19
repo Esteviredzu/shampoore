@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
@@ -22,12 +23,15 @@ type RenderOptions struct {
 	PanelURL string
 }
 
+type relaySite struct {
+	Upstream string
+	Domains  []string
+}
+
 type relayData struct {
-	Node           panelstore.Node
-	Secrets        map[string]string
-	RawWSDomains   []string
-	SiloDomains    []string
-	LiveKitDomains []string
+	Node    panelstore.Node
+	Secrets map[string]string
+	Sites   []relaySite
 }
 
 type exitData struct {
@@ -47,30 +51,30 @@ func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
 		Node:    node,
 		Secrets: cloneSecrets(node.GeneratedSecrets),
 	}
+	siteIndex := make(map[string]int)
 	for _, tr := range node.Transports {
 		if !tr.Enabled || strings.TrimSpace(tr.Domain) == "" {
 			continue
 		}
-		switch tr.Type {
-		case panelstore.TransportRawWS:
-			data.RawWSDomains = append(data.RawWSDomains, siteAddress(tr.Domain))
-		case panelstore.TransportSilo:
-			data.SiloDomains = append(data.SiloDomains, siteAddress(tr.Domain))
-		case panelstore.TransportLiveKit:
-			data.LiveKitDomains = append(data.LiveKitDomains, siteAddress(tr.Domain))
+		descriptor, ok := app.DescriptorFor(tr.Type)
+		if !ok || strings.TrimSpace(descriptor.RelayUpstream) == "" {
+			continue
 		}
+		for _, key := range descriptor.RelaySecrets {
+			if strings.TrimSpace(data.Secrets[key]) == "" {
+				return nil, fmt.Errorf("provisioner: relay %q has no %s for %s", node.Name, key, tr.Type)
+			}
+		}
+		idx, ok := siteIndex[descriptor.RelayUpstream]
+		if !ok {
+			idx = len(data.Sites)
+			siteIndex[descriptor.RelayUpstream] = idx
+			data.Sites = append(data.Sites, relaySite{Upstream: descriptor.RelayUpstream})
+		}
+		data.Sites[idx].Domains = append(data.Sites[idx].Domains, app.SiteAddress(tr.Domain))
 	}
-	if len(data.RawWSDomains)+len(data.SiloDomains)+len(data.LiveKitDomains) == 0 {
+	if len(data.Sites) == 0 {
 		return nil, fmt.Errorf("provisioner: relay %q has no enabled transports with domains", node.Name)
-	}
-	if len(data.RawWSDomains) > 0 && data.Secrets["raw_ws_password"] == "" {
-		return nil, fmt.Errorf("provisioner: relay %q has no raw_ws_password", node.Name)
-	}
-	if len(data.LiveKitDomains) > 0 && (data.Secrets["livekit_api_key"] == "" || data.Secrets["livekit_api_secret"] == "") {
-		return nil, fmt.Errorf("provisioner: relay %q has no LiveKit credentials", node.Name)
-	}
-	if len(data.SiloDomains) > 0 && (data.Secrets["minio_root_user"] == "" || data.Secrets["minio_root_password"] == "" || data.Secrets["s3_bucket"] == "") {
-		return nil, fmt.Errorf("provisioner: relay %q has no MinIO credentials", node.Name)
 	}
 	return renderTemplates("templates/relay/*.tmpl", data)
 }
@@ -196,101 +200,32 @@ func configFileName(route panelstore.Route) string {
 	return fmt.Sprintf("route-%d", route.ID)
 }
 
-func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (map[string]any, error) {
+func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (app.Settings, error) {
 	tr, ok := entry.EnabledTransport(route.TransportType)
 	if !ok {
-		return nil, fmt.Errorf("provisioner: route %d entry node %q has no enabled %s transport", route.ID, entry.Name, route.TransportType)
+		return app.Settings{}, fmt.Errorf("provisioner: route %d entry node %q has no enabled %s transport", route.ID, entry.Name, route.TransportType)
 	}
-	secrets := entry.GeneratedSecrets
-	transport := map[string]any{
-		"multiuser": true,
-		"users":     []any{},
+	descriptor, ok := app.DescriptorFor(route.TransportType)
+	if !ok || descriptor.BuildServerConfig == nil {
+		return app.Settings{}, fmt.Errorf("provisioner: unsupported route transport %q", route.TransportType)
 	}
-	var kind string
-	switch route.TransportType {
-	case panelstore.TransportRawWS:
-		if secrets["raw_ws_password"] == "" {
-			return nil, fmt.Errorf("provisioner: route %d entry node has no raw_ws_password", route.ID)
-		}
-		kind = "raw_ws"
-		serverURL := wsURL(tr.Domain)
-		transport["server_url"] = serverURL
-		transport["room"] = configFileName(route)
-		transport["password"] = secrets["raw_ws_password"]
-		transport["batch"] = true
-		transport["padding"] = true
-		if strings.HasPrefix(serverURL, "ws://") {
-			transport["allow_insecure_ws"] = true
-		}
-	case panelstore.TransportSilo:
-		if secrets["s3_access_key"] == "" || secrets["s3_secret_key"] == "" || secrets["s3_bucket"] == "" {
-			return nil, fmt.Errorf("provisioner: route %d entry node has no Silo credentials", route.ID)
-		}
-		kind = "silo"
-		transport["endpoint"] = hostOnly(tr.Domain)
-		transport["access_key"] = secrets["s3_access_key"]
-		transport["secret_key"] = secrets["s3_secret_key"]
-		transport["bucket"] = secrets["s3_bucket"]
-		transport["use_ssl"] = !strings.HasPrefix(strings.TrimSpace(tr.Domain), "http://")
-		transport["tunnel_id"] = configFileName(route)
-	case panelstore.TransportLiveKit:
-		if secrets["livekit_api_key"] == "" || secrets["livekit_api_secret"] == "" {
-			return nil, fmt.Errorf("provisioner: route %d entry node has no LiveKit credentials", route.ID)
-		}
-		kind = "livekit_datachannel"
-		transport["signal_url"] = wsURL(tr.Domain)
-		transport["api_key"] = secrets["livekit_api_key"]
-		transport["api_secret"] = secrets["livekit_api_secret"]
-		transport["room_prefix"] = "shampoore-" + configFileName(route)
-		transport["data_topic"] = "shampoore"
-		tokenListen := secrets["livekit_token_listen"]
-		if tokenListen == "" {
-			tokenListen = "127.0.0.1:8099"
-		}
-		transport["token_listen"] = tokenListen
-	default:
-		return nil, fmt.Errorf("provisioner: unsupported route transport %q", route.TransportType)
+	settings, err := descriptor.BuildServerConfig(app.RouteParams{
+		RouteID:     route.ID,
+		RouteName:   route.Name,
+		ExitNodeID:  strconv.FormatInt(node.ID, 10),
+		Domain:      tr.Domain,
+		Secrets:     entry.GeneratedSecrets,
+		OnDemand:    tr.OnDemand,
+		TokenURL:    strings.TrimSpace(entry.GeneratedSecrets["livekit_token_url"]),
+		TokenSecret: strings.TrimSpace(entry.GeneratedSecrets["livekit_token_secret"]),
+	})
+	if err != nil {
+		return app.Settings{}, fmt.Errorf("provisioner: route %d: %w", route.ID, err)
 	}
-	settings := map[string]any{
-		"name":         route.Name,
-		"type":         kind,
-		"transport":    transport,
-		"user_id":      "",
-		"exit_node_id": strconv.FormatInt(node.ID, 10),
-	}
-	if password := secrets["encryption_password"]; password != "" {
-		settings["encryption_password"] = password
+	if strings.TrimSpace(settings.Name) == "" {
+		settings.Name = route.Name
 	}
 	return settings, nil
-}
-
-func wsURL(domain string) string {
-	domain = strings.TrimSpace(domain)
-	switch {
-	case strings.HasPrefix(domain, "wss://"), strings.HasPrefix(domain, "ws://"):
-		return domain
-	case strings.HasPrefix(domain, "https://"):
-		return "wss://" + strings.TrimPrefix(domain, "https://")
-	case strings.HasPrefix(domain, "http://"):
-		return "ws://" + strings.TrimPrefix(domain, "http://")
-	default:
-		return "wss://" + domain
-	}
-}
-
-func siteAddress(domain string) string {
-	domain = strings.TrimSpace(domain)
-	for _, prefix := range []string{"wss://", "ws://", "https://", "http://"} {
-		domain = strings.TrimPrefix(domain, prefix)
-	}
-	return strings.TrimSuffix(domain, "/")
-}
-
-func hostOnly(domain string) string {
-	domain = strings.TrimSpace(domain)
-	domain = strings.TrimPrefix(domain, "https://")
-	domain = strings.TrimPrefix(domain, "http://")
-	return strings.TrimSuffix(domain, "/")
 }
 
 func renderTemplates(pattern string, data any) ([]File, error) {

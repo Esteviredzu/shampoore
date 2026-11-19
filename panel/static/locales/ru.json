@@ -1,5 +1,19 @@
 {
   "app": { "title": "Shampoore Panel" },
+  "nav": {
+    "configs": "Конфигурации",
+    "nodes": "Серверы",
+    "routes": "Маршруты",
+    "users": "Пользователи"
+  },
+  "fleet": {
+    "nodesTitle": "Серверы (ноды)",
+    "addNode": "Добавить ноду",
+    "routesTitle": "Маршруты",
+    "addRoute": "Добавить маршрут",
+    "usersTitle": "Пользователи",
+    "addUser": "Добавить пользователя"
+  },
   "server": {
     "checking": "Проверка…",
     "running": "Сервер работает",

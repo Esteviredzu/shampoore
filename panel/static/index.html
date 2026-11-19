@@ -38,47 +38,110 @@
 <main class="container">
   <section id="server-bar" class="server-control"></section>
 
-  <section class="configs-section">
-    <div class="section-header">
-      <h2 class="section-title" data-lang="config.title">Configurations</h2>
-      <div class="section-actions">
-        <button id="btn-backup" class="btn btn--tonal btn--icon" type="button" title="Backup">
-          <span class="material-symbols-rounded">archive</span>
-        </button>
-        <button id="btn-refresh" class="btn btn--tonal btn--icon" type="button" title="Refresh">
-          <span class="material-symbols-rounded">refresh</span>
-        </button>
-        <button id="btn-rules" class="btn btn--tonal" type="button">
-          <span class="material-symbols-rounded">public</span>
-          <span>Geo Rules</span>
-        </button>
-        <button id="btn-add" class="btn btn--filled" type="button">
-          <span class="material-symbols-rounded">add</span>
-          <span data-lang="config.add">Add Config</span>
-        </button>
-      </div>
-    </div>
+  <nav class="panel-tabs" id="panel-tabs">
+    <button class="panel-tab active" type="button" data-panel="configs" data-lang="nav.configs">Configurations</button>
+    <button class="panel-tab" type="button" data-panel="nodes" data-lang="nav.nodes">Servers</button>
+    <button class="panel-tab" type="button" data-panel="routes" data-lang="nav.routes">Routes</button>
+    <button class="panel-tab" type="button" data-panel="users" data-lang="nav.users">Users</button>
+  </nav>
 
-    <div class="toolbar">
-      <div class="search-bar">
-        <span class="material-symbols-rounded">search</span>
-        <input id="search" type="search" data-lang-placeholder="config.search" placeholder="Search configs…">
-      </div>
-      <div class="dropdown" id="sort-dropdown">
-        <button class="btn btn--tonal" style="height:48px;">
-          <span class="material-symbols-rounded">sort</span>
-          <span id="current-sort-label" data-lang="config.sort.name">Sort: Name</span>
-        </button>
-        <div class="dropdown-menu">
-          <button class="dropdown-item" onclick="changeSort('name')" data-lang="config.sort.name">Name (A-Z)</button>
-          <button class="dropdown-item" onclick="changeSort('status')" data-lang="config.sort.status">Status</button>
+  <div id="panel-configs" class="panel-view">
+    <section class="configs-section">
+      <div class="section-header">
+        <h2 class="section-title" data-lang="config.title">Configurations</h2>
+        <div class="section-actions">
+          <button id="btn-backup" class="btn btn--tonal btn--icon" type="button" title="Backup">
+            <span class="material-symbols-rounded">archive</span>
+          </button>
+          <button id="btn-refresh" class="btn btn--tonal btn--icon" type="button" title="Refresh">
+            <span class="material-symbols-rounded">refresh</span>
+          </button>
+          <button id="btn-rules" class="btn btn--tonal" type="button">
+            <span class="material-symbols-rounded">public</span>
+            <span>Geo Rules</span>
+          </button>
+          <button id="btn-add" class="btn btn--filled" type="button">
+            <span class="material-symbols-rounded">add</span>
+            <span data-lang="config.add">Add Config</span>
+          </button>
         </div>
       </div>
-    </div>
 
-    <div id="configs" class="grid"></div>
-    <div id="empty" class="empty hidden"></div>
-  </section>
+      <div class="toolbar">
+        <div class="search-bar">
+          <span class="material-symbols-rounded">search</span>
+          <input id="search" type="search" data-lang-placeholder="config.search" placeholder="Search configs…">
+        </div>
+        <div class="dropdown" id="sort-dropdown">
+          <button class="btn btn--tonal" style="height:48px;">
+            <span class="material-symbols-rounded">sort</span>
+            <span id="current-sort-label" data-lang="config.sort.name">Sort: Name</span>
+          </button>
+          <div class="dropdown-menu">
+            <button class="dropdown-item" onclick="changeSort('name')" data-lang="config.sort.name">Name (A-Z)</button>
+            <button class="dropdown-item" onclick="changeSort('status')" data-lang="config.sort.status">Status</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="configs" class="grid"></div>
+      <div id="empty" class="empty hidden"></div>
+    </section>
+  </div>
+
+  <div id="panel-nodes" class="panel-view hidden">
+    <section class="configs-section">
+      <div class="section-header">
+        <h2 class="section-title" data-lang="fleet.nodesTitle">Servers (Nodes)</h2>
+        <div class="section-actions">
+          <button id="btn-refresh-nodes" class="btn btn--tonal btn--icon" type="button" title="Refresh">
+            <span class="material-symbols-rounded">refresh</span>
+          </button>
+          <button id="btn-add-node" class="btn btn--filled" type="button">
+            <span class="material-symbols-rounded">add</span>
+            <span data-lang="fleet.addNode">Add Node</span>
+          </button>
+        </div>
+      </div>
+      <div id="nodes-list" class="node-grid"></div>
+    </section>
+  </div>
+
+  <div id="panel-routes" class="panel-view hidden">
+    <section class="configs-section">
+      <div class="section-header">
+        <h2 class="section-title" data-lang="fleet.routesTitle">Routes</h2>
+        <div class="section-actions">
+          <button id="btn-refresh-routes" class="btn btn--tonal btn--icon" type="button" title="Refresh">
+            <span class="material-symbols-rounded">refresh</span>
+          </button>
+          <button id="btn-add-route" class="btn btn--filled" type="button">
+            <span class="material-symbols-rounded">add</span>
+            <span data-lang="fleet.addRoute">Add Route</span>
+          </button>
+        </div>
+      </div>
+      <div id="routes-list" class="data-list"></div>
+    </section>
+  </div>
+
+  <div id="panel-users" class="panel-view hidden">
+    <section class="configs-section">
+      <div class="section-header">
+        <h2 class="section-title" data-lang="fleet.usersTitle">Users</h2>
+        <div class="section-actions">
+          <button id="btn-refresh-users" class="btn btn--tonal btn--icon" type="button" title="Refresh">
+            <span class="material-symbols-rounded">refresh</span>
+          </button>
+          <button id="btn-add-user" class="btn btn--filled" type="button">
+            <span class="material-symbols-rounded">add</span>
+            <span data-lang="fleet.addUser">Add User</span>
+          </button>
+        </div>
+      </div>
+      <div id="users-list" class="data-list"></div>
+    </section>
+  </div>
 </main>
 
 <div id="modal-root" class="modal-root hidden"></div>

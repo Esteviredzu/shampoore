@@ -3,6 +3,12 @@ const state = {
   search: '', sort: 'name'
 };
 
+const fleet = {
+  active: 'configs',
+  nodes: [], routes: [], users: [],
+  loading: { nodes: false, routes: false, users: false }
+};
+
 (async function boot() {
   const langLabel = document.getElementById('current-lang-label');
   const savedLang = localStorage.getItem('shampoore_lang') || 'en';
@@ -35,6 +41,7 @@ const state = {
   });
   document.getElementById('btn-logout').addEventListener('click', logout);
   document.getElementById('search').addEventListener('input', e => { state.search = e.target.value.toLowerCase(); render(); });
+  setupFleetTabs();
 
   await load();
   await loadSystemStats();
@@ -124,7 +131,12 @@ async function api(path, opts = {}) {
   }
   const text = await res.text();
   let body = {}; try { body = text ? JSON.parse(text) : {}; } catch { body = { error: text }; }
-  if (!res.ok) throw new Error(body.error || res.statusText);
+  if (!res.ok) {
+    const err = new Error(body.error || res.statusText);
+    err.payload = body;
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 
@@ -800,3 +812,740 @@ async function openRulesDialog() {
 
   renderRulesBody();
 }
+
+/* ------------------------------------------------------------------ */
+/* Fleet control plane: nodes, routes, users                           */
+/* ------------------------------------------------------------------ */
+
+const TRANSPORT_KINDS = [
+  { value: 'raw_ws', label: 'Raw WebSocket' },
+  { value: 'silo', label: 'Silo S3' },
+  { value: 'livekit', label: 'LiveKit' }
+];
+
+function setupFleetTabs() {
+  document.querySelectorAll('.panel-tab').forEach(btn => {
+    btn.addEventListener('click', () => switchPanel(btn.dataset.panel));
+  });
+  const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+  bind('btn-refresh-nodes', () => loadPanel('nodes'));
+  bind('btn-refresh-routes', () => loadPanel('routes'));
+  bind('btn-refresh-users', () => loadPanel('users'));
+  bind('btn-add-node', () => openNodeModal(null));
+  bind('btn-add-route', () => fleetAddRoute());
+  bind('btn-add-user', () => openUserModal());
+
+  setInterval(() => {
+    if (fleet.active === 'nodes' || fleet.active === 'routes' || fleet.active === 'users') {
+      loadPanel(fleet.active, true);
+    }
+  }, 6000);
+}
+
+function switchPanel(name) {
+  if (!name) return;
+  fleet.active = name;
+  document.querySelectorAll('.panel-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.panel === name);
+  });
+  document.querySelectorAll('.panel-view').forEach(view => {
+    view.classList.toggle('hidden', view.id !== 'panel-' + name);
+  });
+  if (name === 'configs') render();
+  else loadPanel(name);
+}
+
+async function loadPanel(name, silent = false) {
+  if (!name || name === 'configs' || fleet.loading[name]) return;
+  fleet.loading[name] = true;
+  try {
+    if (name === 'nodes') {
+      fleet.nodes = (await api('/api/nodes')) || [];
+      renderNodes();
+    } else if (name === 'routes') {
+      const [routes, nodes] = await Promise.all([api('/api/routes'), api('/api/nodes')]);
+      fleet.routes = routes || [];
+      fleet.nodes = nodes || [];
+      renderRoutes();
+    } else if (name === 'users') {
+      const [users, routes] = await Promise.all([api('/api/users'), api('/api/routes')]);
+      fleet.users = users || [];
+      fleet.routes = routes || [];
+      renderUsers();
+    }
+  } catch (e) {
+    if (!silent) toast(e.message, 'error');
+  } finally {
+    fleet.loading[name] = false;
+  }
+}
+
+function nodeName(id) {
+  const node = fleet.nodes.find(n => n.id === id);
+  return node ? node.name : '#' + id;
+}
+
+function nodeRoles(node) {
+  if (node.is_relay && node.is_exit) return 'Relay + Exit';
+  if (node.is_relay) return 'Relay';
+  if (node.is_exit) return 'Exit';
+  return '—';
+}
+
+function statusClass(status) {
+  return ['new', 'deploying', 'deployed', 'online', 'error'].includes(status) ? status : 'new';
+}
+
+function renderNodes() {
+  const root = document.getElementById('nodes-list');
+  if (!root) return;
+  if (!fleet.nodes.length) {
+    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">dns</span><p>No servers yet. Add your first node.</p></div>`;
+    return;
+  }
+  root.innerHTML = fleet.nodes.map(node => {
+    const transports = (node.transports || []).map(tr => {
+      const flags = [tr.enabled ? 'enabled' : 'disabled'];
+      if (tr.on_demand) flags.push('on-demand');
+      return `<span class="transport-chip ${tr.enabled ? '' : 'muted'}">${esc(tr.type)}${tr.domain ? ' · ' + esc(tr.domain) : ''} <em>${esc(flags.join(', '))}</em></span>`;
+    }).join('') || `<span class="transport-chip muted">no transports</span>`;
+    return `
+      <div class="node-card">
+        <div class="node-card__header">
+          <div>
+            <h3 class="card__title">${esc(node.name)}</h3>
+            <span class="card__subtitle">${esc(node.ssh_user || 'root')}@${esc(node.ssh_host || '—')}:${esc(node.ssh_port || 22)}</span>
+          </div>
+          <span class="status-chip status-chip--${statusClass(node.status)}">${esc(node.status || 'new')}</span>
+        </div>
+        <div class="node-card__meta">
+          <span class="role-chip">${esc(nodeRoles(node))}</span>
+          ${node.socks_port ? `<span class="meta-chip">SOCKS :${esc(node.socks_port)}</span>` : ''}
+        </div>
+        <div class="transport-list">${transports}</div>
+        ${node.last_error ? `<div class="card__error">${esc(node.last_error)}</div>` : ''}
+        <div class="node-card__footer">
+          <button class="btn btn--filled btn--compact" type="button" onclick="fleetDeployNode(${node.id})">
+            <span class="material-symbols-rounded">rocket_launch</span> Deploy
+          </button>
+          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetEditNode(${node.id})">
+            <span class="material-symbols-rounded">edit</span> Edit
+          </button>
+          <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteNode(${node.id})">
+            <span class="material-symbols-rounded">delete</span>
+          </button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function fleetDeleteNode(id) {
+  const node = fleet.nodes.find(n => n.id === id);
+  if (!confirm(`Delete node "${node ? node.name : id}"?`)) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast('Node deleted');
+    await loadPanel('nodes');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function fleetDeployNode(id) {
+  const node = fleet.nodes.find(n => n.id === id);
+  const dialog = openModal({
+    title: `Deploy: ${node ? node.name : id}`,
+    body: `<div class="deploy-log"><div class="deploy-step">Connecting to the node…</div></div>`
+  });
+  try {
+    const result = await api(`/api/nodes/${encodeURIComponent(id)}/deploy`, { method: 'POST' });
+    renderDeployResult(dialog, result);
+    toast('Deploy finished');
+  } catch (e) {
+    if (e.payload && e.payload.deployment) renderDeployResult(dialog, e.payload.deployment);
+    else dialog.setBody(`<div class="deploy-log"><div class="deploy-step is-error">${esc(e.message)}</div></div>`);
+    toast(e.message, 'error');
+  }
+  loadPanel('nodes', true);
+}
+
+function renderDeployResult(dialog, result) {
+  const steps = (result && result.steps) || [];
+  const success = !!(result && result.success);
+  let html = `<div class="deploy-summary ${success ? 'is-ok' : 'is-error'}">
+    <span class="material-symbols-rounded">${success ? 'check_circle' : 'error'}</span>
+    ${success ? 'Deployment succeeded' : 'Deployment failed'}
+  </div><div class="deploy-log">`;
+  if (!steps.length) html += `<div class="deploy-step">No steps returned.</div>`;
+  steps.forEach(step => {
+    html += `<div class="deploy-step ${step.error ? 'is-error' : 'is-ok'}">
+      <div class="deploy-step__name">${step.error ? '✗' : '✓'} ${esc(step.name)}</div>
+      ${step.command ? `<div class="deploy-step__cmd">${esc(step.command)}</div>` : ''}
+      ${step.output ? `<pre class="deploy-step__out">${esc(step.output)}</pre>` : ''}
+      ${step.error ? `<pre class="deploy-step__err">${esc(step.error)}</pre>` : ''}
+    </div>`;
+  });
+  html += '</div>';
+  dialog.setBody(html);
+  const body = document.querySelector('.modal__body');
+  if (body) body.scrollTop = body.scrollHeight;
+}
+
+
+function emptyNodeDraft() {
+  return {
+    name: '', ssh_host: '', ssh_port: 22, ssh_user: 'root',
+    ssh_private_key: '', ssh_password: '',
+    is_relay: true, is_exit: false, socks_port: 1080,
+    transports: []
+  };
+}
+
+function nodeDraftFrom(node) {
+  const draft = emptyNodeDraft();
+  if (!node) return draft;
+  Object.assign(draft, {
+    name: node.name || '',
+    ssh_host: node.ssh_host || '',
+    ssh_port: node.ssh_port || 22,
+    ssh_user: node.ssh_user || 'root',
+    ssh_private_key: node.ssh_private_key || '',
+    ssh_password: node.ssh_password || '',
+    is_relay: !!node.is_relay,
+    is_exit: !!node.is_exit,
+    socks_port: node.socks_port || 1080,
+    transports: (node.transports || []).map(tr => ({
+      type: tr.type, domain: tr.domain || '',
+      enabled: !!tr.enabled, on_demand: !!tr.on_demand
+    }))
+  });
+  return draft;
+}
+
+async function fleetEditNode(id) {
+  if (!fleet.nodes.length) await loadPanel('nodes', true);
+  const node = fleet.nodes.find(n => n.id === id);
+  openNodeModal(node || null);
+}
+
+function openNodeModal(node) {
+  const draft = nodeDraftFrom(node);
+  const editID = node ? node.id : null;
+  fleet.nodeDraft = draft;
+
+  const dialog = openModal({
+    title: editID ? `Edit: ${node.name}` : 'Add server',
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: editID ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitNode }
+    ]
+  });
+
+  function transportRow(tr, i) {
+    const options = TRANSPORT_KINDS.map(k =>
+      `<option value="${escAttr(k.value)}" ${k.value === tr.type ? 'selected' : ''}>${esc(k.label)}</option>`
+    ).join('');
+    return `<div class="transport-row">
+      <select class="input" onchange="fleetNodeChangeTransportType(${i}, this.value)">${options}</select>
+      <input type="text" class="input" value="${escAttr(tr.domain)}" placeholder="domain.example.com"
+             oninput="fleetNodeSetTransport(${i}, 'domain', this.value)">
+      <label class="check-row"><input type="checkbox" ${tr.enabled ? 'checked' : ''}
+        onchange="fleetNodeSetTransport(${i}, 'enabled', this.checked)"> enabled</label>
+      ${tr.type === 'livekit' ? `<label class="check-row" title="Clients get short-lived JWT via /session"><input type="checkbox" ${tr.on_demand ? 'checked' : ''}
+        onchange="fleetNodeSetTransport(${i}, 'on_demand', this.checked)"> on-demand</label>` : ''}
+      <button type="button" class="icon-btn icon-btn--danger" title="Remove"
+        onclick="fleetNodeRemoveTransport(${i})"><span class="material-symbols-rounded">delete</span></button>
+    </div>`;
+  }
+
+  function renderNodeBody() {
+    const transports = draft.transports.map(transportRow).join('') ||
+      `<div class="hint">No transports yet. A relay node needs at least one enabled transport.</div>`;
+    dialog.setBody(`
+      <div class="form-group">
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="n-name" value="${escAttr(draft.name)}" placeholder="relay-de">
+        </div>
+        <div class="form-row">
+          <div class="field"><label>SSH host</label><input type="text" id="n-host" value="${escAttr(draft.ssh_host)}" placeholder="203.0.113.10"></div>
+          <div class="field field--small"><label>Port</label><input type="number" id="n-port" value="${escAttr(draft.ssh_port)}" min="1" max="65535"></div>
+        </div>
+        <div class="form-row">
+          <div class="field"><label>SSH user</label><input type="text" id="n-user" value="${escAttr(draft.ssh_user)}" placeholder="root"></div>
+          <div class="field field--small"><label>SOCKS port (exit)</label><input type="number" id="n-socks" value="${escAttr(draft.socks_port)}" min="0" max="65535"></div>
+        </div>
+        <div class="field">
+          <label>SSH private key</label>
+          <textarea id="n-key" class="compact-textarea" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${esc(draft.ssh_private_key)}</textarea>
+        </div>
+        <div class="field">
+          <label>SSH password (optional)</label>
+          <input type="password" id="n-pass" value="${escAttr(draft.ssh_password)}">
+        </div>
+        <div class="field">
+          <label>Roles</label>
+          <div class="role-row">
+            <label class="check-row"><input type="checkbox" id="n-relay" ${draft.is_relay ? 'checked' : ''}> Relay</label>
+            <label class="check-row"><input type="checkbox" id="n-exit" ${draft.is_exit ? 'checked' : ''}> Exit</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Transports &amp; domains</label>
+          <div class="transport-rows">${transports}</div>
+          <button type="button" class="btn btn--tonal" style="align-self:flex-start;margin-top:8px"
+            onclick="fleetNodeAddTransport()"><span class="material-symbols-rounded">add</span> Add transport</button>
+        </div>
+      </div>`);
+    bindNodeForm();
+  }
+
+  function bindNodeForm() {
+    const bindInput = (id, key, numeric) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('input', e => {
+        draft[key] = numeric ? Number(e.target.value) || 0 : e.target.value;
+      });
+    };
+    bindInput('n-name', 'name');
+    bindInput('n-host', 'ssh_host');
+    bindInput('n-port', 'ssh_port', true);
+    bindInput('n-user', 'ssh_user');
+    bindInput('n-socks', 'socks_port', true);
+    bindInput('n-key', 'ssh_private_key');
+    bindInput('n-pass', 'ssh_password');
+    const relay = document.getElementById('n-relay');
+    if (relay) relay.addEventListener('change', e => { draft.is_relay = e.target.checked; });
+    const exit = document.getElementById('n-exit');
+    if (exit) exit.addEventListener('change', e => { draft.is_exit = e.target.checked; });
+  }
+
+  function submitNode() {
+    if (!draft.name.trim()) return toast('Name is required', 'error');
+    if (!draft.ssh_host.trim()) return toast('SSH host is required', 'error');
+    if (!draft.is_relay && !draft.is_exit) return toast('Choose Relay and/or Exit role', 'error');
+    const path = editID ? `/api/nodes/${encodeURIComponent(editID)}` : '/api/nodes';
+    api(path, {
+      method: editID ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(draft)
+    }).then(() => {
+      toast(editID ? 'Node saved' : 'Node created');
+      closeModal();
+      loadPanel('nodes');
+    }).catch(e => toast(e.message, 'error'));
+  }
+
+  fleet.renderNodeBody = renderNodeBody;
+  renderNodeBody();
+}
+
+function fleetNodeSetTransport(index, key, value) {
+  const draft = fleet.nodeDraft;
+  if (!draft || !draft.transports[index]) return;
+  draft.transports[index][key] = value;
+}
+
+function fleetNodeChangeTransportType(index, value) {
+  const draft = fleet.nodeDraft;
+  if (!draft || !draft.transports[index]) return;
+  draft.transports[index].type = value;
+  if (value !== 'livekit') draft.transports[index].on_demand = false;
+  if (fleet.renderNodeBody) fleet.renderNodeBody();
+}
+
+function fleetNodeAddTransport() {
+  const draft = fleet.nodeDraft;
+  if (!draft) return;
+  draft.transports.push({ type: 'raw_ws', domain: '', enabled: true, on_demand: false });
+  if (fleet.renderNodeBody) fleet.renderNodeBody();
+}
+
+function fleetNodeRemoveTransport(index) {
+  const draft = fleet.nodeDraft;
+  if (!draft) return;
+  draft.transports.splice(index, 1);
+  if (fleet.renderNodeBody) fleet.renderNodeBody();
+}
+
+
+function transportLabel(kind) {
+  const found = TRANSPORT_KINDS.find(k => k.value === kind);
+  return found ? found.label : kind;
+}
+
+function renderRoutes() {
+  const root = document.getElementById('routes-list');
+  if (!root) return;
+  if (!fleet.routes.length) {
+    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">alt_route</span><p>No routes yet. Create an Entry → Exit chain.</p></div>`;
+    return;
+  }
+  const rows = fleet.routes.map(route => `
+    <tr>
+      <td><strong>${esc(route.name)}</strong><div class="table-sub">#${esc(route.id)}</div></td>
+      <td>${esc(nodeName(route.entry_node_id))} <span class="arrow">→</span> ${esc(nodeName(route.exit_node_id))}</td>
+      <td><span class="transport-chip">${esc(transportLabel(route.transport_type))}</span></td>
+      <td>
+        <label class="switch">
+          <input type="checkbox" ${route.enabled ? 'checked' : ''} onchange="fleetToggleRoute(${route.id}, this.checked)">
+          <span class="slider"></span>
+        </label>
+      </td>
+      <td class="table-actions">
+        <button class="icon-btn" type="button" title="Edit" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
+        <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
+      </td>
+    </tr>`).join('');
+  root.innerHTML = `<div class="table-wrap"><table class="data-table">
+    <thead><tr><th>Name</th><th>Entry → Exit</th><th>Transport</th><th>Enabled</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+async function fleetToggleRoute(id, enabled) {
+  const route = fleet.routes.find(r => r.id === id);
+  if (!route) return;
+  try {
+    await api(`/api/routes/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: route.name,
+        entry_node_id: route.entry_node_id,
+        exit_node_id: route.exit_node_id,
+        transport_type: route.transport_type,
+        enabled: enabled
+      })
+    });
+    route.enabled = enabled;
+    toast(enabled ? 'Route enabled' : 'Route disabled');
+  } catch (e) {
+    toast(e.message, 'error');
+    loadPanel('routes', true);
+  }
+}
+
+async function fleetDeleteRoute(id) {
+  const route = fleet.routes.find(r => r.id === id);
+  if (!confirm(`Delete route "${route ? route.name : id}"?`)) return;
+  try {
+    await api(`/api/routes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast('Route deleted');
+    await loadPanel('routes');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+
+async function fleetEditRoute(id) {
+  const route = fleet.routes.find(r => r.id === id) || null;
+  if (!route) return;
+  if (!fleet.nodes.length) await loadPanel('routes', true);
+  openRouteModal(route);
+}
+
+async function fleetAddRoute() {
+  if (!fleet.nodes.length) await loadPanel('routes', true);
+  openRouteModal();
+}
+
+function openRouteModal(route) {
+  const editID = route ? route.id : null;
+  const relays = fleet.nodes.filter(n => n.is_relay);
+  const exits = fleet.nodes.filter(n => n.is_exit);
+  const entryID = route ? route.entry_node_id : (relays[0] ? relays[0].id : 0);
+  const exitID = route ? route.exit_node_id : (exits[0] ? exits[0].id : 0);
+  const transport = route ? route.transport_type : (TRANSPORT_KINDS[0].value);
+  const draft = {
+    name: route ? route.name : '',
+    entry_node_id: entryID,
+    exit_node_id: exitID,
+    transport_type: transport,
+    enabled: route ? !!route.enabled : true
+  };
+
+  function selectOptions(nodes, selected) {
+    if (!nodes.length) return `<option value="0">No nodes available</option>`;
+    return nodes.map(n => `<option value="${n.id}" ${n.id === selected ? 'selected' : ''}>${esc(n.name)}</option>`).join('');
+  }
+
+  openModal({
+    title: editID ? `Edit route: ${route.name}` : 'Add route',
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: editID ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitRoute }
+    ],
+    body: `
+      <div class="form-group">
+        <div class="field"><label>Name</label><input type="text" id="r-name" value="${escAttr(draft.name)}" placeholder="de-fr"></div>
+        <div class="field"><label>Entry node (relay)</label><select id="r-entry" class="input">${selectOptions(relays, entryID)}</select></div>
+        <div class="field"><label>Exit node</label><select id="r-exit" class="input">${selectOptions(exits, exitID)}</select></div>
+        <div class="field"><label>Transport</label><select id="r-transport" class="input">
+          ${TRANSPORT_KINDS.map(k => `<option value="${escAttr(k.value)}" ${k.value === transport ? 'selected' : ''}>${esc(k.label)}</option>`).join('')}
+        </select></div>
+        <label class="check-row"><input type="checkbox" id="r-enabled" ${draft.enabled ? 'checked' : ''}> Enabled</label>
+      </div>`
+  });
+
+  document.getElementById('r-name').addEventListener('input', e => { draft.name = e.target.value; });
+  document.getElementById('r-entry').addEventListener('change', e => { draft.entry_node_id = Number(e.target.value) || 0; });
+  document.getElementById('r-exit').addEventListener('change', e => { draft.exit_node_id = Number(e.target.value) || 0; });
+  document.getElementById('r-transport').addEventListener('change', e => { draft.transport_type = e.target.value; });
+  document.getElementById('r-enabled').addEventListener('change', e => { draft.enabled = e.target.checked; });
+
+  function submitRoute() {
+    if (!draft.name.trim()) return toast('Name is required', 'error');
+    if (!draft.entry_node_id || !draft.exit_node_id) return toast('Choose entry and exit nodes', 'error');
+    const path = editID ? `/api/routes/${encodeURIComponent(editID)}` : '/api/routes';
+    api(path, {
+      method: editID ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(draft)
+    }).then(() => {
+      toast(editID ? 'Route saved' : 'Route created');
+      closeModal();
+      loadPanel('routes');
+    }).catch(e => toast(e.message, 'error'));
+  }
+}
+
+
+function userUsedBytes(user) {
+  return (Number(user.used_upload_bytes) || 0) + (Number(user.used_download_bytes) || 0);
+}
+
+function formatExpiry(value) {
+  if (!value) return 'Unlimited';
+  const date = new Date(value);
+  if (isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return 'Unlimited';
+  return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function userExpired(value) {
+  if (!value) return false;
+  const date = new Date(value);
+  if (isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return false;
+  return date.getTime() <= Date.now();
+}
+
+function routeNames(ids) {
+  if (!ids || !ids.length) return 'All routes';
+  return ids.map(id => nodeRouteName(id)).join(', ');
+}
+
+function nodeRouteName(id) {
+  const route = fleet.routes.find(r => r.id === id);
+  return route ? route.name : '#' + id;
+}
+
+function renderUsers() {
+  const root = document.getElementById('users-list');
+  if (!root) return;
+  if (!fleet.users.length) {
+    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">group</span><p>No users yet.</p></div>`;
+    return;
+  }
+  root.innerHTML = fleet.users.map((user, index) => {
+    const used = userUsedBytes(user);
+    const limit = Number(user.traffic_limit_bytes) || 0;
+    const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
+    const progressClass = limit <= 0 ? 'unlimited' : (percent >= 90 ? 'danger' : percent >= 70 ? 'warn' : 'good');
+    const active = user.enabled && !userExpired(user.expires_at) &&
+      (limit <= 0 || used < limit);
+    return `
+      <div class="user-card">
+        <div class="user-card__header">
+          <div>
+            <h3 class="card__title">${esc(user.name || user.id)}</h3>
+            <span class="card__subtitle">${esc(user.id)}</span>
+          </div>
+          <span class="status-chip status-chip--${active ? 'online' : 'error'}">${active ? 'active' : 'inactive'}</span>
+        </div>
+        <div class="user-card__meta">
+          <span class="meta-chip">Expires: ${esc(formatExpiry(user.expires_at))}</span>
+          <span class="meta-chip">${esc(routeNames(user.allowed_route_ids))}</span>
+        </div>
+        <div class="traffic">
+          <div class="traffic__labels">
+            <span>↓ ${formatBytes(Number(user.used_download_bytes) || 0)}</span>
+            <span>↑ ${formatBytes(Number(user.used_upload_bytes) || 0)}</span>
+            <span>${limit > 0 ? formatBytes(used) + ' / ' + formatBytes(limit) : formatBytes(used) + ' / unlimited'}</span>
+          </div>
+          <div class="progress progress--${progressClass}">
+            <div class="progress__bar" style="width:${limit > 0 ? percent : Math.min(100, Math.round(used / (1024 * 1024 * 1024) * 100))}%"></div>
+          </div>
+        </div>
+        <div class="user-card__footer">
+          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetCopySubscription(${index})">
+            <span class="material-symbols-rounded">link</span> Copy subscription
+          </button>
+          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetResetUserTraffic(${index})">
+            <span class="material-symbols-rounded">restart_alt</span> Reset traffic
+          </button>
+          <button class="btn btn--tonal btn--compact" type="button" onclick="fleetToggleUser(${index})">
+            <span class="material-symbols-rounded">${user.enabled ? 'block' : 'lock_open'}</span> ${user.enabled ? 'Block' : 'Unblock'}
+          </button>
+          <button class="icon-btn icon-btn--danger" type="button" title="Delete" onclick="fleetDeleteUser(${index})">
+            <span class="material-symbols-rounded">delete</span>
+          </button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function fleetCopySubscription(index) {
+  const user = fleet.users[index];
+  if (!user) return;
+  const url = user.subscription_url || (location.origin + '/sub/' + encodeURIComponent(user.sub_token));
+  await copyToClipboard(url);
+  toast('Subscription link copied');
+}
+
+async function fleetResetUserTraffic(index) {
+  const user = fleet.users[index];
+  if (!user || !confirm(`Reset traffic for "${user.name || user.id}"?`)) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(user.id)}/reset-traffic`, { method: 'POST' });
+    toast('Traffic reset');
+    await loadPanel('users');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function fleetToggleUser(index) {
+  const user = fleet.users[index];
+  if (!user) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(user.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: user.name,
+        sub_token: user.sub_token,
+        enabled: !user.enabled,
+        expires_at: user.expires_at,
+        traffic_limit_bytes: user.traffic_limit_bytes,
+        allowed_route_ids: user.allowed_route_ids || []
+      })
+    });
+    toast(user.enabled ? 'User blocked' : 'User unblocked');
+    await loadPanel('users');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function fleetDeleteUser(index) {
+  const user = fleet.users[index];
+  if (!user || !confirm(`Delete user "${user.name || user.id}"?`)) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(user.id)}`, { method: 'DELETE' });
+    toast('User deleted');
+    await loadPanel('users');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+
+function openUserModal() {
+  if (!fleet.routes.length) loadPanel('users', true).then(() => openUserModalNow());
+  else openUserModalNow();
+}
+
+function openUserModalNow() {
+  if (!fleet.routes.length) loadPanel('users', true);
+  const draft = {
+    name: '',
+    enabled: true,
+    expiryMode: 'days',
+    days: 30,
+    trafficMode: 'limited',
+    gb: 100,
+    routeIDs: []
+  };
+
+  const routeOptions = fleet.routes.length
+    ? fleet.routes.map(route => `<label class="check-row">
+        <input type="checkbox" id="u-route-${route.id}" data-route-id="${route.id}"
+          onchange="fleetUserToggleRoute(${route.id}, this.checked)">
+        ${esc(route.name)} <span class="hint">(${esc(transportLabel(route.transport_type))})</span>
+      </label>`).join('')
+    : `<div class="hint">No routes yet. The user will get access to all routes created later.</div>`;
+
+  openModal({
+    title: 'Add user',
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: t('actions.create'), kind: 'filled', onClick: submitUser }
+    ],
+    body: `
+      <div class="form-group">
+        <div class="field"><label>Name</label><input type="text" id="u-name" placeholder="Alice"></div>
+        <label class="check-row"><input type="checkbox" id="u-enabled" checked> Enabled</label>
+        <div class="form-row">
+          <div class="field"><label>Expires</label><select id="u-expiry-mode" class="input">
+            <option value="days">In N days</option>
+            <option value="never">Never</option>
+          </select></div>
+          <div class="field field--small"><label>Days</label><input type="number" id="u-days" value="30" min="1"></div>
+        </div>
+        <div class="form-row">
+          <div class="field"><label>Traffic limit</label><select id="u-traffic-mode" class="input">
+            <option value="limited">Limited</option>
+            <option value="unlimited">Unlimited</option>
+          </select></div>
+          <div class="field field--small"><label>GB</label><input type="number" id="u-gb" value="100" min="1"></div>
+        </div>
+        <div class="field"><label>Allowed routes (empty = all)</label><div class="check-list">${routeOptions}</div></div>
+      </div>`
+  });
+
+  fleet.userDraft = draft;
+
+  const nameEl = document.getElementById('u-name');
+  const enabledEl = document.getElementById('u-enabled');
+  const expiryEl = document.getElementById('u-expiry-mode');
+  const daysEl = document.getElementById('u-days');
+  const trafficEl = document.getElementById('u-traffic-mode');
+  const gbEl = document.getElementById('u-gb');
+
+  nameEl.addEventListener('input', e => { draft.name = e.target.value; });
+  enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
+  expiryEl.addEventListener('change', e => {
+    draft.expiryMode = e.target.value;
+    daysEl.disabled = draft.expiryMode === 'never';
+  });
+  daysEl.addEventListener('input', e => { draft.days = Number(e.target.value) || 0; });
+  trafficEl.addEventListener('change', e => {
+    draft.trafficMode = e.target.value;
+    gbEl.disabled = draft.trafficMode === 'unlimited';
+  });
+  gbEl.addEventListener('input', e => { draft.gb = Number(e.target.value) || 0; });
+
+  function submitUser() {
+    const payload = {
+      name: draft.name.trim(),
+      enabled: draft.enabled,
+      allowed_route_ids: draft.routeIDs
+    };
+    if (draft.expiryMode === 'days' && draft.days > 0) {
+      payload.expires_at = new Date(Date.now() + draft.days * 86400000).toISOString();
+    }
+    if (draft.trafficMode === 'limited' && draft.gb > 0) {
+      payload.traffic_limit_bytes = Math.round(draft.gb * 1024 * 1024 * 1024);
+    }
+    api('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(() => {
+      toast('User created');
+      closeModal();
+      loadPanel('users');
+    }).catch(e => toast(e.message, 'error'));
+  }
+}
+
+function fleetUserToggleRoute(id, checked) {
+  const draft = fleet.userDraft;
+  if (!draft) return;
+  const set = new Set(draft.routeIDs);
+  if (checked) set.add(id);
+  else set.delete(id);
+  draft.routeIDs = Array.from(set).sort((a, b) => a - b);
+}
+

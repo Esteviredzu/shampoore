@@ -1,15 +1,8 @@
-{{- range .RawWSDomains }}
+{{- range .Sites }}
+{{- $upstream := .Upstream }}
+{{- range .Domains }}
 {{ . }} {
-	reverse_proxy relay:8787
+	reverse_proxy {{ $upstream }}
 }
 {{ end -}}
-{{- range .SiloDomains }}
-{{ . }} {
-	reverse_proxy minio:9000
-}
-{{ end -}}
-{{- range .LiveKitDomains }}
-{{ . }} {
-	reverse_proxy livekit:7880
-}
 {{ end -}}

@@ -170,3 +170,43 @@ func EncodeValue(v any) string {
 		return fmt.Sprint(v)
 	}
 }
+
+func NormalizeWSURL(domain string) string {
+	domain = strings.TrimSpace(domain)
+	switch {
+	case strings.HasPrefix(domain, "wss://"), strings.HasPrefix(domain, "ws://"):
+		return domain
+	case strings.HasPrefix(domain, "https://"):
+		return "wss://" + strings.TrimPrefix(domain, "https://")
+	case strings.HasPrefix(domain, "http://"):
+		return "ws://" + strings.TrimPrefix(domain, "http://")
+	default:
+		return "wss://" + domain
+	}
+}
+
+func NormalizeHTTPSURL(domain string) string {
+	domain = strings.TrimSpace(domain)
+	switch {
+	case strings.HasPrefix(domain, "https://"), strings.HasPrefix(domain, "http://"):
+		return strings.TrimSuffix(domain, "/")
+	case strings.HasPrefix(domain, "wss://"):
+		return "https://" + strings.TrimPrefix(domain, "wss://")
+	case strings.HasPrefix(domain, "ws://"):
+		return "http://" + strings.TrimPrefix(domain, "ws://")
+	default:
+		return "https://" + strings.TrimSuffix(domain, "/")
+	}
+}
+
+func HostOnly(domain string) string {
+	domain = strings.TrimSpace(domain)
+	for _, prefix := range []string{"https://", "http://", "wss://", "ws://"} {
+		domain = strings.TrimPrefix(domain, prefix)
+	}
+	return strings.TrimSuffix(domain, "/")
+}
+
+func SiteAddress(domain string) string {
+	return HostOnly(domain)
+}

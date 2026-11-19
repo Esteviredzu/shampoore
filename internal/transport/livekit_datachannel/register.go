@@ -3,12 +3,15 @@ package livekit_datachannel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -108,6 +111,12 @@ func init() {
 		EncodeURL: lk.EncodeURL,
 		Validate:  validate,
 		Build:     build,
+
+		Aliases:                 []string{"livekit"},
+		BuildSubscriptionConfig: buildSubscriptionConfig,
+		BuildServerConfig:       buildServerConfig,
+		RelayUpstream:           "livekit:7880",
+		RelaySecrets:            []string{"livekit_api_key", "livekit_api_secret"},
 	})
 	if err != nil {
 		panic(err)
@@ -229,4 +238,106 @@ func bypassHosts(ctx context.Context, signalURL string) []string {
 	out := []string{host}
 	out = append(out, netdial.ResolveIPv4(ctx, host)...)
 	return out
+}
+
+func routeRoomPrefix(p app.RouteParams) string {
+	if p.RouteID > 0 {
+		return "shampoore-route-" + strconv.FormatInt(p.RouteID, 10)
+	}
+	if name := strings.TrimSpace(p.RouteName); name != "" {
+		return "shampoore-" + name
+	}
+	return "shampoore-route"
+}
+
+func buildSubscriptionConfig(p app.RouteParams) (app.Settings, error) {
+	signalURL := app.NormalizeWSURL(p.Domain)
+	if strings.TrimSpace(signalURL) == "" || signalURL == "wss://" {
+		return app.Settings{}, errors.New("livekit: signal domain is required")
+	}
+	cfg := lk.Config{
+		SignalURL:  signalURL,
+		APIKey:     p.Secret("livekit_api_key"),
+		DataTopic:  "shampoore",
+		RoomPrefix: routeRoomPrefix(p),
+		UserID:     p.UserID,
+		ExitNodeID: p.ExitNodeID,
+	}
+	if p.OnDemand {
+
+		cfg.TokenURL = strings.TrimSpace(p.TokenURL)
+		if cfg.TokenURL == "" {
+			cfg.TokenURL = app.NormalizeHTTPSURL(p.Domain) + "/session"
+		}
+		cfg.TokenSecret = strings.TrimSpace(p.TokenSecret)
+	} else {
+		cfg.APISecret = p.Secret("livekit_api_secret")
+		cfg.Room = routeRoomPrefix(p) + "-" + strings.ToLower(p.UserID)
+		if tokenURL := strings.TrimSpace(p.Secret("livekit_token_url")); tokenURL != "" {
+			cfg.TokenURL = tokenURL
+			cfg.TokenSecret = p.Secret("livekit_token_secret")
+		}
+	}
+	if err := cfg.ValidateForRole("client"); err != nil {
+		return app.Settings{}, err
+	}
+	return livekitSettings(cfg, p, false)
+}
+
+func buildServerConfig(p app.RouteParams) (app.Settings, error) {
+	signalURL := app.NormalizeWSURL(p.Domain)
+	if strings.TrimSpace(signalURL) == "" || signalURL == "wss://" {
+		return app.Settings{}, errors.New("livekit: signal domain is required")
+	}
+	tokenListen := strings.TrimSpace(p.Secret("livekit_token_listen"))
+	if tokenListen == "" {
+		tokenListen = "127.0.0.1:8099"
+	}
+	cfg := lk.Config{
+		SignalURL:   signalURL,
+		APIKey:      p.Secret("livekit_api_key"),
+		APISecret:   p.Secret("livekit_api_secret"),
+		Multiuser:   true,
+		Users:       make([]auth.UserSpec, 0),
+		DataTopic:   "shampoore",
+		RoomPrefix:  routeRoomPrefix(p),
+		TokenListen: tokenListen,
+		TokenSecret: p.Secret("livekit_token_secret"),
+	}
+	if err := cfg.ValidateForRole("server"); err != nil {
+		return app.Settings{}, err
+	}
+	return livekitSettings(cfg, p, true)
+}
+
+func livekitSettings(cfg lk.Config, p app.RouteParams, server bool) (app.Settings, error) {
+	raw, err := app.MarshalTransportOptions(cfg, server)
+	if err != nil {
+		return app.Settings{}, err
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return app.Settings{}, err
+	}
+	for key, value := range obj {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
+			delete(obj, key)
+		}
+	}
+	raw, err = json.Marshal(obj)
+	if err != nil {
+		return app.Settings{}, err
+	}
+	out := app.Settings{
+		Name:      p.RouteName,
+		Type:      "livekit_datachannel",
+		Transport: raw,
+	}
+	if !server {
+		out.UserID = p.UserID
+	}
+	out.ExitNodeID = p.ExitNodeID
+	out.EncryptionPassword = p.Secret("encryption_password")
+	return out, nil
 }

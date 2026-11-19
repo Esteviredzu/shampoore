@@ -87,6 +87,12 @@ func init() {
 		EncodeURL: encodeURL,
 		Validate:  validate,
 		Build:     build,
+
+		Aliases:                 []string{"raw_ws"},
+		BuildSubscriptionConfig: buildSubscriptionConfig,
+		BuildServerConfig:       buildServerConfig,
+		RelayUpstream:           "relay:8787",
+		RelaySecrets:            []string{"raw_ws_password"},
 	})
 	if err != nil {
 		panic(err)
@@ -243,4 +249,69 @@ func validate(raw json.RawMessage) error {
 		return errors.New("raw_ws: server_url, room and password are required")
 	}
 	return validateSecureServerURL(cfg.ServerURL, cfg.AllowInsecureWS)
+}
+
+func routeRoom(p app.RouteParams) string {
+	if p.RouteID > 0 {
+		return "route-" + strconv.FormatInt(p.RouteID, 10)
+	}
+	if name := strings.TrimSpace(p.RouteName); name != "" {
+		return name
+	}
+	return "route"
+}
+
+func buildSubscriptionConfig(p app.RouteParams) (app.Settings, error) {
+	cfg := Config{
+		ServerURL: app.NormalizeWSURL(p.Domain),
+		Room:      routeRoom(p),
+		Password:  p.Secret("raw_ws_password"),
+		Batch:     true,
+		Padding:   true,
+		UserID:    p.UserID,
+	}
+	if strings.TrimSpace(cfg.Password) == "" {
+		return app.Settings{}, errors.New("raw_ws: missing raw_ws_password")
+	}
+	if strings.HasPrefix(cfg.ServerURL, "ws://") {
+		cfg.AllowInsecureWS = true
+	}
+	return rawWSSettings(cfg, p, false)
+}
+
+func buildServerConfig(p app.RouteParams) (app.Settings, error) {
+	cfg := Config{
+		ServerURL: app.NormalizeWSURL(p.Domain),
+		Room:      routeRoom(p),
+		Password:  p.Secret("raw_ws_password"),
+		Batch:     true,
+		Padding:   true,
+		Multiuser: true,
+		Users:     make([]auth.UserSpec, 0),
+	}
+	if strings.TrimSpace(cfg.Password) == "" {
+		return app.Settings{}, errors.New("raw_ws: missing raw_ws_password")
+	}
+	if strings.HasPrefix(cfg.ServerURL, "ws://") {
+		cfg.AllowInsecureWS = true
+	}
+	return rawWSSettings(cfg, p, true)
+}
+
+func rawWSSettings(cfg Config, p app.RouteParams, server bool) (app.Settings, error) {
+	raw, err := app.MarshalTransportOptions(cfg, server)
+	if err != nil {
+		return app.Settings{}, err
+	}
+	out := app.Settings{
+		Name:      p.RouteName,
+		Type:      "raw_ws",
+		Transport: raw,
+	}
+	if !server {
+		out.UserID = p.UserID
+	}
+	out.ExitNodeID = p.ExitNodeID
+	out.EncryptionPassword = p.Secret("encryption_password")
+	return out, nil
 }

@@ -17,16 +17,18 @@ import (
 
 func secretsFor(name string) map[string]string {
 	return map[string]string{
-		"encryption_password": "enc-" + name,
-		"raw_ws_password":     "ws-" + name,
-		"livekit_api_key":     "key-" + name,
-		"livekit_api_secret":  "secret-" + name,
-		"minio_root_user":     "minio-" + name,
-		"minio_root_password": "minio-pass-" + name,
-		"s3_access_key":       "s3-key-" + name,
-		"s3_secret_key":       "s3-secret-" + name,
-		"s3_bucket":           "bucket-" + name,
-		"tunnel_id":           "shampoore",
+		"encryption_password":  "enc-" + name,
+		"raw_ws_password":      "ws-" + name,
+		"livekit_api_key":      "key-" + name,
+		"livekit_api_secret":   "secret-" + name,
+		"livekit_token_secret": "token-secret-" + name,
+		"livekit_token_listen": "127.0.0.1:8099",
+		"minio_root_user":      "minio-" + name,
+		"minio_root_password":  "minio-pass-" + name,
+		"s3_access_key":        "s3-key-" + name,
+		"s3_secret_key":        "s3-secret-" + name,
+		"s3_bucket":            "bucket-" + name,
+		"tunnel_id":            "shampoore",
 	}
 }
 
@@ -231,5 +233,70 @@ func TestRenderExit(t *testing.T) {
 	}
 	if _, err := RenderExit(exit, routes, []panelstore.Node{relay, exit}, RenderOptions{}); err == nil {
 		t.Fatal("RenderExit accepted an empty panel URL")
+	}
+}
+
+func TestRenderExitLiveKitOnDemandServerConfig(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               1,
+		Name:             "relay",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportLiveKit, Domain: "lk.example.com", Enabled: true, OnDemand: true},
+		},
+	}
+	exit := panelstore.Node{
+		ID:               2,
+		Name:             "exit",
+		IsExit:           true,
+		SocksPort:        1080,
+		NodeSecret:       "exit-secret",
+		GeneratedSecrets: secretsFor("exit"),
+	}
+	routes := []panelstore.Route{{
+		ID:            9,
+		Name:          "route-9",
+		EntryNodeID:   relay.ID,
+		ExitNodeID:    exit.ID,
+		TransportType: panelstore.TransportLiveKit,
+		Enabled:       true,
+	}}
+	files, err := RenderExit(exit, routes, []panelstore.Node{relay, exit}, RenderOptions{PanelURL: "https://panel.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgFile, ok := fileMap(files)["configs/route-9.json"]
+	if !ok {
+		t.Fatal("missing livekit exit config")
+	}
+	var settings app.Settings
+	if err := json.Unmarshal(cfgFile.Data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.Type != "livekit_datachannel" {
+		t.Fatalf("type = %q", settings.Type)
+	}
+	var tr map[string]any
+	if err := json.Unmarshal(settings.Transport, &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr["multiuser"] != true {
+		t.Fatalf("multiuser = %v", tr["multiuser"])
+	}
+	if users, ok := tr["users"].([]any); !ok || len(users) != 0 {
+		t.Fatalf("users = %#v, want empty array", tr["users"])
+	}
+	if tr["api_secret"] != "secret-relay" {
+		t.Fatalf("server config api_secret = %v", tr["api_secret"])
+	}
+	if tr["token_secret"] != "token-secret-relay" {
+		t.Fatalf("token_secret = %v", tr["token_secret"])
+	}
+	if tr["token_listen"] != "127.0.0.1:8099" {
+		t.Fatalf("token_listen = %v", tr["token_listen"])
+	}
+	if tr["room_prefix"] != "shampoore-route-9" {
+		t.Fatalf("room_prefix = %v", tr["room_prefix"])
 	}
 }

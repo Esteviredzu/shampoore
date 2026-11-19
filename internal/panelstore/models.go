@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,9 +28,10 @@ var (
 )
 
 type Transport struct {
-	Type    string `json:"type"`
-	Domain  string `json:"domain"`
-	Enabled bool   `json:"enabled"`
+	Type     string `json:"type"`
+	Domain   string `json:"domain"`
+	Enabled  bool   `json:"enabled"`
+	OnDemand bool   `json:"on_demand,omitempty"`
 }
 
 type Node struct {
@@ -135,12 +137,12 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 		if tr.Enabled && domain == "" {
 			return nil, invalidf("transport %q requires a domain", kind)
 		}
-		key := kind + "\x00" + domain
+		key := kind + "\x00" + domain + "\x00" + strconv.FormatBool(tr.OnDemand)
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		out = append(out, Transport{Type: kind, Domain: domain, Enabled: tr.Enabled})
+		out = append(out, Transport{Type: kind, Domain: domain, Enabled: tr.Enabled, OnDemand: tr.OnDemand})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Type == out[j].Type {

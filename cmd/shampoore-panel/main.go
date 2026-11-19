@@ -28,18 +28,28 @@ import (
 
 func main() {
 	sockPath := flag.String("socket", "/tmp/shampoore.sock", "control socket of shampoore-server")
-	listen := flag.String("listen", "127.0.0.1:8080", "panel HTTP listen")
+	listen := flag.String("listen", "127.0.0.1:8080", "panel admin HTTP listen (loopback only; use -allow-public-admin to override)")
 	token := flag.String("token", "", "panel access token; generated and logged when empty")
 	configsDir := flag.String("configs-dir", "./configs", "directory with managed configs")
 	rulesDir := flag.String("rules-dir", "./rules", "directory with geoip rule files")
 	dbPath := flag.String("db", "./panel.db", "SQLite database path for the multiuser control plane (empty disables it)")
 	publicListen := flag.String("public-listen", "", "public HTTP listen for /sub/{token} and /api/node/sync (empty disables it)")
 	publicURL := flag.String("public-url", "", "externally reachable panel URL, e.g. https://panel.example.com")
+	allowPublicAdmin := flag.Bool("allow-public-admin", false,
+		"allow the admin UI to listen on a non-loopback interface (not recommended; use an SSH tunnel)")
 	autoStart := flag.Bool("auto-start-server", false,
 		"start shampoore-server automatically on panel launch (useful under systemd)")
 	flag.Parse()
 
 	logger := logging.New("panel", true)
+
+	if err := panel.ValidateAdminListen(*listen, *allowPublicAdmin); err != nil {
+		logger.Error(err)
+		os.Exit(1)
+	}
+	if *allowPublicAdmin && !panel.IsLoopbackListen(*listen) {
+		logger.Warn("panel: admin UI is exposed beyond localhost; prefer an SSH tunnel")
+	}
 
 	tokenValue, err := panel.EnsureToken(*token)
 	if err != nil {

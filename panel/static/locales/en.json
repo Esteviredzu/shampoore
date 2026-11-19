@@ -1,5 +1,19 @@
 {
   "app": { "title": "Shampoore Panel" },
+  "nav": {
+    "configs": "Configurations",
+    "nodes": "Servers",
+    "routes": "Routes",
+    "users": "Users"
+  },
+  "fleet": {
+    "nodesTitle": "Servers (Nodes)",
+    "addNode": "Add Node",
+    "routesTitle": "Routes",
+    "addRoute": "Add Route",
+    "usersTitle": "Users",
+    "addUser": "Add User"
+  },
   "server": {
     "checking": "Checking…",
     "running": "Server running",
