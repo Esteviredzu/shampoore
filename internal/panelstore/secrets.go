@@ -5,7 +5,27 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
+
+var editableSecretKeys = []string{
+	"encryption_password",
+	"raw_ws_password",
+	"livekit_api_key",
+	"livekit_api_secret",
+	"minio_root_user",
+	"minio_root_password",
+	"s3_bucket",
+}
+
+func editableSecret(key string) bool {
+	for _, candidate := range editableSecretKeys {
+		if key == candidate {
+			return true
+		}
+	}
+	return false
+}
 
 func randomHex(n int) (string, error) {
 	buf := make([]byte, n)
@@ -21,6 +41,60 @@ func randomBase64(n int) (string, error) {
 		return "", fmt.Errorf("panelstore: random: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(buf), nil
+}
+
+func validateSecretValue(key, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return invalidf("secret %q must not be empty", key)
+	}
+	if len(value) > 512 {
+		return invalidf("secret %q is too long", key)
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return invalidf("secret %q contains control characters", key)
+		}
+	}
+	return nil
+}
+
+func applyRequestedSecrets(n *Node) error {
+	if len(n.Secrets) == 0 {
+		return nil
+	}
+	if n.GeneratedSecrets == nil {
+		n.GeneratedSecrets = make(map[string]string)
+	}
+	for rawKey, rawValue := range n.Secrets {
+		key := strings.TrimSpace(rawKey)
+		if !editableSecret(key) {
+			return invalidf("node %q: unsupported secret %q", n.Name, rawKey)
+		}
+		if err := validateSecretValue(key, rawValue); err != nil {
+			return fmt.Errorf("node %q: %w", n.Name, err)
+		}
+		n.GeneratedSecrets[key] = rawValue
+		switch key {
+		case "minio_root_user":
+			n.GeneratedSecrets["s3_access_key"] = rawValue
+		case "minio_root_password":
+			n.GeneratedSecrets["s3_secret_key"] = rawValue
+		}
+	}
+	return nil
+}
+
+func pickNodeSecrets(gen map[string]string) map[string]string {
+	out := make(map[string]string, len(editableSecretKeys))
+	for _, key := range editableSecretKeys {
+		out[key] = gen[key]
+	}
+	return out
+}
+
+func hydrateNodeView(n *Node) {
+	n.EncryptionCipher = EncryptionCipherName
+	n.Secrets = pickNodeSecrets(n.GeneratedSecrets)
 }
 
 func ensureSecrets(n *Node) error {

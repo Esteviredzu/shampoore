@@ -26,6 +26,17 @@
       <button class="nav-item" type="button" data-panel="configs"><span class="material-symbols-rounded">tune</span><span data-lang="nav.configs">Configurations</span></button>
       <button class="nav-item" type="button" id="btn-rules"><span class="material-symbols-rounded">public</span><span data-lang="nav.rules">Geo rules</span></button>
     </nav>
+    <div class="sidebar__footer">
+      <div class="sidebar__version">
+        <span data-lang="update.current">Version</span>
+        <strong id="panel-version">v2.0.0</strong>
+      </div>
+      <button class="btn btn--tonal btn--compact update-check" type="button" id="btn-check-updates">
+        <span class="material-symbols-rounded">system_update</span>
+        <span data-lang="update.check">Check for updates</span>
+        <span id="update-badge" class="update-badge hidden"></span>
+      </button>
+    </div>
   </aside>
   <div class="main">
     <header class="topbar">

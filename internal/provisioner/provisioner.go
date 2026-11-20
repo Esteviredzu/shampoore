@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,8 @@ type Options struct {
 	Logger          *logging.Logger
 	Dial            func(ctx context.Context, node panelstore.Node) (Remote, error)
 	HostKeyCallback ssh.HostKeyCallback
+
+	HTTPClient *http.Client
 
 	LocalHosts []string
 }
@@ -99,6 +102,14 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File,
 	if err != nil {
 		return nil, err
 	}
+
+	singleRoutes := make([]panelstore.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.TransportType == panelstore.TransportMulti {
+			continue
+		}
+		singleRoutes = append(singleRoutes, route)
+	}
 	nodes, err := p.store.ListNode(ctx)
 	if err != nil {
 		return nil, err
@@ -107,7 +118,7 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File,
 	if err != nil {
 		return nil, err
 	}
-	exitFiles, err := RenderExit(node, routes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
+	exitFiles, err := RenderExit(node, singleRoutes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +278,12 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 	}
 	files = append(files, binaries...)
 
+	decoy, err := p.decoyFiles(ctx, node)
+	if err != nil {
+		return &DeployResult{NodeID: node.ID, Steps: []Step{{Name: "decoy site", Error: err.Error()}}}, err
+	}
+	files = append(files, decoy...)
+
 	result := &DeployResult{NodeID: node.ID}
 	addStep := func(step Step) { result.Steps = append(result.Steps, step) }
 	fail := func(step Step, err error) (*DeployResult, error) {
@@ -324,7 +341,7 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 	}
 	addStep(Step{Name: "check docker", Command: sudo + "docker --version", Output: strings.TrimSpace(dockerVersion)})
 
-	out, err = remote.Run(ctx, sudo+"mkdir -p /opt/shampoore /opt/shampoore/bin /opt/shampoore/configs /opt/shampoore/rules")
+	out, err = remote.Run(ctx, sudo+"mkdir -p /opt/shampoore /opt/shampoore/bin /opt/shampoore/configs /opt/shampoore/rules /opt/shampoore/decoy")
 	addStep(Step{Name: "prepare directory", Command: "mkdir -p /opt/shampoore", Output: out, Error: errString(err)})
 	if err != nil {
 		return fail(Step{Name: "prepare directory"}, err)
@@ -336,6 +353,15 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 		addStep(Step{Name: "clean rules", Command: cleanRulesCmd, Output: out, Error: errString(err)})
 		if err != nil {
 			return fail(Step{Name: "clean rules", Command: cleanRulesCmd}, err)
+		}
+	}
+
+	if node.IsRelay {
+		cleanDecoyCmd := sudo + "rm -rf /opt/shampoore/decoy"
+		out, err = remote.Run(ctx, cleanDecoyCmd)
+		addStep(Step{Name: "clean decoy", Command: cleanDecoyCmd, Output: out, Error: errString(err)})
+		if err != nil {
+			return fail(Step{Name: "clean decoy", Command: cleanDecoyCmd}, err)
 		}
 	}
 

@@ -22,8 +22,10 @@ ExecStart=/opt/shampoore/bin/shampoore-panel \
     --token=${PANEL_TOKEN} \
     --auto-start-server
 
-Restart=on-failure
+Restart=always
 RestartSec=3s
+# The panel restarts itself with SIGTERM after installing an update.
+SuccessExitStatus=SIGTERM
 
 RuntimeDirectory=shampoore
 RuntimeDirectoryMode=0750

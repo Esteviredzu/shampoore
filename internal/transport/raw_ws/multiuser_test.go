@@ -38,9 +38,20 @@ func newTestRelay() *testRelay {
 	return &testRelay{rooms: make(map[string]*relayRoom), accept: make(chan string, 64)}
 }
 
-func (r *testRelay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func testRoomFromRequest(req *http.Request) string {
+	if req.URL.Path == "/ws/stream" {
+		return strings.TrimSpace(req.URL.Query().Get("room"))
+	}
 	room := strings.TrimPrefix(req.URL.Path, "/ws/")
 	if room == "" || room == req.URL.Path {
+		return ""
+	}
+	return room
+}
+
+func (r *testRelay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	room := testRoomFromRequest(req)
+	if room == "" {
 		http.NotFound(w, req)
 		return
 	}

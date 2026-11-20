@@ -96,7 +96,22 @@
     "sshPort": "SSH-порт",
     "transportAlreadyAdded": "уже добавлен",
     "allTransportsAdded": "Все доступные транспорты уже добавлены",
-    "duplicateTransport": "Этот транспорт уже добавлен на сервер"
+    "duplicateTransport": "Этот транспорт уже добавлен на сервер",
+    "encryptionTitle": "Шифрование туннеля",
+    "encryptionCipher": "Шифр",
+    "encryptionPassword": "Пароль шифрования",
+    "encryptionHint": "Все транспорты используют XChaCha20-Poly1305 с этим паролем.",
+    "secretRawWSPassword": "Пароль комнаты",
+    "secretLiveKitKey": "API-ключ",
+    "secretLiveKitSecret": "API-секрет",
+    "secretMinioUser": "Пользователь MinIO",
+    "secretMinioPassword": "Пароль MinIO",
+    "secretS3Bucket": "S3-бакет",
+    "decoyRepoLabel": "Сайт-заглушка (GitHub URL, необязательно)",
+    "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
+    "decoyRepoHint": "Укажите ссылку на публичный GitHub-репозиторий с index.html, style.css и app.js. Если поле пустое, сайт-заглушка не развёртывается",
+    "secretsHint": "Секреты хранятся в базе панели и передаются на сервер при развёртывании. Нажмите 🎲, чтобы сгенерировать значение.",
+    "regenerate": "Сгенерировать случайное значение"
   },
   "roles": {
     "title": "Роль сервера",
@@ -124,7 +139,21 @@
     "noExits": "Нет Exit-серверов",
     "hint": "После изменений Exit-нода переразвернётся автоматически.",
     "nodesRequired": "Выберите Relay и Exit",
-    "transportTaken": "Маршрут между этими серверами с таким транспортом уже существует"
+    "transportTaken": "Маршрут между этими серверами с таким транспортом уже существует",
+    "mode": "Тип маршрута",
+    "modeSingle": "Одиночный маршрут",
+    "modeMulti": "Мульти-маршрут (Bond / FlowMux)",
+    "multiStrategy": "Стратегия",
+    "strategyBond": "Bond — резервирование и агрегация",
+    "strategyFlowmux": "FlowMux — распределение потоков",
+    "strategyBondShort": "Bond",
+    "strategyFlowmuxShort": "FlowMux",
+    "subRoutes": "Входящие маршруты",
+    "subRoutesRequired": "Выберите минимум два одиночных маршрута",
+    "noSubRoutes": "Сначала создайте минимум два одиночных маршрута",
+    "childDisabled": "выключен",
+    "multiBadge": "Multi",
+    "multiHint": "Мульти-маршрут объединяет существующие одиночные маршруты; Relay и Exit берутся из них."
   },
   "users": {
     "title": "Пользователи",
@@ -333,5 +362,22 @@
     "noExitNodes": "Нет доступных Exit-серверов",
     "exitNodesRequired": "Выберите хотя бы один Exit-сервер",
     "exitNodesSaved": "Привязка Exit-серверов сохранена"
+  },
+  "update": {
+    "current": "Версия",
+    "check": "Проверить обновления",
+    "available": "Доступно обновление",
+    "upToDate": "Установлена последняя версия",
+    "title": "Обновление панели",
+    "published": "Опубликовано",
+    "notes": "Что нового",
+    "noNotes": "Описание изменений отсутствует.",
+    "preserveHint": "База SQLite, конфигурации и TLS-сертификаты сохраняются.",
+    "installNow": "Обновить сейчас",
+    "installing": "Скачивание и установка…",
+    "restarting": "Обновление установлено. Панель перезапускается…",
+    "waiting": "Ожидание перезапуска панели…",
+    "done": "Обновление установлено. Перезагрузка…",
+    "failed": "Панель не вернулась вовремя"
   }
 }

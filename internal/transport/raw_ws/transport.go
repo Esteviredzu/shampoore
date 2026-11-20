@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -17,7 +18,9 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/relay"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
@@ -44,7 +47,22 @@ const (
 	sendQueueCap   = 4096
 
 	defaultReconnectDelay = 2 * time.Second
+
+	defaultWarmupMinDelay  = 60 * time.Millisecond
+	defaultWarmupMaxDelay  = 250 * time.Millisecond
+	defaultWarmupTimeout   = 5 * time.Second
+	defaultWarmupBodyLimit = 64 << 10
+	defaultRotationMin     = 15 * time.Minute
+	defaultRotationMax     = 35 * time.Minute
+	defaultRotateGraceMin  = 2 * time.Second
+	defaultRotateGraceMax  = 3 * time.Second
+	defaultDialTimeout     = 10 * time.Second
+
+	chromeAcceptLanguage = "en-US,en;q=0.9"
+	chromeAccept         = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 )
+
+var warmupAssetPaths = []string{"/", "/style.css", "/app.js"}
 
 var frameMagic = [4]byte{'S', 'W', 'F', 'T'}
 
@@ -72,6 +90,17 @@ type wsTransport struct {
 
 	reconnectDelay time.Duration
 
+	profile        utlsdial.Profile
+	warmupClient   *http.Client
+	wsDialer       *websocket.Dialer
+	warmupPaths    []string
+	warmupMinDelay time.Duration
+	warmupMaxDelay time.Duration
+	rotationMin    time.Duration
+	rotationMax    time.Duration
+	graceMin       time.Duration
+	graceMax       time.Duration
+
 	stateMu sync.Mutex
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -86,19 +115,49 @@ type wsTransport struct {
 	ctr transport.Counters
 }
 
+type wsSession struct {
+	conn   *websocket.Conn
+	queue  chan []byte
+	ctx    context.Context
+	cancel context.CancelFunc
+	errCh  chan error
+}
+
+func (s *wsSession) close() {
+	if s == nil {
+		return
+	}
+	s.cancel()
+	_ = s.conn.Close()
+}
+
 func newTransport(cfg Config, logger logging.ContextLogger) *wsTransport {
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &wsTransport{
+	t := &wsTransport{
 		cfg:            cfg,
 		logger:         logger,
 		recvCh:         make(chan recvItem, 256),
 		batchEnabled:   cfg.Batch,
 		paddingEnabled: cfg.Padding,
 		reconnectDelay: defaultReconnectDelay,
+		profile:        utlsdial.DefaultProfile,
+		warmupPaths:    append([]string(nil), warmupAssetPaths...),
+		warmupMinDelay: defaultWarmupMinDelay,
+		warmupMaxDelay: defaultWarmupMaxDelay,
+		rotationMin:    defaultRotationMin,
+		rotationMax:    defaultRotationMax,
+		graceMin:       defaultRotateGraceMin,
+		graceMax:       defaultRotateGraceMax,
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+	t.warmupClient = &http.Client{
+		Transport: utlsdial.NewHTTPTransport(t.profile),
+		Timeout:   defaultWarmupTimeout,
+	}
+	t.wsDialer = utlsdial.NewWebSocketDialer(t.profile)
+	return t
 }
 
 func (t *wsTransport) transportCtx() context.Context {
@@ -166,90 +225,221 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 	if err := validateSecureServerURL(t.cfg.ServerURL, t.cfg.AllowInsecureWS); err != nil {
 		return false, err
 	}
-	wsURL, err := buildWSURL(t.cfg.ServerURL, roomForUser(t.cfg.Room, t.cfg.UserID))
+
+	sess, err := t.dialSession(parent)
 	if err != nil {
 		return false, err
 	}
 
-	header := http.Header{}
-	if t.cfg.Password != "" {
-		header.Set("X-Room-Password", t.cfg.Password)
-	}
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		NetDialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
-			Control: netdial.Control,
-		}).DialContext,
-	}
-	conn, resp, err := dialer.DialContext(parent, wsURL, header)
-	if err != nil {
-		if resp != nil {
-			return false, fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
-		}
-		return false, fmt.Errorf("dial: %w", err)
-	}
-
-	conn.SetReadLimit(maxWSPayload)
-	_ = conn.SetReadDeadline(time.Now().Add(readIdleTimout))
-	conn.SetPongHandler(func(_ string) error {
-		return conn.SetReadDeadline(time.Now().Add(readIdleTimout))
-	})
-
-	var queue chan []byte
-	if t.batchEnabled {
-		queue = make(chan []byte, sendQueueCap)
-	}
-
-	t.connMu.Lock()
-	t.conn = conn
-	t.sendQueue = queue
-	t.connMu.Unlock()
-
+	t.attachSession(sess)
 	if reconnect {
-
 		t.signalReset()
 	}
 
 	t.logger.Info("raw_ws: connected (room=", t.cfg.Room, ")")
+	t.runSession(sess)
 
-	connCtx, connCancel := context.WithCancel(parent)
+	rotate := time.NewTimer(t.nextRotationDelay())
+	defer rotate.Stop()
 
-	var connWg sync.WaitGroup
-	errCh := make(chan error, 3)
+	cur := sess
+	for {
+		select {
+		case <-parent.Done():
+			t.closeSession(cur, 0)
+			return true, nil
+		case err := <-cur.errCh:
+			t.closeSession(cur, 0)
+			return true, err
+		case <-rotate.C:
+			next, derr := t.dialSession(parent)
+			if derr != nil {
+				t.logger.Warn("raw_ws: rotate: ", derr)
+				rotate.Reset(t.nextRotationDelay())
+				continue
+			}
 
-	connWg.Add(1)
-	go func() {
-		defer connWg.Done()
-		t.readLoop(connCtx, conn, errCh)
-	}()
-	connWg.Add(1)
-	go func() {
-		defer connWg.Done()
-		t.pingLoop(connCtx, conn, errCh)
-	}()
-	if queue != nil {
-		connWg.Add(1)
-		go func() {
-			defer connWg.Done()
-			t.sendLoop(connCtx, queue, errCh)
-		}()
+			t.attachSession(next)
+			t.runSession(next)
+			old := cur
+			cur = next
+			t.logger.Info("raw_ws: connection rotated")
+			go t.closeSession(old, t.nextGrace())
+			rotate.Reset(t.nextRotationDelay())
+		}
+	}
+}
+
+func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
+	room := roomForUser(t.cfg.Room, t.cfg.UserID)
+	wsURL, err := buildStreamURL(t.cfg.ServerURL, room)
+	if err != nil {
+		return nil, err
 	}
 
-	var runErr error
-	select {
-	case <-parent.Done():
-		runErr = nil
-	case err := <-errCh:
-		runErr = err
+	t.warmup(parent, wsURL)
+
+	dialer := t.newDialer()
+	dialer.Subprotocols = relay.AuthProtocols(room, t.cfg.Password, time.Now())
+	conn, resp, err := dialer.DialContext(parent, wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			return nil, fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("dial: %w", err)
 	}
 
-	connCancel()
-	t.detachConn(conn)
-	connWg.Wait()
+	conn.SetReadLimit(maxWSPayload)
+	_ = conn.SetReadDeadline(time.Now().Add(readIdleTimout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(readIdleTimout))
+	})
 
-	return true, runErr
+	sessCtx, cancel := context.WithCancel(parent)
+	sess := &wsSession{
+		conn:   conn,
+		ctx:    sessCtx,
+		cancel: cancel,
+		errCh:  make(chan error, 4),
+	}
+	if t.batchEnabled {
+		sess.queue = make(chan []byte, sendQueueCap)
+	}
+	return sess, nil
+}
+
+func (t *wsTransport) newDialer() *websocket.Dialer {
+	if t.wsDialer != nil {
+		d := *t.wsDialer
+		return &d
+	}
+	return &websocket.Dialer{
+		HandshakeTimeout: defaultDialTimeout,
+		NetDialContext: (&net.Dialer{
+			Timeout: defaultDialTimeout,
+			Control: netdial.Control,
+		}).DialContext,
+	}
+}
+
+func (t *wsTransport) warmup(ctx context.Context, wsURL string) {
+	base, err := httpBaseURL(wsURL)
+	if err != nil {
+		return
+	}
+	paths := t.warmupPaths
+	if len(paths) == 0 {
+		return
+	}
+	count := 2
+	if len(paths) >= 3 && rand.IntN(2) == 1 {
+		count = 3
+	}
+	if count > len(paths) {
+		count = len(paths)
+	}
+
+	for i := 0; i < count; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(t.nextWarmupPause()):
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+paths[i], nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", utlsdial.UserAgent(t.profile))
+		req.Header.Set("Accept", chromeAccept)
+		req.Header.Set("Accept-Language", chromeAcceptLanguage)
+		resp, err := t.warmupClient.Do(req)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, defaultWarmupBodyLimit))
+		_ = resp.Body.Close()
+	}
+}
+
+func (t *wsTransport) runSession(sess *wsSession) {
+	go t.readLoop(sess.ctx, sess.conn, sess.errCh)
+	go t.pingLoop(sess.ctx, sess.conn, sess.errCh)
+	if sess.queue != nil {
+		go t.sendLoop(sess.ctx, sess.conn, sess.queue, sess.errCh)
+	}
+}
+
+func (t *wsTransport) attachSession(sess *wsSession) {
+	t.connMu.Lock()
+	t.conn = sess.conn
+	t.sendQueue = sess.queue
+	t.connMu.Unlock()
+}
+
+func (t *wsTransport) closeSession(sess *wsSession, grace time.Duration) {
+	if sess == nil {
+		return
+	}
+	if grace > 0 {
+		select {
+		case <-sess.ctx.Done():
+		case <-time.After(grace):
+		}
+	}
+	sess.close()
+	t.detachConn(sess.conn)
+}
+
+func (t *wsTransport) nextWarmupPause() time.Duration {
+	return randomBetween(t.warmupMinDelay, t.warmupMaxDelay, defaultWarmupMinDelay, defaultWarmupMaxDelay)
+}
+
+func (t *wsTransport) nextRotationDelay() time.Duration {
+	return randomBetween(t.rotationMin, t.rotationMax, defaultRotationMin, defaultRotationMax)
+}
+
+func (t *wsTransport) nextGrace() time.Duration {
+	return randomBetween(t.graceMin, t.graceMax, defaultRotateGraceMin, defaultRotateGraceMax)
+}
+
+func randomBetween(minD, maxD, defMin, defMax time.Duration) time.Duration {
+	if minD <= 0 {
+		minD = defMin
+	}
+	if maxD <= 0 {
+		maxD = defMax
+	}
+	if maxD <= minD {
+		return minD
+	}
+	return minD + time.Duration(rand.Int64N(int64(maxD-minD)))
+}
+
+func httpBaseURL(wsURL string) (string, error) {
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "wss":
+		u.Scheme = "https"
+	case "ws":
+		u.Scheme = "http"
+	case "https", "http":
+	default:
+		return "", fmt.Errorf("raw_ws: unsupported scheme %q", u.Scheme)
+	}
+	p := u.Path
+	if idx := strings.Index(p, "/ws"); idx >= 0 {
+		p = p[:idx]
+	}
+	u.Path = p
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimSuffix(u.String(), "/"), nil
 }
 
 func (t *wsTransport) detachConn(conn *websocket.Conn) {
@@ -311,6 +501,9 @@ func (t *wsTransport) Stop(ctx context.Context) error {
 		}
 	})
 	t.wg.Wait()
+	if t.warmupClient != nil {
+		t.warmupClient.CloseIdleConnections()
+	}
 	t.logger.Info("raw_ws: stopped")
 	return nil
 }
@@ -367,7 +560,7 @@ func reportErr(errCh chan<- error, err error) {
 	}
 }
 
-func (t *wsTransport) sendLoop(ctx context.Context, queue <-chan []byte, errCh chan<- error) {
+func (t *wsTransport) sendLoop(ctx context.Context, conn *websocket.Conn, queue <-chan []byte, errCh chan<- error) {
 	var batch [][]byte
 	var batchBytes int
 
@@ -376,7 +569,7 @@ func (t *wsTransport) sendLoop(ctx context.Context, queue <-chan []byte, errCh c
 			return nil
 		}
 		frame := encodeFrame(batch, true, t.paddingEnabled)
-		if err := t.sendRaw(ctx, frame); err != nil {
+		if err := t.sendRawTo(conn, frame); err != nil {
 
 			if t.logger != nil {
 				t.logger.Warn("raw_ws: flush batch failed (", len(batch), " msgs / ",
@@ -437,6 +630,13 @@ func (t *wsTransport) sendRaw(ctx context.Context, data []byte) error {
 	t.connMu.Lock()
 	conn := t.conn
 	t.connMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("%w: raw_ws: no active connection", transport.ErrTransportReset)
+	}
+	return t.sendRawTo(conn, data)
+}
+
+func (t *wsTransport) sendRawTo(conn *websocket.Conn, data []byte) error {
 	if conn == nil {
 		return fmt.Errorf("%w: raw_ws: no active connection", transport.ErrTransportReset)
 	}
@@ -582,6 +782,18 @@ func buildWSURL(base, room string) (string, error) {
 		return base + "/" + escaped, nil
 	}
 	return base + "/ws/" + escaped, nil
+}
+
+func buildStreamURL(base, room string) (string, error) {
+	raw, err := buildWSURL(base, room)
+	if err != nil {
+		return "", err
+	}
+	idx := strings.Index(raw, "/ws/")
+	if idx < 0 {
+		return raw, nil
+	}
+	return raw[:idx] + "/ws/stream?room=" + url.QueryEscape(strings.TrimSpace(room)), nil
 }
 
 func encodeFrame(msgs [][]byte, batched, padding bool) []byte {

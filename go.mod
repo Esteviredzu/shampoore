@@ -15,6 +15,7 @@ require (
 	github.com/pion/rtp v1.10.5
 	github.com/pion/transport/v5 v5.1.1
 	github.com/pion/webrtc/v4 v4.2.23
+	github.com/refraction-networking/utls v1.8.2
 	github.com/xjasonlyu/tun2socks/v2 v2.7.0
 	github.com/xtaci/kcp-go/v5 v5.6.72
 	golang.org/x/crypto v0.58.0
@@ -31,6 +32,7 @@ require (
 	buf.build/go/protoyaml v0.7.0 // indirect
 	cel.dev/expr v0.25.2 // indirect
 	github.com/ajg/form v1.7.1 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

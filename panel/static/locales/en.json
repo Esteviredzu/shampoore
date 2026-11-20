@@ -96,7 +96,22 @@
     "sshPort": "SSH port",
     "transportAlreadyAdded": "already added",
     "allTransportsAdded": "All available transports have already been added",
-    "duplicateTransport": "This transport is already added to the server"
+    "duplicateTransport": "This transport is already added to the server",
+    "encryptionTitle": "Tunnel encryption",
+    "encryptionCipher": "Cipher",
+    "encryptionPassword": "Encryption password",
+    "encryptionHint": "Every transport uses XChaCha20-Poly1305 with this password.",
+    "secretRawWSPassword": "Room password",
+    "secretLiveKitKey": "API key",
+    "secretLiveKitSecret": "API secret",
+    "secretMinioUser": "MinIO user",
+    "secretMinioPassword": "MinIO password",
+    "secretS3Bucket": "S3 bucket",
+    "decoyRepoLabel": "Decoy site (GitHub URL, optional)",
+    "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
+    "decoyRepoHint": "Provide a public GitHub repository with index.html, style.css and app.js. If the field is empty, no decoy site is deployed.",
+    "secretsHint": "Secrets are stored in the panel database and pushed to the server on deploy. Use 🎲 to regenerate a value.",
+    "regenerate": "Generate random value"
   },
   "roles": {
     "title": "Server role",
@@ -124,7 +139,21 @@
     "noExits": "No Exit servers",
     "hint": "The Exit node is redeployed automatically after changes.",
     "nodesRequired": "Choose both Relay and Exit",
-    "transportTaken": "Already configured for this server pair"
+    "transportTaken": "Already configured for this server pair",
+    "mode": "Route type",
+    "modeSingle": "Single route",
+    "modeMulti": "Multi-route (Bond / FlowMux)",
+    "multiStrategy": "Strategy",
+    "strategyBond": "Bond — redundancy & aggregation",
+    "strategyFlowmux": "FlowMux — flow distribution",
+    "strategyBondShort": "Bond",
+    "strategyFlowmuxShort": "FlowMux",
+    "subRoutes": "Included routes",
+    "subRoutesRequired": "Select at least two single routes",
+    "noSubRoutes": "Create at least two single routes first",
+    "childDisabled": "disabled",
+    "multiBadge": "Multi",
+    "multiHint": "A multi-route combines existing single routes; the relay and exit are taken from them."
   },
   "users": {
     "title": "Users",
@@ -333,5 +362,22 @@
     "noExitNodes": "No Exit servers available",
     "exitNodesRequired": "Select at least one Exit server",
     "exitNodesSaved": "Exit server bindings saved"
+  },
+  "update": {
+    "current": "Version",
+    "check": "Check for updates",
+    "available": "Update available",
+    "upToDate": "You are running the latest version",
+    "title": "Panel update",
+    "published": "Published",
+    "notes": "What's new",
+    "noNotes": "No release notes provided.",
+    "preserveHint": "Your SQLite database, configs and TLS certificates are preserved.",
+    "installNow": "Update now",
+    "installing": "Downloading and installing…",
+    "restarting": "Update installed. The panel is restarting…",
+    "waiting": "Waiting for the panel to come back…",
+    "done": "Update installed. Reloading…",
+    "failed": "The panel did not come back in time"
   }
 }

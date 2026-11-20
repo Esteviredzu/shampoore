@@ -96,7 +96,22 @@
     "sshPort": "SSH-pordo",
     "transportAlreadyAdded": "jam aldonita",
     "allTransportsAdded": "Ĉiuj disponeblaj transportoj jam estas aldonitaj",
-    "duplicateTransport": "Ĉi tiu transporto jam estas aldonita al la servilo"
+    "duplicateTransport": "Ĉi tiu transporto jam estas aldonita al la servilo",
+    "encryptionTitle": "Ĉifrado de tunelo",
+    "encryptionCipher": "Ĉifro",
+    "encryptionPassword": "Ĉifrada pasvorto",
+    "encryptionHint": "Ĉiuj transportiloj uzas XChaCha20-Poly1305 kun ĉi tiu pasvorto.",
+    "secretRawWSPassword": "Ĉambra pasvorto",
+    "secretLiveKitKey": "API-ŝlosilo",
+    "secretLiveKitSecret": "API-sekreto",
+    "secretMinioUser": "MinIO-uzanto",
+    "secretMinioPassword": "MinIO-pasvorto",
+    "secretS3Bucket": "S3-barelo",
+    "decoyRepoLabel": "Maskoservilo (GitHub URL, laŭvola)",
+    "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
+    "decoyRepoHint": "Indiku publikan GitHub-deponejon kun index.html, style.css kaj app.js. Se la kampo estas malplena, maskoservilo ne estas deplojita.",
+    "secretsHint": "Sekretoj estas konservitaj en la panela datumbazo kaj senditaj al la servilo dum deplojo. Uzu 🎲 por generi valoron.",
+    "regenerate": "Generi hazardan valoron"
   },
   "roles": {
     "title": "Rolo de la servilo",
@@ -124,7 +139,21 @@
     "noExits": "Neniuj Exit-serviloj",
     "hint": "La Exit-nodo re-deploiĝas aŭtomate post ŝanĝoj.",
     "nodesRequired": "Elektu Relay kaj Exit",
-    "transportTaken": "Itinero inter ĉi tiuj serviloj kun ĉi tiu transporto jam ekzistas"
+    "transportTaken": "Itinero inter ĉi tiuj serviloj kun ĉi tiu transporto jam ekzistas",
+    "mode": "Tipo de itinero",
+    "modeSingle": "Unuopa itinero",
+    "modeMulti": "Pluritinero (Bond / FlowMux)",
+    "multiStrategy": "Strategio",
+    "strategyBond": "Bond — dispono kaj agregado",
+    "strategyFlowmux": "FlowMux — disdono de fluoj",
+    "strategyBondShort": "Bond",
+    "strategyFlowmuxShort": "FlowMux",
+    "subRoutes": "Inkluzivitaj itineroj",
+    "subRoutesRequired": "Elektu almenaŭ du unuopajn itinerojn",
+    "noSubRoutes": "Unue kreu almenaŭ du unuopajn itinerojn",
+    "childDisabled": "malŝaltita",
+    "multiBadge": "Multi",
+    "multiHint": "Pluritinero kunigas ekzistantajn unuopajn itinerojn; Relay kaj Exit preniĝas el ili."
   },
   "users": {
     "title": "Uzantoj",
@@ -333,5 +362,22 @@
     "noExitNodes": "Neniu Ela servilo disponeblas",
     "exitNodesRequired": "Elektu almenaŭ unu Elan servilon",
     "exitNodesSaved": "Elaj serviloj ligitaj kaj konservitaj"
+  },
+  "update": {
+    "current": "Versio",
+    "check": "Kontroli ĝisdatigojn",
+    "available": "Ĝisdatigo disponeblas",
+    "upToDate": "Vi uzas la plej novan version",
+    "title": "Ĝisdatigo de la panelo",
+    "published": "Publikigita",
+    "notes": "Kio novas",
+    "noNotes": "Neniu priskribo de ŝanĝoj.",
+    "preserveHint": "Via SQLite-datumbazo, agordoj kaj TLS-atestiloj konserviĝas.",
+    "installNow": "Ĝisdatigi nun",
+    "installing": "Elŝutado kaj instalado…",
+    "restarting": "Ĝisdatigo instalita. La panelo restartas…",
+    "waiting": "Atendante la panelon…",
+    "done": "Ĝisdatigo instalita. Reŝargado…",
+    "failed": "La panelo ne revenis ĝustatempe"
   }
 }

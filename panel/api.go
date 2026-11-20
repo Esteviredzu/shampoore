@@ -26,6 +26,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 	"github.com/Esteviredzu/shampoore/internal/server/manager"
+	"github.com/Esteviredzu/shampoore/internal/version"
 )
 
 //go:embed static
@@ -58,6 +59,10 @@ type API struct {
 	geoMu          sync.Mutex
 	geoClient      *http.Client
 	geoUpdateEvery time.Duration
+
+	version   string
+	updateCfg updateConfig
+	updater   *updater
 }
 
 func New(client *control.Client, sup ServerManager, logger *logging.Logger, token, configsDir string, filter *geofilter.Filter, rulesDir string, opts ...Option) *API {
@@ -75,10 +80,15 @@ func New(client *control.Client, sup ServerManager, logger *logging.Logger, toke
 		settings:       panelstore.DefaultSettings(),
 		geoClient:      &http.Client{Timeout: geoDownloadTimeout},
 		geoUpdateEvery: time.Minute,
+		version:        version.Current(),
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
+	if strings.TrimSpace(a.updateCfg.CurrentVersion) == "" {
+		a.updateCfg.CurrentVersion = a.version
+	}
+	a.updater = newUpdater(a.updateCfg, a.logger)
 	if a.store != nil {
 		if settings, err := a.store.GetSettings(context.Background()); err != nil {
 			a.logger.Warn("panel: load settings: ", err)
@@ -106,6 +116,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/stats", a.stats)
 	mux.HandleFunc("GET /api/stats/stream", a.statsStream)
 	mux.HandleFunc("GET /api/system/stats", a.systemStats)
+	a.registerSystemRoutes(mux)
 
 	mux.HandleFunc("GET /api/templates", a.templates)
 	mux.HandleFunc("GET /api/configs", a.list)

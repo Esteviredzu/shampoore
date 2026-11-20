@@ -15,12 +15,17 @@ import (
 func main() {
 	listen := flag.String("listen", envDefault("SHAMPOORE_RELAY_LISTEN", ":8787"), "HTTP listen address")
 	password := flag.String("password", os.Getenv("SHAMPOORE_RELAY_PASSWORD"), "shared room password")
+	decoyDir := flag.String("decoy-dir", os.Getenv("SHAMPOORE_RELAY_DECOY_DIR"), "optional directory with a decoy site (must contain index.html); empty disables the decoy site")
 	maxSize := flag.Int64("max-message-size", envInt64("SHAMPOORE_RELAY_MAX_MESSAGE", relay.DefaultMaxMessageSize), "maximum websocket message size")
 	flag.Parse()
 
 	logger := logging.New("relay", true)
 	srv := relay.New(*password)
 	srv.SetMaxMessageSize(*maxSize)
+	if *decoyDir != "" {
+		srv.SetDecoyDir(*decoyDir)
+		logger.Info("relay: decoy site directory ", *decoyDir)
+	}
 	if *password == "" {
 		logger.Warn("relay: password is empty; anyone can join relay rooms")
 	}

@@ -7,6 +7,7 @@ const fleet = {
   active: 'dashboard',
   nodes: [], routes: [], users: [], settings: null, caddy: null,
   domainDraft: null, livePolling: false,
+  version: '', update: null, updateChecking: false, updating: false,
   loading: { dashboard: false, nodes: false, routes: false, users: false, configs: false }
 };
 
@@ -70,7 +71,9 @@ function canAutoRefresh() {
 
   await load();
   await loadSystemStats();
+  await loadPanelVersion();
   await loadPanel('dashboard');
+  checkForUpdates({ silent: true }).catch(() => {});
   // No periodic full re-render: data is refreshed on load, on tab switch,
   // after user actions and via the manual refresh buttons. Only light polls
   // that update isolated status/traffic widgets are kept.
@@ -134,6 +137,149 @@ async function loadSystemStats() {
   }
 }
 
+async function loadPanelVersion() {
+  try {
+    const info = await api('/api/system/version');
+    fleet.version = info.version || '';
+    const el = document.getElementById('panel-version');
+    if (el && fleet.version) el.textContent = fleet.version;
+  } catch (e) {
+    // Keep the build-time placeholder when the version endpoint is unavailable.
+  }
+}
+
+function setUpdateBadge(info) {
+  const badge = document.getElementById('update-badge');
+  const button = document.getElementById('btn-check-updates');
+  if (!badge) return;
+  if (info && info.update_available) {
+    badge.textContent = info.latest_version || '';
+    badge.classList.remove('hidden');
+    if (button) button.title = t('update.available');
+  } else {
+    badge.textContent = '';
+    badge.classList.add('hidden');
+    if (button) button.title = t('update.check');
+  }
+}
+
+async function checkForUpdates({ silent = false, notifyError = false } = {}) {
+  if (fleet.updateChecking) return fleet.update;
+  const button = document.getElementById('btn-check-updates');
+  fleet.updateChecking = true;
+  if (button) button.disabled = true;
+  try {
+    const info = await api('/api/system/update');
+    fleet.update = info || null;
+    setUpdateBadge(fleet.update);
+    if (!silent) {
+      if (info && info.update_available) toast(`${t('update.available')}: ${info.latest_version}`, 'success');
+      else toast(t('update.upToDate'));
+    }
+    return fleet.update;
+  } catch (e) {
+    if (notifyError) toast(e.message, 'error');
+    return null;
+  } finally {
+    fleet.updateChecking = false;
+    if (button) button.disabled = false;
+  }
+}
+
+async function onUpdateButton() {
+  if (fleet.updating) return;
+  const info = await checkForUpdates({ silent: true, notifyError: true });
+  if (!info) return;
+  if (info.update_available) openUpdateDialog(info);
+  else toast(t('update.upToDate'));
+}
+
+function compareSemver(a, b) {
+  const parse = (value) => String(value || '').trim().replace(/^v+/i, '').split(/[+-]/)[0]
+    .split('.').map(part => parseInt(part, 10) || 0);
+  const left = parse(a);
+  const right = parse(b);
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i++) {
+    const l = left[i] || 0;
+    const r = right[i] || 0;
+    if (l !== r) return l < r ? -1 : 1;
+  }
+  return 0;
+}
+
+function openUpdateDialog(info) {
+  const notes = (info.release_notes || '').trim();
+  const published = info.published_at
+    ? `<div class="update-meta">${esc(t('update.published'))}: ${esc(new Date(info.published_at).toLocaleString())}</div>`
+    : '';
+  const dialog = openModal({
+    title: t('update.title'),
+    body: `
+      <div class="update-summary-line">
+        <span class="update-version">${esc(info.current_version)}</span>
+        <span class="material-symbols-rounded">arrow_forward</span>
+        <span class="update-version update-version--new">${esc(info.latest_version)}</span>
+      </div>
+      ${published}
+      <h3 class="update-notes-title">${esc(t('update.notes'))}</h3>
+      <div class="update-notes">${notes ? esc(notes) : esc(t('update.noNotes'))}</div>
+      <div class="hint">${esc(t('update.preserveHint'))}</div>`,
+    actions: [
+      { kind: 'tonal', label: t('actions.close'), onClick: closeModal },
+      { kind: 'filled', label: t('update.installNow'), onClick: () => runUpdate(dialog, info) }
+    ]
+  });
+  return dialog;
+}
+
+async function runUpdate(dialog, info) {
+  if (fleet.updating) return;
+  fleet.updating = true;
+  const modal = dialog || openModal({ title: t('update.title'), body: '' });
+  modal.setBody(`<div class="update-progress"><span class="update-spinner"></span><span>${esc(t('update.installing'))}</span></div>`);
+  try {
+    const result = await api('/api/system/update', { method: 'POST' });
+    const latest = (result && result.latest_version) || (info && info.latest_version) || '';
+    modal.setBody(`
+      <div class="deploy-summary is-ok"><span class="material-symbols-rounded">check_circle</span>${esc(t('update.restarting'))}</div>
+      <div class="update-progress"><span class="update-spinner"></span><span>${esc(t('update.waiting'))}</span></div>`);
+    toast(t('update.done'), 'success');
+    await waitForPanelRestart(latest);
+  } catch (e) {
+    modal.setBody(`<div class="deploy-summary is-error"><span class="material-symbols-rounded">error</span>${esc(e.message)}</div>`);
+    toast(e.message, 'error');
+  } finally {
+    fleet.updating = false;
+  }
+}
+
+async function waitForPanelRestart(expectedVersion) {
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    try {
+      const res = await fetch('/api/system/version', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json' }
+      });
+      if (!res.ok) continue;
+      const info = await res.json();
+      if (!expectedVersion || compareSemver(info.version, expectedVersion) >= 0) {
+        window.location.reload();
+        return;
+      }
+    } catch (e) {
+      // The panel is still restarting; keep polling.
+    }
+  }
+  toast(t('update.failed'), 'error');
+  window.location.reload();
+}
+
+
+
 window.changeLanguage = async (lang) => {
   LANGS.current = lang;
   localStorage.setItem('shampoore_lang', lang);
@@ -142,6 +288,7 @@ window.changeLanguage = async (lang) => {
   await loadLang(lang);
   applyLang();
   renderServerBar();
+  setUpdateBadge(fleet.update);
   // Re-render the active view right away from cached data, so switching the
   // language does not wait for any background refresh.
   rerenderActivePanel();
@@ -1087,6 +1234,78 @@ const TRANSPORT_KINDS = [
   { value: 'livekit', label: 'LiveKit' }
 ];
 
+/* Editable transport secrets. The panel exposes the real values (instead of an
+   opaque generated blob) so admins can review, rotate and regenerate them. */
+const NODE_SECRET_FIELDS = {
+  raw_ws: [
+    { key: 'raw_ws_password', label: 'nodes.secretRawWSPassword' }
+  ],
+  livekit: [
+    { key: 'livekit_api_key', label: 'nodes.secretLiveKitKey' },
+    { key: 'livekit_api_secret', label: 'nodes.secretLiveKitSecret' }
+  ],
+  silo: [
+    { key: 'minio_root_user', label: 'nodes.secretMinioUser' },
+    { key: 'minio_root_password', label: 'nodes.secretMinioPassword' },
+    { key: 's3_bucket', label: 'nodes.secretS3Bucket' }
+  ]
+};
+
+function randomBytes(n) {
+  const buf = new Uint8Array(n);
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(buf);
+  else for (let i = 0; i < n; i++) buf[i] = Math.floor(Math.random() * 256);
+  return buf;
+}
+
+function randomHex(n) {
+  return Array.from(randomBytes(n), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function randomBase64(n) {
+  return btoa(String.fromCharCode.apply(null, Array.from(randomBytes(n))));
+}
+
+function generateSecretValue(key) {
+  switch (key) {
+    case 'encryption_password': return randomHex(32);
+    case 'raw_ws_password': return randomHex(32);
+    case 'livekit_api_key': return randomHex(8);
+    case 'livekit_api_secret': return randomBase64(32);
+    case 'minio_root_user': return 'shampoore-' + randomHex(6);
+    case 'minio_root_password': return randomHex(24);
+    case 's3_bucket': return 'shampoore-' + randomHex(4);
+    default: return randomHex(24);
+  }
+}
+
+function transportSecretKeys(type) {
+  return (NODE_SECRET_FIELDS[type] || []).map(field => field.key);
+}
+
+function fillSecretKeys(draft, keys) {
+  if (!draft.secrets) draft.secrets = {};
+  keys.forEach(key => {
+    if (!draft.secrets[key]) draft.secrets[key] = generateSecretValue(key);
+  });
+}
+
+function fillDraftSecrets(draft, type) {
+  fillSecretKeys(draft, transportSecretKeys(type));
+}
+
+function takenRouteTransports(entryID, exitID, excludeID) {
+  const taken = new Set();
+  for (const route of fleet.routes || []) {
+    if (excludeID && route.id === excludeID) continue;
+    if (route.transport_type === 'multi') continue;
+    if (route.entry_node_id === entryID && route.exit_node_id === exitID) {
+      taken.add(route.transport_type);
+    }
+  }
+  return taken;
+}
+
 const PANEL_META = {
   dashboard: { title: 'nav.dashboard', subtitle: 'app.tagline' },
   nodes: { title: 'nodes.title', subtitle: 'nodes.subtitle' },
@@ -1107,6 +1326,7 @@ function setupFleetTabs() {
   bind('btn-add-node', () => openNodeModal(null, 'relay'));
   bind('btn-add-route', () => fleetAddRoute());
   bind('btn-add-user', () => openUserModal());
+  bind('btn-check-updates', onUpdateButton);
 }
 
 function switchPanel(name) {
@@ -1317,8 +1537,23 @@ function nodeRoles(node) {
 }
 
 function transportLabel(kind) {
+  if (kind === 'multi') return t('routes.multiBadge');
   const found = TRANSPORT_KINDS.find(k => k.value === kind);
   return found ? found.label : kind;
+}
+
+function multiStrategyLabel(strategy) {
+  if (strategy === 'bond') return t('routes.strategyBondShort');
+  if (strategy === 'flowmux') return t('routes.strategyFlowmuxShort');
+  return strategy || '';
+}
+
+function subRouteNames(ids) {
+  if (!ids || !ids.length) return '';
+  return ids.map(id => {
+    const route = fleet.routes.find(r => r.id === id);
+    return route ? route.name : '#' + id;
+  }).join(', ');
 }
 
 function emptyState(icon, text, actionLabel, action) {
@@ -1608,12 +1843,16 @@ function renderDeployResult(dialog, result) {
 function emptyNodeDraft(role) {
   const relay = role === 'relay' || role === 'both';
   const exit = role === 'exit' || role === 'both';
-  return {
+  const draft = {
     name: '', ssh_host: '', ssh_port: 22, ssh_user: 'root',
     ssh_private_key: '', ssh_password: '', authMode: 'key',
     is_relay: relay, is_exit: exit, socks_port: 1080,
-    transports: relay ? [{ type: 'raw_ws', domain: '', enabled: true }] : []
+    secrets: {},
+    transports: relay ? [{ type: 'raw_ws', domain: '', decoy_repo_url: '', enabled: true }] : []
   };
+  if (relay) fillSecretKeys(draft, ['encryption_password']);
+  draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
+  return draft;
 }
 
 function nodeDraftFrom(node) {
@@ -1629,9 +1868,12 @@ function nodeDraftFrom(node) {
     is_relay: !!node.is_relay,
     is_exit: !!node.is_exit,
     socks_port: node.socks_port || 1080,
-    transports: (node.transports || []).map(tr => ({ type: tr.type, domain: tr.domain || '', enabled: !!tr.enabled }))
+    secrets: Object.assign({}, node.secrets || node.generated_secrets || {}),
+    transports: (node.transports || []).map(tr => ({ type: tr.type, domain: tr.domain || '', decoy_repo_url: tr.decoy_repo_url || '', enabled: !!tr.enabled }))
   });
   draft.authMode = draft.ssh_private_key ? 'key' : (draft.ssh_password ? 'password' : 'key');
+  if (draft.is_relay) fillSecretKeys(draft, ['encryption_password']);
+  draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
   return draft;
 }
 
@@ -1654,6 +1896,18 @@ function openNodeModal(node, role) {
     ]
   });
 
+  function secretInput(field, value) {
+    return `<label class="secret-field">
+      <span>${esc(t(field.label))}</span>
+      <span class="secret-field__control">
+        <input type="text" class="input" autocomplete="off" spellcheck="false" value="${escAttr(value || '')}"
+          oninput="fleetNodeSetSecret('${field.key}', this.value)">
+        <button type="button" class="icon-btn secret-gen" title="${escAttr(t('nodes.regenerate'))}"
+          onclick="fleetNodeRandomSecret('${field.key}')">🎲</button>
+      </span>
+    </label>`;
+  }
+
   function transportRow(tr, i) {
     const usedByOthers = new Set(draft.transports.filter((_, idx) => idx !== i).map(item => item.type));
     const options = TRANSPORT_KINDS.map(k => {
@@ -1661,14 +1915,34 @@ function openNodeModal(node, role) {
       const label = used ? `${k.label} (${t('nodes.transportAlreadyAdded')})` : k.label;
       return `<option value="${escAttr(k.value)}" ${k.value === tr.type ? 'selected' : ''} ${used ? 'disabled' : ''}>${esc(label)}</option>`;
     }).join('');
-    return `<div class="transport-row">
-      <select class="input" onchange="fleetNodeChangeTransportType(${i}, this.value)">${options}</select>
-      <input type="text" class="input" value="${escAttr(tr.domain)}" placeholder="domain.example.com"
-             oninput="fleetNodeSetTransport(${i}, 'domain', this.value)">
-      <label class="check-row"><input type="checkbox" ${tr.enabled ? 'checked' : ''}
-        onchange="fleetNodeSetTransport(${i}, 'enabled', this.checked)"> ${esc(t('nodes.enabled'))}</label>
-      <button type="button" class="icon-btn icon-btn--danger" title="${esc(t('actions.remove'))}"
-        onclick="fleetNodeRemoveTransport(${i})"><span class="material-symbols-rounded">delete</span></button>
+    const fields = NODE_SECRET_FIELDS[tr.type] || [];
+    const secrets = fields.length
+      ? `<div class="transport-secrets">${fields.map(field => secretInput(field, (draft.secrets || {})[field.key])).join('')}</div>`
+      : '';
+    const decoy = tr.type === 'raw_ws'
+      ? `<div class="transport-decoy">
+          <label class="secret-field">
+            <span>${esc(t('nodes.decoyRepoLabel'))}</span>
+            <input type="text" class="input" autocomplete="off" spellcheck="false"
+              value="${escAttr(tr.decoy_repo_url || '')}"
+              placeholder="${escAttr(t('nodes.decoyRepoPlaceholder'))}"
+              oninput="fleetNodeSetTransport(${i}, 'decoy_repo_url', this.value)">
+          </label>
+          <div class="hint">${esc(t('nodes.decoyRepoHint'))}</div>
+        </div>`
+      : '';
+    return `<div class="transport-card">
+      <div class="transport-row">
+        <select class="input" onchange="fleetNodeChangeTransportType(${i}, this.value)">${options}</select>
+        <input type="text" class="input" value="${escAttr(tr.domain)}" placeholder="domain.example.com"
+               oninput="fleetNodeSetTransport(${i}, 'domain', this.value)">
+        <label class="check-row"><input type="checkbox" ${tr.enabled ? 'checked' : ''}
+          onchange="fleetNodeSetTransport(${i}, 'enabled', this.checked)"> ${esc(t('nodes.enabled'))}</label>
+        <button type="button" class="icon-btn icon-btn--danger" title="${esc(t('actions.remove'))}"
+          onclick="fleetNodeRemoveTransport(${i})"><span class="material-symbols-rounded">delete</span></button>
+      </div>
+      ${secrets}
+      ${decoy}
     </div>`;
   }
 
@@ -1684,11 +1958,26 @@ function openNodeModal(node, role) {
       ? `<button type="button" class="btn btn--tonal btn--compact" style="align-self:flex-start;margin-top:8px"
             onclick="fleetNodeAddTransport()"><span class="material-symbols-rounded">add</span>${esc(t('nodes.addTransport'))}</button>`
       : '';
-    const transportSection = draft.is_relay
+    const encryptionSection = draft.is_relay
       ? `<div class="field">
+          <label>${esc(t('nodes.encryptionTitle'))}</label>
+          <div class="encryption-badge">
+            <span class="material-symbols-rounded">lock</span>
+            <div><strong>${esc(t('nodes.encryptionCipher'))}</strong><span class="cipher">XChaCha20-Poly1305</span></div>
+          </div>
+          <div class="transport-secrets" style="margin-top:8px">
+            ${secretInput({ key: 'encryption_password', label: 'nodes.encryptionPassword' }, draft.secrets.encryption_password)}
+          </div>
+          <div class="hint">${esc(t('nodes.encryptionHint'))}</div>
+        </div>`
+      : '';
+    const transportSection = draft.is_relay
+      ? `${encryptionSection}
+        <div class="field">
           <label>${esc(t('nodes.transports'))}</label>
           <div class="transport-rows">${transports}</div>
           ${addTransportButton}
+          <div class="hint">${esc(t('nodes.secretsHint'))}</div>
         </div>`
       : '';
     dialog.setBody(`
@@ -1747,7 +2036,11 @@ function openNodeModal(node, role) {
     if (relay) relay.addEventListener('change', e => {
       draft.is_relay = e.target.checked;
       if (draft.is_relay && !draft.transports.length) {
-        draft.transports.push({ type: 'raw_ws', domain: '', enabled: true });
+        draft.transports.push({ type: 'raw_ws', domain: '', decoy_repo_url: '', enabled: true });
+      }
+      if (draft.is_relay) {
+        fillSecretKeys(draft, ['encryption_password']);
+        draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
       }
       renderNodeBody();
     });
@@ -1779,8 +2072,20 @@ function openNodeModal(node, role) {
       is_relay: draft.is_relay,
       is_exit: draft.is_exit,
       socks_port: draft.socks_port,
-      transports: draft.is_relay ? draft.transports : []
+      transports: draft.is_relay ? draft.transports.map(tr => {
+        const item = { type: tr.type, domain: tr.domain, enabled: tr.enabled };
+        const decoyURL = String(tr.decoy_repo_url || '').trim();
+        if (tr.type === 'raw_ws' && decoyURL) item.decoy_repo_url = decoyURL;
+        return item;
+      }) : []
     };
+    if (draft.is_relay) {
+      const secrets = {};
+      Object.entries(draft.secrets || {}).forEach(([key, value]) => {
+        if (String(value || '').trim()) secrets[key] = value;
+      });
+      payload.secrets = secrets;
+    }
     const path = editID ? `/api/nodes/${encodeURIComponent(editID)}` : '/api/nodes';
     try {
       await api(path, {
@@ -1806,6 +2111,21 @@ function fleetNodeSetTransport(index, key, value) {
   draft.transports[index][key] = value;
 }
 
+function fleetNodeSetSecret(key, value) {
+  const draft = fleet.nodeDraft;
+  if (!draft) return;
+  if (!draft.secrets) draft.secrets = {};
+  draft.secrets[key] = value;
+}
+
+function fleetNodeRandomSecret(key) {
+  const draft = fleet.nodeDraft;
+  if (!draft) return;
+  if (!draft.secrets) draft.secrets = {};
+  draft.secrets[key] = generateSecretValue(key);
+  if (fleet.renderNodeBody) fleet.renderNodeBody();
+}
+
 function fleetNodeChangeTransportType(index, value) {
   const draft = fleet.nodeDraft;
   if (!draft || !draft.transports[index]) return;
@@ -1815,6 +2135,7 @@ function fleetNodeChangeTransportType(index, value) {
     return;
   }
   draft.transports[index].type = value;
+  fillDraftSecrets(draft, value);
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
@@ -1833,7 +2154,8 @@ function fleetNodeAddTransport() {
     toast(t('nodes.allTransportsAdded'), 'info');
     return;
   }
-  draft.transports.push({ type: next.value, domain: '', enabled: true });
+  draft.transports.push({ type: next.value, domain: '', decoy_repo_url: '', enabled: true });
+  fillDraftSecrets(draft, next.value);
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
@@ -1856,11 +2178,17 @@ function renderRoutes() {
     root.innerHTML = emptyState('alt_route', t('routes.empty'), t('routes.add'), 'fleetAddRoute()');
     return;
   }
-  const rows = fleet.routes.map(route => `
+  const rows = fleet.routes.map(route => {
+    const isMulti = route.transport_type === 'multi';
+    const transportCell = isMulti
+      ? `<span class="transport-chip transport-chip--multi">${esc(t('routes.multiBadge'))} · ${esc(multiStrategyLabel(route.multi_strategy))}</span>
+         <div class="table-sub">${esc(subRouteNames(route.sub_route_ids))}</div>`
+      : `<span class="transport-chip">${esc(transportLabel(route.transport_type))}</span>`;
+    return `
     <tr>
       <td><strong>${esc(route.name)}</strong><div class="table-sub">#${esc(route.id)}</div></td>
       <td>${esc(nodeName(route.entry_node_id))} <span class="arrow">→</span> ${esc(nodeName(route.exit_node_id))}</td>
-      <td><span class="transport-chip">${esc(transportLabel(route.transport_type))}</span></td>
+      <td>${transportCell}</td>
       <td>
         <label class="switch">
           <input type="checkbox" ${route.enabled ? 'checked' : ''} onchange="fleetToggleRoute(${route.id}, this.checked)">
@@ -1871,7 +2199,8 @@ function renderRoutes() {
         <button class="icon-btn" type="button" title="${esc(t('actions.edit'))}" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
         <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   root.innerHTML = `<div class="table-wrap"><table class="data-table">
     <thead><tr><th>${esc(t('routes.name'))}</th><th>${esc(t('routes.path'))}</th><th>${esc(t('routes.transport'))}</th><th>${esc(t('routes.enabled'))}</th><th></th></tr></thead>
     <tbody>${rows}</tbody>
@@ -1885,13 +2214,21 @@ async function fleetToggleRoute(id, enabled) {
     await api(`/api/routes/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: route.name,
-        entry_node_id: route.entry_node_id,
-        exit_node_id: route.exit_node_id,
-        transport_type: route.transport_type,
-        enabled: enabled
-      })
+      body: JSON.stringify(route.transport_type === 'multi'
+        ? {
+            name: route.name,
+            transport_type: 'multi',
+            multi_strategy: route.multi_strategy || 'bond',
+            sub_route_ids: route.sub_route_ids || [],
+            enabled: enabled
+          }
+        : {
+            name: route.name,
+            entry_node_id: route.entry_node_id,
+            exit_node_id: route.exit_node_id,
+            transport_type: route.transport_type,
+            enabled: enabled
+          })
     });
     route.enabled = enabled;
     toast(enabled ? t('routes.enabledToast') : t('routes.disabledToast'), 'success');
@@ -1928,30 +2265,27 @@ function openRouteModal(route) {
   const editID = route ? route.id : null;
   const relays = fleet.nodes.filter(n => n.is_relay);
   const exits = fleet.nodes.filter(n => n.is_exit);
-  const entryID = route ? route.entry_node_id : (relays[0] ? relays[0].id : 0);
-  const exitID = route ? route.exit_node_id : (exits[0] ? exits[0].id : 0);
-  const transport = route ? route.transport_type : (TRANSPORT_KINDS[0].value);
+  const isMulti = !!route && route.transport_type === 'multi';
   const draft = {
+    mode: isMulti ? 'multi' : 'single',
     name: route ? route.name : '',
-    entry_node_id: entryID,
-    exit_node_id: exitID,
-    transport_type: transport,
+    entry_node_id: route ? route.entry_node_id : (relays[0] ? relays[0].id : 0),
+    exit_node_id: route ? route.exit_node_id : (exits[0] ? exits[0].id : 0),
+    transport_type: route && route.transport_type !== 'multi' ? route.transport_type : TRANSPORT_KINDS[0].value,
+    multi_strategy: route && route.multi_strategy ? route.multi_strategy : 'bond',
+    sub_route_ids: route && Array.isArray(route.sub_route_ids) ? route.sub_route_ids.slice() : [],
     enabled: route ? !!route.enabled : true
   };
+  fleet.routeDraft = draft;
+  fleet.routeEditID = editID;
 
-  function takenTransports(entryID, exitID) {
-    const taken = new Set();
-    for (const r of fleet.routes || []) {
-      if (editID && r.id === editID) continue;
-      if (r.entry_node_id === entryID && r.exit_node_id === exitID) {
-        taken.add(r.transport_type);
-      }
-    }
-    return taken;
+  function selectOptions(nodes, selected, emptyLabel) {
+    if (!nodes.length) return `<option value="0">${esc(emptyLabel)}</option>`;
+    return nodes.map(n => `<option value="${n.id}" ${n.id === selected ? 'selected' : ''}>${esc(n.name)}</option>`).join('');
   }
 
   function transportOptions() {
-    const taken = takenTransports(draft.entry_node_id, draft.exit_node_id);
+    const taken = takenRouteTransports(draft.entry_node_id, draft.exit_node_id, editID);
     return TRANSPORT_KINDS.map(k => {
       const disabled = taken.has(k.value);
       const label = disabled ? `${k.label} (${t('routes.transportTaken')})` : k.label;
@@ -1959,19 +2293,27 @@ function openRouteModal(route) {
     }).join('');
   }
 
-  function refreshTransportOptions() {
-    const taken = takenTransports(draft.entry_node_id, draft.exit_node_id);
-    if (taken.has(draft.transport_type)) {
-      const next = TRANSPORT_KINDS.find(k => !taken.has(k.value));
-      if (next) draft.transport_type = next.value;
-    }
-    typeEl.innerHTML = transportOptions();
-    typeEl.value = draft.transport_type;
+  function strategyOptions() {
+    return [
+      { value: 'bond', label: t('routes.strategyBond') },
+      { value: 'flowmux', label: t('routes.strategyFlowmux') }
+    ].map(option => `<option value="${option.value}" ${option.value === draft.multi_strategy ? 'selected' : ''}>${esc(option.label)}</option>`).join('');
   }
 
-  function selectOptions(nodes, selected, emptyLabel) {
-    if (!nodes.length) return `<option value="0">${esc(emptyLabel)}</option>`;
-    return nodes.map(n => `<option value="${n.id}" ${n.id === selected ? 'selected' : ''}>${esc(n.name)}</option>`).join('');
+  function childRoutes() {
+    return (fleet.routes || []).filter(r => r.transport_type !== 'multi' && (!editID || r.id !== editID));
+  }
+
+  function childCheckboxes() {
+    const options = childRoutes();
+    if (!options.length) return `<div class="hint">${esc(t('routes.noSubRoutes'))}</div>`;
+    return options.map(r => {
+      const checked = (draft.sub_route_ids || []).includes(r.id);
+      const disabled = r.enabled ? '' : ` · ${t('routes.childDisabled')}`;
+      return `<label class="check-row"><input type="checkbox" ${checked ? 'checked' : ''}
+        onchange="fleetRouteToggleChild(${r.id}, this.checked)">
+        <span>${esc(r.name)} · ${esc(transportLabel(r.transport_type))}${esc(disabled)}</span></label>`;
+    }).join('');
   }
 
   const dialog = openModal({
@@ -1979,62 +2321,145 @@ function openRouteModal(route) {
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
       { label: editID ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitRoute }
-    ],
-    body: `
+    ]
+  });
+
+  function renderRouteBody() {
+    const multi = draft.mode === 'multi';
+    dialog.setBody(`
       <div class="form-group">
         <div class="field"><label>${esc(t('routes.name'))}</label><input type="text" id="r-name" value="${escAttr(draft.name)}" placeholder="helsinki-frankfurt"></div>
-        <div class="form-row">
-          <div class="field"><label>${esc(t('routes.from'))}</label><select id="r-entry">${selectOptions(relays, entryID, t('routes.noRelays'))}</select></div>
-          <div class="field"><label>${esc(t('routes.to'))}</label><select id="r-exit">${selectOptions(exits, exitID, t('routes.noExits'))}</select></div>
+        <div class="field">
+          <label>${esc(t('routes.mode'))}</label>
+          <div class="segmented" role="group">
+            <button type="button" class="segmented__btn ${multi ? '' : 'active'}" onclick="fleetRouteSetMode('single')">${esc(t('routes.modeSingle'))}</button>
+            <button type="button" class="segmented__btn ${multi ? 'active' : ''}" onclick="fleetRouteSetMode('multi')">${esc(t('routes.modeMulti'))}</button>
+          </div>
         </div>
-        <div class="field"><label>${esc(t('routes.transport'))}</label><select id="r-transport">
+        ${multi ? `
+        <div class="field"><label>${esc(t('routes.multiStrategy'))}</label>
+          <select id="r-strategy" onchange="fleetRouteSetStrategy(this.value)">${strategyOptions()}</select>
+        </div>
+        <div class="field"><label>${esc(t('routes.subRoutes'))}</label>
+          <div class="check-list">${childCheckboxes()}</div>
+          <div class="hint">${esc(t('routes.multiHint'))}</div>
+        </div>` : `
+        <div class="form-row">
+          <div class="field"><label>${esc(t('routes.from'))}</label><select id="r-entry" onchange="fleetRouteSetNode('entry_node_id', this.value)">${selectOptions(relays, draft.entry_node_id, t('routes.noRelays'))}</select></div>
+          <div class="field"><label>${esc(t('routes.to'))}</label><select id="r-exit" onchange="fleetRouteSetNode('exit_node_id', this.value)">${selectOptions(exits, draft.exit_node_id, t('routes.noExits'))}</select></div>
+        </div>
+        <div class="field"><label>${esc(t('routes.transport'))}</label><select id="r-transport" onchange="fleetRouteSetTransport(this.value)">
           ${transportOptions()}
-        </select></div>
+        </select></div>`}
         <label class="check-row"><input type="checkbox" id="r-enabled" ${draft.enabled ? 'checked' : ''}> ${esc(t('routes.enabled'))}</label>
         <div class="hint">${esc(t('routes.hint'))}</div>
-      </div>`
-  });
+      </div>`);
+    const nameEl = document.getElementById('r-name');
+    if (nameEl) nameEl.addEventListener('input', e => { draft.name = e.target.value; });
+    const enabledEl = document.getElementById('r-enabled');
+    if (enabledEl) enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
+  }
 
-  const nameEl = document.getElementById('r-name');
-  const entryEl = document.getElementById('r-entry');
-  const exitEl = document.getElementById('r-exit');
-  const typeEl = document.getElementById('r-transport');
-  const enabledEl = document.getElementById('r-enabled');
-  nameEl.addEventListener('input', e => { draft.name = e.target.value; });
-  entryEl.addEventListener('change', e => {
-    draft.entry_node_id = Number(e.target.value) || 0;
-    refreshTransportOptions();
-  });
-  exitEl.addEventListener('change', e => {
-    draft.exit_node_id = Number(e.target.value) || 0;
-    refreshTransportOptions();
-  });
-  typeEl.addEventListener('change', e => { draft.transport_type = e.target.value; });
-  enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
+  fleet.renderRouteBody = renderRouteBody;
+  renderRouteBody();
 
   async function submitRoute() {
-    if (!draft.entry_node_id || !draft.exit_node_id) return toast(t('routes.nodesRequired'), 'error');
-    if (takenTransports(draft.entry_node_id, draft.exit_node_id).has(draft.transport_type)) {
-      return toast(t('routes.transportTaken'), 'error');
+    if (draft.mode === 'multi') {
+      if (!draft.sub_route_ids || draft.sub_route_ids.length < 2) {
+        return toast(t('routes.subRoutesRequired'), 'error');
+      }
+    } else {
+      if (!draft.entry_node_id || !draft.exit_node_id) return toast(t('routes.nodesRequired'), 'error');
+      if (takenRouteTransports(draft.entry_node_id, draft.exit_node_id, editID).has(draft.transport_type)) {
+        return toast(t('routes.transportTaken'), 'error');
+      }
     }
     if (!draft.name.trim()) {
-      draft.name = `${nodeName(draft.entry_node_id)}-${nodeName(draft.exit_node_id)}`.toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+      if (draft.mode === 'multi') {
+        const names = (draft.sub_route_ids || []).map(id => {
+          const child = fleet.routes.find(r => r.id === id);
+          return child ? child.name : String(id);
+        });
+        draft.name = (names.slice(0, 2).join('-') || 'multi') + '-multi';
+      } else {
+        draft.name = `${nodeName(draft.entry_node_id)}-${nodeName(draft.exit_node_id)}`;
+      }
+      draft.name = draft.name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
     }
+    const payload = draft.mode === 'multi'
+      ? {
+          name: draft.name,
+          transport_type: 'multi',
+          multi_strategy: draft.multi_strategy || 'bond',
+          sub_route_ids: (draft.sub_route_ids || []).slice(),
+          enabled: draft.enabled
+        }
+      : {
+          name: draft.name,
+          entry_node_id: draft.entry_node_id,
+          exit_node_id: draft.exit_node_id,
+          transport_type: draft.transport_type,
+          enabled: draft.enabled
+        };
     const path = editID ? `/api/routes/${encodeURIComponent(editID)}` : '/api/routes';
     try {
       await api(path, {
         method: editID ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(draft)
+        body: JSON.stringify(payload)
       });
       toast(editID ? t('toast.saved') : t('toast.created'), 'success');
       closeModal();
       await loadActiveView();
     } catch (e) {
-      toast(e.status === 409 ? t('routes.transportTaken') : e.message, 'error');
+      toast(e.status === 409 && draft.mode !== 'multi' ? t('routes.transportTaken') : e.message, 'error');
     }
   }
   dialog.setFocus?.('r-name');
+}
+
+function fleetRouteSetMode(mode) {
+  const draft = fleet.routeDraft;
+  if (!draft) return;
+  draft.mode = mode === 'multi' ? 'multi' : 'single';
+  if (draft.mode === 'single' && draft.transport_type === 'multi') {
+    const taken = takenRouteTransports(draft.entry_node_id, draft.exit_node_id, fleet.routeEditID);
+    const next = TRANSPORT_KINDS.find(k => !taken.has(k.value));
+    draft.transport_type = next ? next.value : TRANSPORT_KINDS[0].value;
+  }
+  if (fleet.renderRouteBody) fleet.renderRouteBody();
+}
+
+function fleetRouteSetStrategy(strategy) {
+  const draft = fleet.routeDraft;
+  if (!draft) return;
+  draft.multi_strategy = strategy === 'flowmux' ? 'flowmux' : 'bond';
+}
+
+function fleetRouteToggleChild(id, checked) {
+  const draft = fleet.routeDraft;
+  if (!draft) return;
+  const selected = new Set(draft.sub_route_ids || []);
+  if (checked) selected.add(Number(id)); else selected.delete(Number(id));
+  draft.sub_route_ids = Array.from(selected);
+}
+
+function fleetRouteSetNode(key, value) {
+  const draft = fleet.routeDraft;
+  if (!draft) return;
+  draft[key] = Number(value) || 0;
+  const taken = takenRouteTransports(draft.entry_node_id, draft.exit_node_id, fleet.routeEditID);
+  if (taken.has(draft.transport_type)) {
+    const next = TRANSPORT_KINDS.find(k => !taken.has(k.value));
+    if (next) draft.transport_type = next.value;
+  }
+  if (fleet.renderRouteBody) fleet.renderRouteBody();
+}
+
+function fleetRouteSetTransport(value) {
+  const draft = fleet.routeDraft;
+  if (!draft) return;
+  draft.transport_type = value;
 }
 
 function userUsedBytes(user) {

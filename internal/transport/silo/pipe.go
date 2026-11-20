@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"sort"
 	"sync"
@@ -17,7 +16,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
-	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
@@ -59,19 +58,8 @@ func (s *minioStore) ListObjects(ctx context.Context, bucket string, opts minio.
 }
 
 func newMinioStore(cfg *Config) (objectStore, error) {
-	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   netdial.Control,
-		}).DialContext,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+
+	tr := utlsdial.NewHTTPTransport(utlsdial.ProfileChrome)
 
 	cl, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),

@@ -3,6 +3,7 @@ package panelstore
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +13,12 @@ const (
 	TransportRawWS   = "raw_ws"
 	TransportSilo    = "silo"
 	TransportLiveKit = "livekit"
+	TransportMulti   = "multi"
+
+	MultiStrategyBond    = "bond"
+	MultiStrategyFlowMux = "flowmux"
+
+	EncryptionCipherName = "XChaCha20-Poly1305"
 
 	NodeStatusNew       = "new"
 	NodeStatusDeploying = "deploying"
@@ -27,9 +34,10 @@ var (
 )
 
 type Transport struct {
-	Type    string `json:"type"`
-	Domain  string `json:"domain"`
-	Enabled bool   `json:"enabled"`
+	Type         string `json:"type"`
+	Domain       string `json:"domain"`
+	DecoyRepoURL string `json:"decoy_repo_url,omitempty"`
+	Enabled      bool   `json:"enabled"`
 }
 
 func normalizeNodeIDs(in []int64) ([]int64, error) {
@@ -61,7 +69,9 @@ type Node struct {
 	IsExit           bool              `json:"is_exit"`
 	Transports       []Transport       `json:"transports"`
 	NodeSecret       string            `json:"node_secret"`
-	GeneratedSecrets map[string]string `json:"generated_secrets"`
+	GeneratedSecrets map[string]string `json:"-"`
+	Secrets          map[string]string `json:"secrets,omitempty"`
+	EncryptionCipher string            `json:"encryption_cipher,omitempty"`
 	SocksPort        int               `json:"socks_port"`
 	Status           string            `json:"status"`
 	LastError        string            `json:"last_error,omitempty"`
@@ -78,12 +88,14 @@ func (n Node) EnabledTransport(kind string) (Transport, bool) {
 }
 
 type Route struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	EntryNodeID   int64  `json:"entry_node_id"`
-	ExitNodeID    int64  `json:"exit_node_id"`
-	TransportType string `json:"transport_type"`
-	Enabled       bool   `json:"enabled"`
+	ID            int64   `json:"id"`
+	Name          string  `json:"name"`
+	EntryNodeID   int64   `json:"entry_node_id"`
+	ExitNodeID    int64   `json:"exit_node_id"`
+	TransportType string  `json:"transport_type"`
+	MultiStrategy string  `json:"multi_strategy,omitempty"`
+	SubRouteIDs   []int64 `json:"sub_route_ids"`
+	Enabled       bool    `json:"enabled"`
 }
 
 type User struct {
@@ -140,6 +152,14 @@ func validTransport(kind string) bool {
 	}
 }
 
+func validRouteTransport(kind string) bool {
+	return validTransport(kind) || kind == TransportMulti
+}
+
+func validMultiStrategy(strategy string) bool {
+	return strategy == MultiStrategyBond || strategy == MultiStrategyFlowMux
+}
+
 func normalizeTransports(in []Transport) ([]Transport, error) {
 	out := make([]Transport, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
@@ -155,8 +175,12 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 		if _, ok := seen[kind]; ok {
 			return nil, invalidf("duplicate transport type %q", kind)
 		}
+		decoyURL, err := normalizeDecoyRepoURL(kind, tr.DecoyRepoURL)
+		if err != nil {
+			return nil, err
+		}
 		seen[kind] = struct{}{}
-		out = append(out, Transport{Type: kind, Domain: domain, Enabled: tr.Enabled})
+		out = append(out, Transport{Type: kind, Domain: domain, DecoyRepoURL: decoyURL, Enabled: tr.Enabled})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Type == out[j].Type {
@@ -165,6 +189,57 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 		return out[i].Type < out[j].Type
 	})
 	return out, nil
+}
+
+func normalizeDecoyRepoURL(kind, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if kind != TransportRawWS {
+		return "", invalidf("decoy repo URL is only supported for transport %q", TransportRawWS)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", invalidf("decoy repo URL %q must be an https link", raw)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", invalidf("decoy repo URL %q must not contain credentials, query or fragment", raw)
+	}
+	if strings.HasSuffix(strings.ToLower(parsed.Path), ".zip") {
+		return parsed.String(), nil
+	}
+	host := strings.ToLower(parsed.Host)
+	if host != "github.com" && host != "www.github.com" {
+		return "", invalidf("decoy repo URL %q must point to github.com or a .zip archive", raw)
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) != 2 {
+		return "", invalidf("decoy repo URL %q must look like https://github.com/<owner>/<repo>", raw)
+	}
+	for _, segment := range segments {
+		if !validGitHubSegment(segment) {
+			return "", invalidf("decoy repo URL %q has an invalid owner or repository name", raw)
+		}
+	}
+	return "https://github.com/" + segments[0] + "/" + segments[1], nil
+}
+
+func validGitHubSegment(segment string) bool {
+	if segment == "" || segment == "." || segment == ".." {
+		return false
+	}
+	for _, r := range segment {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeAllowedRoutes(in []int64) []int64 {

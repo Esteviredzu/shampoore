@@ -40,6 +40,7 @@ VERSION="${VERSION_RAW#v}"
 if [ -z "$VERSION" ]; then
     VERSION="dev"
 fi
+VERSION_TAG="v${VERSION}"
 
 ARCHES=(amd64 arm64)
 DIST="dist"
@@ -55,13 +56,13 @@ command -v tar >/dev/null || die "tar is required"
 [ -f deploy/systemd/uninstall.sh ]       || die "deploy/systemd/uninstall.sh is missing"
 [ -f deploy/systemd/shampoore.service ]  || die "deploy/systemd/shampoore.service is missing"
 
-log "version: $VERSION"
+log "version: $VERSION_TAG"
 log "arches:  ${ARCHES[*]}"
 
 rm -rf "$DIST"
 mkdir -p "$DIST" "$STAGE_ROOT"
 
-LDFLAGS="-s -w"
+LDFLAGS="-s -w -X github.com/Esteviredzu/shampoore/internal/version.Version=$VERSION_TAG"
 
 for ARCH in "${ARCHES[@]}"; do
     STAGE="$STAGE_ROOT/shampoore-linux-$ARCH"

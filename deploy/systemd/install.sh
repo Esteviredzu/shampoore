@@ -96,7 +96,10 @@ if ! id -u "$USER_NAME" >/dev/null 2>&1; then
 fi
 
 log "installing binaries to $PREFIX/bin"
-install -d -m 0755 "$PREFIX/bin"
+# The panel replaces its own binaries during a self-update. The setgid,
+# group-writable directory lets the service user stage "*.new" files and rename
+# them over the root-owned binaries (write access to the directory is enough).
+install -d -m 2775 -o root -g "$USER_NAME" "$PREFIX/bin"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-panel"  "$PREFIX/bin/shampoore-panel"
 install -o root -g root -m 0755 "$SRC_DIR/shampoore-server" "$PREFIX/bin/shampoore-server"
 for extra in shampoore-relay shampoore-node-agent; do

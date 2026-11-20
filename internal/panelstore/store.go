@@ -42,12 +42,14 @@ var migrations = []string{
 		updated_at             TEXT    NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS routes (
-		id             INTEGER PRIMARY KEY AUTOINCREMENT,
-		name           TEXT    NOT NULL UNIQUE,
-		entry_node_id  INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-		exit_node_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-		transport_type TEXT    NOT NULL CHECK (transport_type IN ('raw_ws','silo','livekit')),
-		enabled        INTEGER NOT NULL DEFAULT 1
+		id                INTEGER PRIMARY KEY AUTOINCREMENT,
+		name              TEXT    NOT NULL UNIQUE,
+		entry_node_id     INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		exit_node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		transport_type    TEXT    NOT NULL CHECK (transport_type IN ('raw_ws','silo','livekit','multi')),
+		multi_strategy    TEXT    NOT NULL DEFAULT '',
+		sub_route_ids_json TEXT   NOT NULL DEFAULT '[]',
+		enabled           INTEGER NOT NULL DEFAULT 1
 	);
 	CREATE TABLE IF NOT EXISTS users (
 		id                     TEXT PRIMARY KEY,
@@ -104,6 +106,49 @@ var migrations = []string{
 		  AND entry_node_id = NEW.entry_node_id
 		  AND exit_node_id = NEW.exit_node_id
 		  AND transport_type = NEW.transport_type
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;`,
+	`CREATE TABLE routes_new (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		name               TEXT    NOT NULL UNIQUE,
+		entry_node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		exit_node_id       INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		transport_type     TEXT    NOT NULL CHECK (transport_type IN ('raw_ws','silo','livekit','multi')),
+		multi_strategy     TEXT    NOT NULL DEFAULT '',
+		sub_route_ids_json TEXT    NOT NULL DEFAULT '[]',
+		enabled            INTEGER NOT NULL DEFAULT 1
+	);
+	INSERT INTO routes_new (id, name, entry_node_id, exit_node_id, transport_type, enabled)
+		SELECT id, name, entry_node_id, exit_node_id, transport_type, enabled FROM routes;
+	DROP TABLE routes;
+	ALTER TABLE routes_new RENAME TO routes;
+	CREATE INDEX IF NOT EXISTS idx_routes_entry ON routes(entry_node_id);
+	CREATE INDEX IF NOT EXISTS idx_routes_exit  ON routes(exit_node_id);
+	CREATE TRIGGER IF NOT EXISTS trg_routes_unique_insert
+	BEFORE INSERT ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+		  AND multi_strategy = NEW.multi_strategy
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;
+	CREATE TRIGGER IF NOT EXISTS trg_routes_unique_update
+	BEFORE UPDATE ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE id <> OLD.id
+		  AND entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+		  AND multi_strategy = NEW.multi_strategy
 	)
 	BEGIN
 		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');

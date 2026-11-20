@@ -3,7 +3,9 @@ package relay
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -17,13 +19,26 @@ const (
 	DefaultMaxMessageSize = 16 << 20
 	defaultPingInterval   = 30 * time.Second
 	defaultWriteTimeout   = 10 * time.Second
+
+	streamPath    = "/ws/stream"
+	minTickDelay  = 300 * time.Millisecond
+	maxTickJitter = 300 * time.Millisecond
+	telemetryRead = 16 << 10
 )
 
 type Server struct {
 	password       string
 	maxMessageSize int64
 	pingInterval   time.Duration
-	upgrader       websocket.Upgrader
+	roomUpgrader   websocket.Upgrader
+	decoyUpgrader  websocket.Upgrader
+
+	feed      *Feed
+	now       func() time.Time
+	tickDelay func() time.Duration
+
+	decoyMu  sync.Mutex
+	decoyDir string
 
 	mu    sync.Mutex
 	rooms map[string]map[*client]struct{}
@@ -35,17 +50,38 @@ type client struct {
 }
 
 func New(password string) *Server {
-	return &Server{
+	s := &Server{
 		password:       strings.TrimSpace(password),
 		maxMessageSize: DefaultMaxMessageSize,
 		pingInterval:   defaultPingInterval,
-		upgrader: websocket.Upgrader{
-			CheckOrigin:     func(*http.Request) bool { return true },
-			ReadBufferSize:  32 << 10,
-			WriteBufferSize: 32 << 10,
-		},
-		rooms: make(map[string]map[*client]struct{}),
+		feed:           NewFeed(FeedOptions{}),
+		now:            time.Now,
+		tickDelay:      defaultTickDelay,
+		rooms:          make(map[string]map[*client]struct{}),
 	}
+	base := websocket.Upgrader{
+		CheckOrigin:     func(*http.Request) bool { return true },
+		ReadBufferSize:  32 << 10,
+		WriteBufferSize: 32 << 10,
+	}
+	s.roomUpgrader = base
+	s.roomUpgrader.Subprotocols = []string{SubprotocolTelemetry}
+
+	s.decoyUpgrader = base
+	return s
+}
+
+func (s *Server) SetFeed(f *Feed) {
+	if f == nil {
+		return
+	}
+	s.feed = f
+}
+
+func (s *Server) Feed() *Feed { return s.feed }
+
+func defaultTickDelay() time.Duration {
+	return minTickDelay + time.Duration(rand.Int64N(int64(maxTickJitter)+1))
 }
 
 func (s *Server) SetMaxMessageSize(n int64) {
@@ -54,15 +90,18 @@ func (s *Server) SetMaxMessageSize(n int64) {
 	}
 }
 
-func (s *Server) authorized(r *http.Request) bool {
+func (s *Server) authorized(r *http.Request, room string) bool {
 	if s.password == "" {
+		return true
+	}
+	if VerifyAuthToken(room, s.password, authTokenFromRequest(r), s.now()) {
 		return true
 	}
 	got := r.Header.Get("X-Room-Password")
 	if got == "" {
 		got = r.URL.Query().Get("password")
 	}
-	if len(got) != len(s.password) {
+	if got == "" || len(got) != len(s.password) {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.password)) == 1
@@ -81,25 +120,49 @@ func roomFromPath(path string) string {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	roomName := roomFromPath(r.URL.Path)
-	if roomName == "" {
-		http.NotFound(w, r)
+	if r.URL.Path == streamPath {
+		s.serveStream(w, r)
 		return
 	}
-	if !s.authorized(r) {
+	if room := roomFromPath(r.URL.Path); room != "" {
+		s.serveRoom(w, r, room)
+		return
+	}
+	s.serveDecoy(w, r)
+}
+
+func (s *Server) serveRoom(w http.ResponseWriter, r *http.Request, room string) {
+	if !s.authorized(r, room) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	conn, err := s.roomUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	s.serveTunnel(room, conn)
+}
+
+func (s *Server) serveStream(w http.ResponseWriter, r *http.Request) {
+	room := strings.TrimSpace(r.URL.Query().Get("room"))
+	if room != "" && !strings.Contains(room, "/") && s.authorized(r, room) {
+		conn, err := s.roomUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		s.serveTunnel(room, conn)
+		return
+	}
+	s.serveTelemetry(w, r)
+}
+
+func (s *Server) serveTunnel(room string, conn *websocket.Conn) {
 	conn.SetReadLimit(s.maxMessageSize)
 
 	c := &client{conn: conn}
-	s.add(roomName, c)
+	s.add(room, c)
 	defer func() {
-		s.remove(roomName, c)
+		s.remove(room, c)
 		_ = conn.Close()
 	}()
 
@@ -115,7 +178,59 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if msgType != websocket.BinaryMessage && msgType != websocket.TextMessage {
 			continue
 		}
-		s.broadcast(roomName, c, msgType, data)
+		s.broadcast(room, c, msgType, data)
+	}
+}
+
+func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
+	header := http.Header{"Sec-Websocket-Protocol": []string{SubprotocolTelemetry}}
+	conn, err := s.decoyUpgrader.Upgrade(w, r, header)
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	conn.SetReadLimit(telemetryRead)
+	c := &client{conn: conn}
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go s.pingLoop(c, stopPing)
+
+	ctx := r.Context()
+	for {
+		timer := time.NewTimer(s.tickDelay())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-closed:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		data, err := json.Marshal(s.feed.Tick())
+		if err != nil {
+			return
+		}
+		c.mu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
+		err = conn.WriteMessage(websocket.TextMessage, data)
+		c.mu.Unlock()
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -202,6 +317,9 @@ func (s *Server) CloseAll() {
 }
 
 func (s *Server) Run(ctx context.Context, addr string) error {
+	if s.feed != nil {
+		s.feed.Start(ctx)
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err

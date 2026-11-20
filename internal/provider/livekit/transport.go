@@ -2,10 +2,31 @@ package livekit
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
+	"time"
 
+	"github.com/gorilla/websocket"
+
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
+
+const livekitAPITimeout = 15 * time.Second
+
+func NewHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = livekitAPITimeout
+	}
+	return &http.Client{
+		Transport: utlsdial.NewHTTPTransport(utlsdial.DefaultProfile),
+		Timeout:   timeout,
+	}
+}
+
+func NewSignalDialer() *websocket.Dialer {
+	return utlsdial.NewWebSocketDialer(utlsdial.DefaultProfile)
+}
 
 type pipeTransport struct {
 	pipe transport.Pipe

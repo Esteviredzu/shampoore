@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
@@ -330,5 +331,153 @@ func TestUserOfflineBundle(t *testing.T) {
 	}
 	if len(limited.Links) != 1 {
 		t.Fatalf("restricted bundle links = %d, want 1", len(limited.Links))
+	}
+}
+
+func TestSubscriptionMultiRoutes(t *testing.T) {
+	api, store, _, _ := newControlTestAPI(t)
+	topo := seedTopology(t, store)
+	ctx := context.Background()
+
+	bond, err := store.CreateRoute(ctx, panelstore.Route{
+		Name:          "bond-route",
+		TransportType: panelstore.TransportMulti,
+		MultiStrategy: panelstore.MultiStrategyBond,
+		SubRouteIDs:   []int64{topo.routes[0].ID, topo.routes[1].ID},
+		Enabled:       true,
+	})
+	if err != nil {
+		t.Fatalf("create bond route: %v", err)
+	}
+	flow, err := store.CreateRoute(ctx, panelstore.Route{
+		Name:          "flowmux-route",
+		TransportType: panelstore.TransportMulti,
+		MultiStrategy: panelstore.MultiStrategyFlowMux,
+		SubRouteIDs:   []int64{topo.routes[1].ID, topo.routes[2].ID},
+		Enabled:       true,
+	})
+	if err != nil {
+		t.Fatalf("create flowmux route: %v", err)
+	}
+	relay, err := store.GetNode(ctx, topo.relay.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := perform(api.PublicHandler(), http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscription = %d: %s", rec.Code, rec.Body.String())
+	}
+	var settings []app.Settings
+	if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if len(settings) != len(topo.routes)+2 {
+		t.Fatalf("settings = %d, want %d", len(settings), len(topo.routes)+2)
+	}
+	byName := make(map[string]app.Settings, len(settings))
+	for _, s := range settings {
+		byName[s.Name] = s
+	}
+
+	type multiChild struct {
+		Type      string          `json:"type"`
+		Transport json.RawMessage `json:"transport"`
+	}
+	type multiConfig struct {
+		Strategy   string       `json:"strategy"`
+		Transports []multiChild `json:"transports"`
+	}
+	cases := []struct {
+		name      string
+		strategy  string
+		wantTypes []string
+	}{
+		{"bond-route", panelstore.MultiStrategyBond, []string{"raw_ws", "silo"}},
+		{"flowmux-route", panelstore.MultiStrategyFlowMux, []string{"silo", "livekit_datachannel"}},
+	}
+	for _, tc := range cases {
+		s, ok := byName[tc.name]
+		if !ok {
+			t.Fatalf("multi settings %q not found in %+v", tc.name, byName)
+		}
+		if s.Type != panelstore.TransportMulti {
+			t.Fatalf("%s type = %q", tc.name, s.Type)
+		}
+		if s.UserID != topo.user.ID || s.ExitNodeID != itoa(topo.exit.ID) {
+			t.Fatalf("%s identity = %q/%q", tc.name, s.UserID, s.ExitNodeID)
+		}
+		if s.EncryptionPassword != relay.GeneratedSecrets["encryption_password"] {
+			t.Fatalf("%s encryption password = %q", tc.name, s.EncryptionPassword)
+		}
+		var cfg multiConfig
+		if err := json.Unmarshal(s.Transport, &cfg); err != nil {
+			t.Fatalf("%s transport: %v", tc.name, err)
+		}
+		if cfg.Strategy != tc.strategy {
+			t.Fatalf("%s strategy = %q, want %q", tc.name, cfg.Strategy, tc.strategy)
+		}
+		if len(cfg.Transports) != len(tc.wantTypes) {
+			t.Fatalf("%s transports = %d, want %d", tc.name, len(cfg.Transports), len(tc.wantTypes))
+		}
+		for i, want := range tc.wantTypes {
+			if cfg.Transports[i].Type != want {
+				t.Fatalf("%s transport %d = %q, want %q", tc.name, i, cfg.Transports[i].Type, want)
+			}
+		}
+		if tc.strategy == panelstore.MultiStrategyBond {
+			var raw map[string]any
+			if err := json.Unmarshal(cfg.Transports[0].Transport, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if raw["password"] != relay.GeneratedSecrets["raw_ws_password"] {
+				t.Fatalf("bond raw_ws password = %v", raw["password"])
+			}
+		}
+	}
+
+	rec = perform(api.Handler(), http.MethodGet, "/api/users/"+topo.user.ID+"/bundle", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bundle = %d: %s", rec.Code, rec.Body.String())
+	}
+	var bundle OfflineBundle
+	if err := json.Unmarshal(rec.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if len(bundle.Links) != len(topo.routes)+2 {
+		t.Fatalf("bundle links = %d, want %d: %+v", len(bundle.Links), len(topo.routes)+2, bundle)
+	}
+	multiLinks := 0
+	for _, link := range bundle.Links {
+		if !strings.HasPrefix(link, "shampoore://") {
+			t.Fatalf("bundle link %q is not a shampoore:// URL", link)
+		}
+		parsed, err := app.ParseURL(link)
+		if err != nil {
+			t.Fatalf("parse bundle link %q: %v", link, err)
+		}
+		if parsed.Type != panelstore.TransportMulti {
+			continue
+		}
+		multiLinks++
+		if parsed.UserID != topo.user.ID || parsed.ExitNodeID != itoa(topo.exit.ID) {
+			t.Fatalf("multi link identity = %q/%q", parsed.UserID, parsed.ExitNodeID)
+		}
+		if parsed.EncryptionPassword != relay.GeneratedSecrets["encryption_password"] {
+			t.Fatalf("multi link encryption password = %q", parsed.EncryptionPassword)
+		}
+		var cfg multiConfig
+		if err := json.Unmarshal(parsed.Transport, &cfg); err != nil {
+			t.Fatalf("parse multi transport: %v", err)
+		}
+		if cfg.Strategy != panelstore.MultiStrategyBond && cfg.Strategy != panelstore.MultiStrategyFlowMux {
+			t.Fatalf("multi link strategy = %q", cfg.Strategy)
+		}
+		if len(cfg.Transports) != 2 {
+			t.Fatalf("multi link transports = %d, want 2", len(cfg.Transports))
+		}
+	}
+	if multiLinks != 2 {
+		t.Fatalf("multi links = %d, want 2 (bond=%d flowmux=%d)", multiLinks, bond.ID, flow.ID)
 	}
 }

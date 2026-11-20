@@ -48,6 +48,12 @@ func (a *API) registerControlPlane(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/georules/{name}", a.deleteRule)
 }
 
+func (a *API) registerSystemRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/system/version", a.systemVersion)
+	mux.HandleFunc("GET /api/system/update", a.checkSystemUpdate)
+	mux.HandleFunc("POST /api/system/update", a.installSystemUpdate)
+}
+
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
 	if limit <= 0 {
 		limit = 1 << 20

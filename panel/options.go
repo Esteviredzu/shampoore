@@ -56,3 +56,30 @@ func WithGeoRuleUpdateInterval(interval time.Duration) Option {
 		}
 	}
 }
+
+func WithPanelVersion(version string) Option {
+	return func(a *API) {
+		trimmed := strings.TrimSpace(version)
+		if trimmed == "" {
+			return
+		}
+		a.version = trimmed
+		a.updateCfg.CurrentVersion = trimmed
+	}
+}
+
+func WithUpdateRepo(repo string) Option {
+	return func(a *API) { a.updateCfg.Repo = strings.TrimSpace(repo) }
+}
+
+func WithUpdateToken(token string) Option {
+	return func(a *API) { a.updateCfg.Token = strings.TrimSpace(token) }
+}
+
+func WithUpdateAPIBaseURL(baseURL string) Option {
+	return func(a *API) { a.updateCfg.APIBaseURL = strings.TrimSpace(baseURL) }
+}
+
+func WithUpdateBinaryDir(dir string) Option {
+	return func(a *API) { a.updateCfg.BinaryDir = strings.TrimSpace(dir) }
+}

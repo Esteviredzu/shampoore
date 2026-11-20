@@ -3,23 +3,61 @@ package panelstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
-const routeColumns = `id, name, entry_node_id, exit_node_id, transport_type, enabled`
+const routeColumns = `id, name, entry_node_id, exit_node_id, transport_type, multi_strategy, sub_route_ids_json, enabled`
 
 func scanRoute(scanner interface{ Scan(...any) error }) (Route, error) {
 	var (
-		r       Route
-		enabled int
+		r              Route
+		subRouteIDsRaw string
+		enabled        int
 	)
-	if err := scanner.Scan(&r.ID, &r.Name, &r.EntryNodeID, &r.ExitNodeID, &r.TransportType, &enabled); err != nil {
+	if err := scanner.Scan(&r.ID, &r.Name, &r.EntryNodeID, &r.ExitNodeID, &r.TransportType,
+		&r.MultiStrategy, &subRouteIDsRaw, &enabled); err != nil {
 		return Route{}, err
 	}
 	r.Enabled = enabled != 0
+	ids, err := decodeRouteIDs(subRouteIDsRaw)
+	if err != nil {
+		return Route{}, err
+	}
+	r.SubRouteIDs = ids
 	return r, nil
+}
+
+func decodeRouteIDs(raw string) ([]int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []int64{}, nil
+	}
+	var ids []int64
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, fmt.Errorf("panelstore: decode sub-route ids: %w", err)
+	}
+	return normalizeRouteIDs(ids), nil
+}
+
+func normalizeRouteIDs(in []int64) []int64 {
+	out := make([]int64, 0, len(in))
+	seen := make(map[int64]struct{}, len(in))
+	for _, id := range in {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (s *Store) validateRoute(ctx context.Context, r *Route) error {
@@ -31,9 +69,14 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 		return invalidf("route name is too long")
 	}
 	r.TransportType = strings.TrimSpace(r.TransportType)
-	if !validTransport(r.TransportType) {
+	if !validRouteTransport(r.TransportType) {
 		return invalidf("route %q: unsupported transport type %q", r.Name, r.TransportType)
 	}
+	if r.TransportType == TransportMulti {
+		return s.validateMultiRoute(ctx, r)
+	}
+	r.MultiStrategy = ""
+	r.SubRouteIDs = []int64{}
 	if r.EntryNodeID <= 0 || r.ExitNodeID <= 0 {
 		return invalidf("route %q: entry and exit nodes are required", r.Name)
 	}
@@ -54,12 +97,47 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 	return nil
 }
 
+func (s *Store) validateMultiRoute(ctx context.Context, r *Route) error {
+	r.MultiStrategy = strings.TrimSpace(r.MultiStrategy)
+	if !validMultiStrategy(r.MultiStrategy) {
+		return invalidf("route %q: multi_strategy must be %q or %q", r.Name, MultiStrategyBond, MultiStrategyFlowMux)
+	}
+	r.SubRouteIDs = normalizeRouteIDs(r.SubRouteIDs)
+	if len(r.SubRouteIDs) < 2 {
+		return invalidf("route %q: a multi-route requires at least two sub-routes", r.Name)
+	}
+	var entryID, exitID int64
+	for _, id := range r.SubRouteIDs {
+		child, err := s.GetRoute(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			return invalidf("route %q: sub-route %d not found", r.Name, id)
+		}
+		if err != nil {
+			return fmt.Errorf("route %q: sub-route %d: %w", r.Name, id, err)
+		}
+		if child.TransportType == TransportMulti {
+			return invalidf("route %q: sub-route %d is itself a multi-route (recursion is not allowed)", r.Name, id)
+		}
+		if entryID == 0 {
+			entryID, exitID = child.EntryNodeID, child.ExitNodeID
+			continue
+		}
+		if child.EntryNodeID != entryID || child.ExitNodeID != exitID {
+			return invalidf("route %q: all sub-routes must share the same relay and exit", r.Name)
+		}
+	}
+	r.EntryNodeID = entryID
+	r.ExitNodeID = exitID
+	return nil
+}
+
 func (s *Store) routeConflict(ctx context.Context, r Route, excludeID int64) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM routes
-		WHERE entry_node_id = ? AND exit_node_id = ? AND transport_type = ? AND id <> ?
+		WHERE entry_node_id = ? AND exit_node_id = ? AND transport_type = ?
+		  AND multi_strategy = ? AND id <> ?
 		LIMIT 1`,
-		r.EntryNodeID, r.ExitNodeID, r.TransportType, excludeID).Scan(&id)
+		r.EntryNodeID, r.ExitNodeID, r.TransportType, r.MultiStrategy, excludeID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -70,25 +148,34 @@ func (s *Store) routeConflict(ctx context.Context, r Route, excludeID int64) (in
 }
 
 func routeConflictErr(r Route, existingID int64) error {
+	if r.TransportType == TransportMulti {
+		return fmt.Errorf("%w: multi-route between entry node %d and exit node %d with strategy %q already exists (route %d)",
+			ErrConflict, r.EntryNodeID, r.ExitNodeID, r.MultiStrategy, existingID)
+	}
 	return fmt.Errorf("%w: route between entry node %d and exit node %d with transport %q already exists (route %d)",
 		ErrConflict, r.EntryNodeID, r.ExitNodeID, r.TransportType, existingID)
 }
 
 func (s *Store) CreateRoute(ctx context.Context, r Route) (Route, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.validateRoute(ctx, &r); err != nil {
 		return Route{}, err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if existingID, err := s.routeConflict(ctx, r, 0); err != nil {
 		return Route{}, err
 	} else if existingID != 0 {
 		return Route{}, routeConflictErr(r, existingID)
 	}
+	subRouteIDsRaw, err := json.Marshal(r.SubRouteIDs)
+	if err != nil {
+		return Route{}, err
+	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO routes
-		(name, entry_node_id, exit_node_id, transport_type, enabled)
-		VALUES (?, ?, ?, ?, ?)`,
-		r.Name, r.EntryNodeID, r.ExitNodeID, r.TransportType, boolInt(r.Enabled))
+		(name, entry_node_id, exit_node_id, transport_type, multi_strategy, sub_route_ids_json, enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.Name, r.EntryNodeID, r.ExitNodeID, r.TransportType, r.MultiStrategy,
+		string(subRouteIDsRaw), boolInt(r.Enabled))
 	if err != nil {
 		return Route{}, wrapDBErr(err, "create route")
 	}
@@ -154,23 +241,29 @@ func (s *Store) ListRoutesForExit(ctx context.Context, exitNodeID int64) ([]Rout
 }
 
 func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if _, err := s.GetRoute(ctx, r.ID); err != nil {
 		return Route{}, err
 	}
 	if err := s.validateRoute(ctx, &r); err != nil {
 		return Route{}, err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if existingID, err := s.routeConflict(ctx, r, r.ID); err != nil {
 		return Route{}, err
 	} else if existingID != 0 {
 		return Route{}, routeConflictErr(r, existingID)
 	}
+	subRouteIDsRaw, err := json.Marshal(r.SubRouteIDs)
+	if err != nil {
+		return Route{}, err
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE routes SET
-		name = ?, entry_node_id = ?, exit_node_id = ?, transport_type = ?, enabled = ?
+		name = ?, entry_node_id = ?, exit_node_id = ?, transport_type = ?,
+		multi_strategy = ?, sub_route_ids_json = ?, enabled = ?
 		WHERE id = ?`,
-		r.Name, r.EntryNodeID, r.ExitNodeID, r.TransportType, boolInt(r.Enabled), r.ID)
+		r.Name, r.EntryNodeID, r.ExitNodeID, r.TransportType, r.MultiStrategy,
+		string(subRouteIDsRaw), boolInt(r.Enabled), r.ID)
 	if err != nil {
 		return Route{}, wrapDBErr(err, "update route")
 	}
@@ -184,6 +277,12 @@ func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
 func (s *Store) DeleteRoute(ctx context.Context, id int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if multi, ok, err := s.routeUsedByMulti(ctx, id); err != nil {
+		return err
+	} else if ok {
+		return fmt.Errorf("%w: route %d is used by multi-route %q (%d); remove it from the multi-route first",
+			ErrConflict, id, multi.Name, multi.ID)
+	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM routes WHERE id = ?`, id)
 	if err != nil {
 		return wrapDBErr(err, "delete route")
@@ -193,4 +292,27 @@ func (s *Store) DeleteRoute(ctx context.Context, id int64) error {
 		return fmt.Errorf("%w: route %d", ErrNotFound, id)
 	}
 	return nil
+}
+
+func (s *Store) routeUsedByMulti(ctx context.Context, id int64) (Route, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+routeColumns+` FROM routes WHERE transport_type = ?`, TransportMulti)
+	if err != nil {
+		return Route{}, false, wrapDBErr(err, "list multi routes")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanRoute(rows)
+		if err != nil {
+			return Route{}, false, wrapDBErr(err, "scan multi route")
+		}
+		for _, childID := range r.SubRouteIDs {
+			if childID == id {
+				return r, true, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return Route{}, false, wrapDBErr(err, "list multi routes")
+	}
+	return Route{}, false, nil
 }

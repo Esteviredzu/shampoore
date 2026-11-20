@@ -45,6 +45,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (Node, error) {
 	if n.GeneratedSecrets == nil {
 		n.GeneratedSecrets = map[string]string{}
 	}
+	hydrateNodeView(&n)
 	return n, nil
 }
 
@@ -98,6 +99,9 @@ func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
 	if err := validateNode(&n); err != nil {
 		return Node{}, err
 	}
+	if err := applyRequestedSecrets(&n); err != nil {
+		return Node{}, err
+	}
 	if err := ensureSecrets(&n); err != nil {
 		return Node{}, err
 	}
@@ -129,6 +133,7 @@ func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
 		return Node{}, fmt.Errorf("panelstore: create node id: %w", err)
 	}
 	n.ID = id
+	hydrateNodeView(&n)
 	return n, nil
 }
 
@@ -210,6 +215,9 @@ func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	if err := validateNode(&n); err != nil {
 		return Node{}, err
 	}
+	if err := applyRequestedSecrets(&n); err != nil {
+		return Node{}, err
+	}
 	if err := ensureSecrets(&n); err != nil {
 		return Node{}, err
 	}
@@ -241,12 +249,16 @@ func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	if affected == 0 {
 		return Node{}, fmt.Errorf("%w: node %d", ErrNotFound, n.ID)
 	}
+	hydrateNodeView(&n)
 	return n, nil
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.pruneDependentMultiRoutes(ctx, id); err != nil {
+		return err
+	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
 	if err != nil {
 		return wrapDBErr(err, "delete node")
@@ -254,6 +266,66 @@ func (s *Store) DeleteNode(ctx context.Context, id int64) error {
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("%w: node %d", ErrNotFound, id)
+	}
+	return nil
+}
+
+func (s *Store) pruneDependentMultiRoutes(ctx context.Context, nodeID int64) error {
+	childIDs := make(map[int64]struct{})
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM routes WHERE entry_node_id = ? OR exit_node_id = ?`, nodeID, nodeID)
+	if err != nil {
+		return wrapDBErr(err, "list node routes")
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return wrapDBErr(err, "scan node route")
+		}
+		childIDs[id] = struct{}{}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return wrapDBErr(err, "list node routes")
+	}
+	if len(childIDs) == 0 {
+		return nil
+	}
+
+	multiRows, err := s.db.QueryContext(ctx, `SELECT id, sub_route_ids_json FROM routes WHERE transport_type = ?`, TransportMulti)
+	if err != nil {
+		return wrapDBErr(err, "list multi routes")
+	}
+	var stale []int64
+	for multiRows.Next() {
+		var id int64
+		var raw string
+		if err := multiRows.Scan(&id, &raw); err != nil {
+			multiRows.Close()
+			return wrapDBErr(err, "scan multi route")
+		}
+		ids, err := decodeRouteIDs(raw)
+		if err != nil {
+			multiRows.Close()
+			return err
+		}
+		for _, childID := range ids {
+			if _, ok := childIDs[childID]; ok {
+				stale = append(stale, id)
+				break
+			}
+		}
+	}
+	err = multiRows.Err()
+	multiRows.Close()
+	if err != nil {
+		return wrapDBErr(err, "list multi routes")
+	}
+	for _, id := range stale {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM routes WHERE id = ?`, id); err != nil {
+			return wrapDBErr(err, "delete stale multi route")
+		}
 	}
 	return nil
 }

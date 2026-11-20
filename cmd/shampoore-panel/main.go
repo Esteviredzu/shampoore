@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 	"github.com/Esteviredzu/shampoore/internal/provisioner"
+	"github.com/Esteviredzu/shampoore/internal/version"
 	"github.com/Esteviredzu/shampoore/panel"
 
 	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
@@ -41,13 +43,23 @@ func main() {
 		"start shampoore-server automatically on panel launch (useful under systemd)")
 	cleanupAllNodes := flag.Bool("cleanup-all-nodes", false,
 		"clean up every server stored in the panel database via SSH and exit (used by uninstall --purge)")
+	showVersion := flag.Bool("version", false, "print the panel version and exit")
+	updateRepo := flag.String("update-repo", envDefault("SHAMPOORE_UPDATE_REPO", panel.DefaultUpdateRepo),
+		"GitHub repository (owner/name) used for panel self-updates")
 	flag.Parse()
 
 	logger := logging.New("panel", true)
 
+	if *showVersion {
+		fmt.Println("shampoore-panel", version.Current())
+		return
+	}
+
 	if *cleanupAllNodes {
 		os.Exit(runCleanupAllNodes(*dbPath, *publicURL, logger))
 	}
+
+	logger.Info("panel: starting version ", version.Current())
 
 	if err := panel.ValidateAdminListen(*listen, *allowPublicAdmin); err != nil {
 		logger.Error(err)
@@ -85,6 +97,11 @@ func main() {
 		store *panelstore.Store
 		prov  *provisioner.Provisioner
 		opts  []panel.Option
+	)
+	opts = append(opts,
+		panel.WithPanelVersion(version.Current()),
+		panel.WithUpdateRepo(*updateRepo),
+		panel.WithUpdateToken(os.Getenv("SHAMPOORE_GITHUB_TOKEN")),
 	)
 	if strings.TrimSpace(*dbPath) != "" {
 		store, err = panelstore.Open(ctx, *dbPath)
@@ -281,6 +298,13 @@ func cleanupNodes(ctx context.Context, nodes []panelstore.Node, cleaner nodeClea
 		logger.Info("panel: node ", node.ID, " (", node.Name, ") cleaned up")
 	}
 	return ok, failed
+}
+
+func envDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func guessPublicURL(listen string) string {
