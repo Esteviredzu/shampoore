@@ -21,6 +21,8 @@ func (a *API) registerControlPlane(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/nodes/{id}", a.updateNode)
 	mux.HandleFunc("DELETE /api/nodes/{id}", a.deleteNode)
 	mux.HandleFunc("POST /api/nodes/{id}/deploy", a.deployNode)
+	mux.HandleFunc("POST /api/nodes/{id}/start", a.startNode)
+	mux.HandleFunc("POST /api/nodes/{id}/stop", a.stopNode)
 
 	mux.HandleFunc("GET /api/routes", a.listRoutes)
 	mux.HandleFunc("POST /api/routes", a.createRoute)
@@ -269,6 +271,74 @@ func (a *API) deployNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.syncLocalCaddy(context.Background())
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *API) startNode(w http.ResponseWriter, r *http.Request) {
+	a.setNodeRunning(w, r, true)
+}
+
+func (a *API) stopNode(w http.ResponseWriter, r *http.Request) {
+	a.setNodeRunning(w, r, false)
+}
+
+func (a *API) setNodeRunning(w http.ResponseWriter, r *http.Request, running bool) {
+	if a.provisioner == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("provisioner is not configured"))
+		return
+	}
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	node, err := a.store.GetNode(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if node.Status == panelstore.NodeStatusNew {
+		writeErr(w, http.StatusConflict, fmt.Errorf("node %q is not deployed yet", node.Name))
+		return
+	}
+
+	a.deployMu.Lock()
+	if _, busy := a.deploying[id]; busy {
+		a.deployMu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Errorf("node %d is busy; wait for the current operation to finish", id))
+		return
+	}
+	a.deploying[id] = struct{}{}
+	a.deployMu.Unlock()
+	defer func() {
+		a.deployMu.Lock()
+		delete(a.deploying, id)
+		a.deployMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	result, err := a.provisioner.SetNodeRunning(ctx, node, running)
+
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer statusCancel()
+	if err != nil {
+		_ = a.store.SetNodeStatus(statusCtx, id, node.Status, err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   err.Error(),
+			"service": result,
+		})
+		return
+	}
+
+	status := panelstore.NodeStatusDeployed
+	if !running {
+		status = panelstore.NodeStatusStopped
+	}
+	if err := a.store.SetNodeStatus(statusCtx, id, status, ""); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 

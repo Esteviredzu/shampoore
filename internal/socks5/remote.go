@@ -16,7 +16,13 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 )
 
-const remoteResolveTimeout = 10 * time.Second
+const (
+	remoteResolveTimeout = 10 * time.Second
+
+	remoteProbeExit       = "exit"
+	remoteProbeReply      = "ok\n"
+	remoteProbeMinSpacing = 100 * time.Millisecond
+)
 
 func dialTCP(ctx context.Context, target string, ipv4Only bool, upstream string) (net.Conn, error) {
 	if upstream != "" {
@@ -64,6 +70,9 @@ type RemoteHandler struct {
 
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
+
+	probeMu   sync.Mutex
+	lastProbe time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -307,9 +316,37 @@ func (s *RemoteHandler) closeStream(stream multiplexing.Stream) {
 	}
 }
 
+func (s *RemoteHandler) handleProbe(stream multiplexing.Stream, probe string) {
+	defer s.closeStream(stream)
+
+	if probe != remoteProbeExit {
+		s.logger.Warn("remote: ", stream.ID(), " unknown probe ", probe)
+		return
+	}
+
+	s.probeMu.Lock()
+	now := time.Now()
+	if !s.lastProbe.IsZero() && now.Sub(s.lastProbe) < remoteProbeMinSpacing {
+		s.probeMu.Unlock()
+		s.logger.Debug("remote: ", stream.ID(), " probe rate limited")
+		return
+	}
+	s.lastProbe = now
+	s.probeMu.Unlock()
+
+	if _, err := stream.Write([]byte(remoteProbeReply)); err != nil {
+		s.logger.Warn("remote: ", stream.ID(), " probe write: ", err)
+	}
+}
+
 func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 	streamID := stream.ID()
 	meta := stream.Metadata()
+
+	if probe, _ := meta["probe"].(string); probe != "" {
+		s.handleProbe(stream, probe)
+		return
+	}
 
 	host, _ := meta["host"].(string)
 

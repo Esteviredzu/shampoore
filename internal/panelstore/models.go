@@ -24,6 +24,7 @@ const (
 	NodeStatusDeploying = "deploying"
 	NodeStatusDeployed  = "deployed"
 	NodeStatusOnline    = "online"
+	NodeStatusStopped   = "stopped"
 	NodeStatusError     = "error"
 )
 

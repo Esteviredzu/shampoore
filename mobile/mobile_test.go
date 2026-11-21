@@ -145,6 +145,9 @@ func resetMobileState(t *testing.T) {
 	done = nil
 	currentRuntime = nil
 	stateListener = nil
+	tunnelHealth = HealthStatus{}
+	healthError = false
+	healthCtl = nil
 	stateMu.Unlock()
 
 	statsMu.Lock()
@@ -157,6 +160,13 @@ func resetMobileState(t *testing.T) {
 	globalFilter = nil
 	rulesDirPath = ""
 	filterMu.Unlock()
+
+	healthProbeTimeout = 3 * time.Second
+	healthFailureLimit = 3
+	healthRetryInitial = time.Second
+	healthFailureCooldown = 5 * time.Second
+	healthNoInternetGrace = 30 * time.Second
+	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error { return nil }
 
 	startTUNFD = runtime.StartTUNFD
 }
@@ -233,6 +243,16 @@ func TestStateMachineStartStopNotifiesListener(t *testing.T) {
 	})
 	startTUNFD = runFakeTUN
 
+	release := make(chan struct{})
+	exitProbe = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	listener := newRecordingListener()
 	SetStateListener(listener)
 	t.Cleanup(func() { SetStateListener(nil) })
@@ -240,14 +260,20 @@ func TestStateMachineStartStopNotifiesListener(t *testing.T) {
 	if got := StartClientVPN(testSource, 0, 1500); got != "" {
 		t.Fatalf("StartClientVPN returned %q", got)
 	}
-	if GetState() != StateRunning {
-		t.Fatalf("expected running, got %q", GetState())
+	if GetState() != StateConnecting {
+		t.Fatalf("expected connecting, got %q", GetState())
 	}
+	if !listener.has(StateConnecting) {
+		t.Fatal("listener did not observe connecting")
+	}
+
+	close(release)
+	waitForState(t, StateRunning, 2*time.Second)
 
 	StopClient()
 	waitForState(t, StateIdle, 3*time.Second)
 
-	for _, want := range []string{StateStarting, StateRunning, StateStopping, StateIdle} {
+	for _, want := range []string{StateStarting, StateConnecting, StateRunning, StateStopping, StateIdle} {
 		if !listener.has(want) {
 			t.Fatalf("listener did not observe %q", want)
 		}

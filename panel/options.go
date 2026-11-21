@@ -15,6 +15,7 @@ type Option func(*API)
 type NodeDeployer interface {
 	DeployNode(ctx context.Context, node panelstore.Node) (*provisioner.DeployResult, error)
 	CleanupNode(ctx context.Context, node panelstore.Node) (*provisioner.CleanupResult, error)
+	SetNodeRunning(ctx context.Context, node panelstore.Node, running bool) (*provisioner.ServiceResult, error)
 }
 
 func WithStore(store *panelstore.Store) Option {

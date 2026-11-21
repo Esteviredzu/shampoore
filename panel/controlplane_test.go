@@ -20,11 +20,14 @@ type fakeDeployer struct {
 	mu           sync.Mutex
 	calls        int
 	cleanupCalls int
+	serviceCalls int
+	lastRunning  bool
 	started      chan struct{}
 	block        chan struct{}
 	once         sync.Once
 	err          error
 	cleanupErr   error
+	serviceErr   error
 }
 
 func (f *fakeDeployer) CleanupNode(_ context.Context, node panelstore.Node) (*provisioner.CleanupResult, error) {
@@ -55,6 +58,21 @@ func (f *fakeDeployer) DeployNode(_ context.Context, node panelstore.Node) (*pro
 		return &provisioner.DeployResult{NodeID: node.ID, Steps: []provisioner.Step{{Name: "fake", Error: f.err.Error()}}}, f.err
 	}
 	return &provisioner.DeployResult{NodeID: node.ID, Success: true, Steps: []provisioner.Step{{Name: "fake", Output: "ok"}}}, nil
+}
+
+func (f *fakeDeployer) SetNodeRunning(_ context.Context, node panelstore.Node, running bool) (*provisioner.ServiceResult, error) {
+	f.mu.Lock()
+	f.serviceCalls++
+	f.lastRunning = running
+	err := f.serviceErr
+	f.mu.Unlock()
+	result := &provisioner.ServiceResult{NodeID: node.ID, Running: running, Success: err == nil}
+	if err != nil {
+		result.Steps = []provisioner.Step{{Name: "fake service", Error: err.Error()}}
+		return result, err
+	}
+	result.Steps = []provisioner.Step{{Name: "fake service", Output: "ok"}}
+	return result, nil
 }
 
 func newControlTestAPI(t *testing.T) (*API, *panelstore.Store, *fakeDeployer, string) {
@@ -173,6 +191,60 @@ func TestControlPlaneNodeRouteUserCRUD(t *testing.T) {
 	}
 	if _, err := store.GetRoute(context.Background(), route.ID); err == nil {
 		t.Fatal("route still exists after delete")
+	}
+}
+
+func TestNodeServiceToggleUpdatesStatus(t *testing.T) {
+	api, store, deployer, _ := newControlTestAPI(t)
+	h := api.Handler()
+
+	rec := perform(h, http.MethodPost, "/api/nodes", `{"name":"relay","ssh_host":"203.0.113.1","is_relay":true,"transports":[{"type":"raw_ws","domain":"ws.example.com","enabled":true}]}`, authRequest())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create node = %d: %s", rec.Code, rec.Body.String())
+	}
+	var node panelstore.Node
+	_ = json.Unmarshal(rec.Body.Bytes(), &node)
+
+	rec = perform(h, http.MethodPost, "/api/nodes/"+itoa(node.ID)+"/deploy", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deploy = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = perform(h, http.MethodPost, "/api/nodes/"+itoa(node.ID)+"/stop", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop services = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result provisioner.ServiceResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode stop result: %v", err)
+	}
+	if result.Running || !result.Success {
+		t.Fatalf("stop result = %+v", result)
+	}
+	got, err := store.GetNode(context.Background(), node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if got.Status != panelstore.NodeStatusStopped {
+		t.Fatalf("status after stop = %q, want %q", got.Status, panelstore.NodeStatusStopped)
+	}
+	if deployer.serviceCalls != 1 || deployer.lastRunning {
+		t.Fatalf("service calls = %d lastRunning=%v", deployer.serviceCalls, deployer.lastRunning)
+	}
+
+	rec = perform(h, http.MethodPost, "/api/nodes/"+itoa(node.ID)+"/start", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start services = %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err = store.GetNode(context.Background(), node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if got.Status != panelstore.NodeStatusDeployed {
+		t.Fatalf("status after start = %q, want %q", got.Status, panelstore.NodeStatusDeployed)
+	}
+	if deployer.serviceCalls != 2 || !deployer.lastRunning {
+		t.Fatalf("service calls = %d lastRunning=%v", deployer.serviceCalls, deployer.lastRunning)
 	}
 }
 

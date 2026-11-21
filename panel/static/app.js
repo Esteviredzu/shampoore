@@ -287,7 +287,6 @@ window.changeLanguage = async (lang) => {
   if (label) label.textContent = { en: 'English', ru: 'Русский', eo: 'Esperanto' }[lang] || lang;
   await loadLang(lang);
   applyLang();
-  renderServerBar();
   setUpdateBadge(fleet.update);
   // Re-render the active view right away from cached data, so switching the
   // language does not wait for any background refresh.
@@ -330,56 +329,11 @@ async function load() {
     const sst = await api('/api/server/status');
     state.serverRunning = sst.running;
     state.configs = (await api('/api/configs')) || [];
-    renderServerBar();
     render();
   } catch (e) {
     state.serverRunning = false;
-    renderServerBar();
+    render();
   }
-}
-
-function renderServerBar() {
-  const bar = document.getElementById('server-bar');
-  if (!bar) return;
-  const running = state.serverRunning;
-  const label = running ? t('server.running') : t('server.stopped');
-  const logsBtn = `<button class="btn btn--tonal btn--compact" type="button" title="${esc(t('server.logs'))}" onclick="openServerLogs()"><span class="material-symbols-rounded">terminal</span><span class="server-control__btn-label">${esc(t('actions.logs'))}</span></button>`;
-  const actionBtn = running
-    ? `<button class="btn btn--danger btn--compact" type="button" title="${esc(t('server.stop'))}" onclick="stopServer()"><span class="material-symbols-rounded">power_settings_new</span><span class="server-control__btn-label">${esc(t('server.stopShort'))}</span></button>`
-    : `<button class="btn btn--success btn--compact" type="button" title="${esc(t('server.start'))}" onclick="startServer()"><span class="material-symbols-rounded">power_settings_new</span><span class="server-control__btn-label">${esc(t('server.startShort'))}</span></button>`;
-  bar.innerHTML = `
-    <div class="server-control__status">
-      <span class="status-dot ${running ? 'online' : ''}"></span>
-      <span class="server-control__label">${esc(label)}</span>
-    </div>
-    <div class="server-control__actions">${logsBtn}${actionBtn}</div>
-  `;
-}
-
-async function startServer() {
-  try {
-    await api('/api/server/start', { method: 'POST' });
-    state.serverRunning = true;
-    renderServerBar();
-    toast(t('toast.serverStarted'));
-    await loadActiveView();
-    render();
-  } catch (e) { toast(e.message, 'error'); }
-}
-async function stopServer() {
-  if (!confirm(t('server.confirmStop'))) return;
-  try {
-    await api('/api/server/stop', { method: 'POST' });
-    state.serverRunning = false;
-    renderServerBar();
-    toast(t('toast.serverStopped'));
-    await loadActiveView();
-    render();
-  } catch (e) { toast(e.message, 'error'); }
-}
-async function openServerLogs() {
-  const d = await api('/api/server/logs?limit=1000');
-  openModal({ title: t('actions.logs'), body: `<div class="logs">${esc((d.lines || []).join('\n'))}</div>` });
 }
 
 function render() {
@@ -1521,6 +1475,7 @@ function relativeTime(value) {
 function nodeStatusText(node) {
   const status = node.status || 'new';
   if (status === 'deploying') return t('nodes.statusDeploying');
+  if (status === 'stopped') return t('nodes.statusStopped');
   if (status === 'error') return t('nodes.statusError');
   if (status === 'deployed' || status === 'online') {
     const rel = relativeTime(node.updated_at);
@@ -1725,7 +1680,19 @@ function networkSubscriptionsEnabled() {
 }
 
 function statusClass(status) {
-  return ['new', 'deploying', 'deployed', 'online', 'error'].includes(status) ? status : 'new';
+  return ['new', 'deploying', 'deployed', 'online', 'stopped', 'error'].includes(status) ? status : 'new';
+}
+
+function nodeServicesRunning(node) {
+  return node.status === 'deployed' || node.status === 'online';
+}
+
+function nodeServicesLabel(node) {
+  if (nodeServicesRunning(node)) return t('nodes.servicesOn');
+  if (node.status === 'stopped') return t('nodes.servicesOff');
+  if (node.status === 'new') return t('nodes.servicesNotDeployed');
+  if (node.status === 'deploying') return t('nodes.servicesBusy');
+  return t('nodes.servicesUnknown');
 }
 
 function renderNodes() {
@@ -1742,6 +1709,8 @@ function renderNodes() {
     ).join('');
     const transports = exitOnly ? '' : (transportChips || `<span class="transport-chip muted">${esc(t('nodes.noTransports'))}</span>`);
     const deployed = node.status === 'deployed' || node.status === 'online';
+    const servicesRunning = nodeServicesRunning(node);
+    const canToggleServices = node.status !== 'new' && node.status !== 'deploying';
     return `
       <article class="node-card" data-node-id="${escAttr(node.id)}">
         <div class="node-card__header">
@@ -1757,6 +1726,14 @@ function renderNodes() {
         ${exitOnly ? '' : `<div class="transport-list">${transports}</div>`}
         ${node.last_error ? `<div class="card__error">${esc(node.last_error)}</div>` : ''}
         <div class="node-card__footer">
+          <label class="switch-wrapper" title="${esc(t('nodes.toggleServices'))}">
+            <span class="switch">
+              <input type="checkbox" ${servicesRunning ? 'checked' : ''} ${canToggleServices ? '' : 'disabled'}
+                     onchange="fleetToggleNodeServices(${node.id}, this.checked)">
+              <span class="slider"></span>
+            </span>
+            <span>${esc(nodeServicesLabel(node))}</span>
+          </label>
           <button class="btn btn--filled btn--compact" type="button" onclick="fleetDeployNode(${node.id})">
             <span class="material-symbols-rounded">rocket_launch</span>${esc(deployed ? t('nodes.redeploy') : t('nodes.deploy'))}
           </button>
@@ -1769,6 +1746,30 @@ function renderNodes() {
         </div>
       </article>`;
   }).join('');
+}
+
+async function fleetToggleNodeServices(id, running) {
+  const node = fleet.nodes.find(n => n.id === id);
+  const name = node ? node.name : String(id);
+  if (!running && !confirm(t('nodes.confirmStopServices').replace('{name}', name))) {
+    await loadActiveView();
+    return;
+  }
+  try {
+    const result = await api(`/api/nodes/${encodeURIComponent(id)}/${running ? 'start' : 'stop'}`, { method: 'POST' });
+    toast(t(running ? 'toast.nodeStarted' : 'toast.nodeStopped'), 'success');
+    if (result && !result.success) {
+      const dialog = openModal({ title: name, body: '' });
+      renderDeployResult(dialog, result);
+    }
+  } catch (e) {
+    toast(e.message, 'error');
+    if (e.payload && e.payload.service) {
+      const dialog = openModal({ title: name, body: '' });
+      renderDeployResult(dialog, e.payload.service);
+    }
+  }
+  await loadActiveView();
 }
 
 async function fleetDeleteNode(id) {

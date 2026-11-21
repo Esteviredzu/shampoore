@@ -29,11 +29,12 @@ import (
 )
 
 const (
-	StateIdle     = "idle"
-	StateStarting = "starting"
-	StateRunning  = "running"
-	StateStopping = "stopping"
-	StateError    = "error"
+	StateIdle       = "idle"
+	StateStarting   = "starting"
+	StateConnecting = "connecting"
+	StateRunning    = "running"
+	StateStopping   = "stopping"
+	StateError      = "error"
 )
 
 type StateListener interface {
@@ -50,6 +51,10 @@ var (
 	done           chan struct{}
 	currentRuntime *app.Runtime
 	stateListener  StateListener
+
+	tunnelHealth HealthStatus
+	healthError  bool
+	healthCtl    *healthController
 )
 
 var startTUNFD = runtime.StartTUNFD
@@ -180,6 +185,9 @@ func transitionState(st, msg string) {
 	stateMu.Lock()
 	state = st
 	stateMessage = msg
+	if st == StateStarting {
+		resetHealthLocked()
+	}
 	listener := stateListener
 	stateMu.Unlock()
 	if listener != nil {
@@ -224,40 +232,72 @@ const (
 	runTUN
 )
 
+type clientSession struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	rt         *app.Runtime
+	mux        multiplexing.StreamMultiplexer
+	detachMux  multiplexing.StreamMultiplexer
+	healthCtl  *healthController
+	tunMode    bool
+	tunStopped <-chan struct{}
+	fatalCh    chan error
+	doneCh     chan struct{}
+}
+
 func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
 
 	stateMu.Lock()
 	current := state
+	runtimeAlive := currentRuntime != nil
 	stateMu.Unlock()
 	switch current {
-	case StateStarting, StateRunning, StateStopping:
+	case StateStarting, StateConnecting, StateRunning, StateStopping:
 		return "shampoore: client already running"
+	case StateError:
+		if runtimeAlive {
+			return "shampoore: client already running"
+		}
 	}
 
 	transitionState(StateStarting, "")
-	if err := startLocked(source, mode, vpnFD, vpnMTU); err != nil {
+	sess, err := startLocked(source, mode, vpnFD, vpnMTU)
+	if err != nil {
 		transitionState(StateError, err.Error())
 		return "shampoore: " + err.Error()
 	}
 
-	if !setStateIf(StateStarting, StateRunning, "") {
+	next := StateRunning
+	if sess.tunMode {
+		next = StateConnecting
+	}
+	if !setStateIf(StateStarting, next, "") {
 		stateMu.Lock()
 		msg := stateMessage
 		stateMu.Unlock()
 		if msg == "" {
 			msg = "start aborted"
 		}
+		sess.cancel()
+		go monitorRuntime(sess.ctx, sess.rt, sess.mux, sess.detachMux, sess.tunStopped, sess.fatalCh, sess.doneCh, nil)
 		return "shampoore: " + msg
 	}
+
+	var healthDone <-chan struct{}
+	if sess.tunMode && sess.healthCtl != nil {
+		sess.healthCtl.start()
+		healthDone = sess.healthCtl.done
+	}
+	go monitorRuntime(sess.ctx, sess.rt, sess.mux, sess.detachMux, sess.tunStopped, sess.fatalCh, sess.doneCh, healthDone)
 	return ""
 }
 
-func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
+func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSession, error) {
 	s, err := app.ParseSource(source)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	lg := logging.New("mobile", app.LogLevel == "debug")
 
@@ -270,7 +310,7 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 	rt, err := app.BuildRuntime(ctx, s, "client", lg)
 	if err != nil {
 		cancelFn()
-		return err
+		return nil, err
 	}
 
 	var mux multiplexing.StreamMultiplexer
@@ -288,18 +328,20 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 	}
 
 	if err := mux.Start(ctx); err != nil {
-		cleanupRuntime(rt, mux, nil)
+		cleanupRuntime(rt, mux, nil, nil)
 		cancelFn()
-		return err
+		return nil, err
 	}
 	if err := rt.Start(ctx); err != nil {
-		cleanupRuntime(rt, mux, nil)
+		cleanupRuntime(rt, mux, nil, nil)
 		cancelFn()
-		return err
+		return nil, err
 	}
 
 	fatalCh := make(chan error, 1)
 	var tunDone <-chan error
+	var detachMux multiplexing.StreamMultiplexer
+	var newHealthCtl *healthController
 
 	switch mode {
 	case runSocks5:
@@ -316,21 +358,28 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		}()
 
 	case runTUN:
-		runtime.AttachMuxForTUN(mux)
+		observer := newHealthObserver(healthFailureLimit)
+		ctl := newHealthController(ctx, rt, mux)
+		observer.attach(ctl)
+		tunMux := newHealthMux(mux, observer)
+		detachMux = tunMux
+		newHealthCtl = ctl
+
+		runtime.AttachMuxForTUN(tunMux)
 		runtime.AttachFilterForTUN(filter)
 		stopped, err := startTUNFD(ctx, vpnFD, vpnMTU)
 		if err != nil {
-			runtime.DetachMuxForTUN(mux)
-			cleanupRuntime(rt, mux, nil)
+			runtime.DetachMuxForTUN(tunMux)
+			cleanupRuntime(rt, mux, nil, nil)
 			cancelFn()
-			return fmt.Errorf("mobile: start TUN: %w", err)
+			return nil, fmt.Errorf("mobile: start TUN: %w", err)
 		}
 		tunDone = stopped
 
 	default:
-		cleanupRuntime(rt, mux, nil)
+		cleanupRuntime(rt, mux, nil, nil)
 		cancelFn()
-		return fmt.Errorf("mobile: unknown run mode %d", mode)
+		return nil, fmt.Errorf("mobile: unknown run mode %d", mode)
 	}
 
 	statsMu.Lock()
@@ -351,8 +400,18 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) error {
 		tunStopped = watchTUN(ctx, tunDone, fatalCh)
 	}
 
-	go monitorRuntime(ctx, rt, mux, tunStopped, fatalCh, doneCh)
-	return nil
+	return &clientSession{
+		ctx:        ctx,
+		cancel:     cancelFn,
+		rt:         rt,
+		mux:        mux,
+		detachMux:  detachMux,
+		healthCtl:  newHealthCtl,
+		tunMode:    mode == runTUN,
+		tunStopped: tunStopped,
+		fatalCh:    fatalCh,
+		doneCh:     doneCh,
+	}, nil
 }
 
 func watchTUN(ctx context.Context, tunDone <-chan error, fatalCh chan<- error) <-chan struct{} {
@@ -374,7 +433,7 @@ func watchTUN(ctx context.Context, tunDone <-chan error, fatalCh chan<- error) <
 	return stopped
 }
 
-func cleanupRuntime(rt *app.Runtime, mux multiplexing.StreamMultiplexer, tunStopped <-chan struct{}) {
+func cleanupRuntime(rt *app.Runtime, mux, detachMux multiplexing.StreamMultiplexer, tunStopped <-chan struct{}) {
 	if tunStopped != nil {
 		select {
 		case <-tunStopped:
@@ -393,7 +452,13 @@ func cleanupRuntime(rt *app.Runtime, mux multiplexing.StreamMultiplexer, tunStop
 		if err := mux.Stop(stopCtx); err != nil {
 			log.Printf("mobile: stop mux: %v", err)
 		}
-		runtime.DetachMuxForTUN(mux)
+	}
+	detach := detachMux
+	if detach == nil {
+		detach = mux
+	}
+	if detach != nil {
+		runtime.DetachMuxForTUN(detach)
 	}
 
 	statsMu.Lock()
@@ -407,9 +472,11 @@ func monitorRuntime(
 	ctx context.Context,
 	rt *app.Runtime,
 	mux multiplexing.StreamMultiplexer,
+	detachMux multiplexing.StreamMultiplexer,
 	tunStopped <-chan struct{},
 	fatalCh <-chan error,
 	doneCh chan struct{},
+	healthDone <-chan struct{},
 ) {
 	var fatalErr error
 	select {
@@ -424,7 +491,13 @@ func monitorRuntime(
 		<-ctx.Done()
 	}
 
-	cleanupRuntime(rt, mux, tunStopped)
+	cleanupRuntime(rt, mux, detachMux, tunStopped)
+	if healthDone != nil {
+		select {
+		case <-healthDone:
+		case <-time.After(5 * time.Second):
+		}
+	}
 
 	stateMu.Lock()
 	prev := state
@@ -442,6 +515,7 @@ func monitorRuntime(
 	currentRuntime = nil
 	cancel = nil
 	done = nil
+	resetHealthLocked()
 	next := state
 	msg := stateMessage
 	listener := stateListener
@@ -475,14 +549,17 @@ func StopClient() {
 		stateMu.Unlock()
 		return
 	case StateError:
-		state = StateIdle
-		stateMessage = ""
-		listener := stateListener
-		stateMu.Unlock()
-		if listener != nil {
-			listener.OnStateChanged(StateIdle, "")
+		if currentRuntime == nil && cancel == nil {
+			state = StateIdle
+			stateMessage = ""
+			resetHealthLocked()
+			listener := stateListener
+			stateMu.Unlock()
+			if listener != nil {
+				listener.OnStateChanged(StateIdle, "")
+			}
+			return
 		}
-		return
 	case StateStopping:
 		d := done
 		stateMu.Unlock()
@@ -509,18 +586,33 @@ func StopClient() {
 func IsRunning() bool {
 	stateMu.Lock()
 	defer stateMu.Unlock()
-	return state == StateRunning || state == StateStarting
+	switch state {
+	case StateStarting, StateConnecting, StateRunning:
+		return true
+	case StateError:
+		return currentRuntime != nil
+	}
+	return false
 }
 
 func NotifyNetworkChanged() {
 	stateMu.Lock()
 	rt := currentRuntime
 	st := state
+	ctl := healthCtl
 	stateMu.Unlock()
-	if rt == nil || st != StateRunning {
+	if rt == nil {
+		return
+	}
+	switch st {
+	case StateConnecting, StateRunning, StateError:
+	default:
 		return
 	}
 	rt.NotifyNetworkChanged()
+	if ctl != nil {
+		ctl.trigger(healthTrigger{})
+	}
 }
 
 type StatsResult struct {

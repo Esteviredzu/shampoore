@@ -85,6 +85,45 @@ func (f *fakeRemote) Upload(_ context.Context, dir string, files []File, _ bool)
 
 func (f *fakeRemote) Close() error { return nil }
 
+func TestSetNodeRunningUsesComposeStopAndUp(t *testing.T) {
+	remote := &fakeRemote{failOnce: map[string]bool{}}
+	p := New(&fakeStore{}, Options{
+		Dial: func(context.Context, panelstore.Node) (Remote, error) { return remote, nil },
+	})
+	node := panelstore.Node{ID: 2, Name: "exit", SSHHost: "198.51.100.2", SSHUser: "root", SSHPort: 22}
+
+	res, err := p.SetNodeRunning(context.Background(), node, false)
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if !res.Success || res.Running {
+		t.Fatalf("stop result = %+v", res)
+	}
+	if !commandContains(remote.commands, "docker-compose.yml stop") {
+		t.Fatalf("stop command not issued: %v", remote.commands)
+	}
+
+	res, err = p.SetNodeRunning(context.Background(), node, true)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !res.Success || !res.Running {
+		t.Fatalf("start result = %+v", res)
+	}
+	if !commandContains(remote.commands, "docker-compose.yml up -d") {
+		t.Fatalf("start command not issued: %v", remote.commands)
+	}
+}
+
+func commandContains(commands []string, want string) bool {
+	for _, cmd := range commands {
+		if strings.Contains(cmd, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func writeFakeBinaries(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

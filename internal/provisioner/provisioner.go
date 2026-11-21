@@ -413,6 +413,90 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 	return result, nil
 }
 
+type ServiceResult struct {
+	NodeID  int64  `json:"node_id"`
+	Running bool   `json:"running"`
+	Success bool   `json:"success"`
+	Steps   []Step `json:"steps"`
+}
+
+func (p *Provisioner) SetNodeRunning(ctx context.Context, node panelstore.Node, running bool) (*ServiceResult, error) {
+	if p == nil {
+		return nil, errors.New("provisioner: not configured")
+	}
+	if strings.TrimSpace(node.SSHHost) == "" {
+		return nil, fmt.Errorf("provisioner: node %q has no ssh_host", node.Name)
+	}
+
+	result := &ServiceResult{NodeID: node.ID, Running: running}
+	addStep := func(step Step) { result.Steps = append(result.Steps, step) }
+	fail := func(step Step, err error) (*ServiceResult, error) {
+		step.Error = err.Error()
+		addStep(step)
+		result.Success = false
+		return result, err
+	}
+
+	dial := p.opts.Dial
+	if dial == nil {
+		dial = func(ctx context.Context, n panelstore.Node) (Remote, error) {
+			return dialSSH(ctx, n, p.opts.HostKeyCallback)
+		}
+	}
+	remote, err := dial(ctx, node)
+	if err != nil {
+		return fail(Step{Name: "ssh connect", Command: node.SSHHost}, err)
+	}
+	defer remote.Close()
+	addStep(Step{Name: "ssh connect", Output: node.SSHUser + "@" + node.SSHHost})
+
+	sudo := ""
+	if out, err := remote.Run(ctx, "id -u"); err == nil && strings.TrimSpace(out) != "0" {
+		sudo = "sudo -n "
+	}
+
+	checkCmd := sudo + "test -f /opt/shampoore/docker-compose.yml"
+	out, err := remote.Run(ctx, checkCmd)
+	addStep(Step{Name: "check compose file", Command: checkCmd, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "check compose file", Command: checkCmd},
+			errors.New("docker-compose.yml was not found; deploy the node first"))
+	}
+
+	compose := ""
+	if out, err := remote.Run(ctx, sudo+"docker compose version"); err == nil {
+		compose = sudo + "docker compose"
+		addStep(Step{Name: "detect compose", Command: sudo + "docker compose version", Output: strings.TrimSpace(out)})
+	} else if out, err := remote.Run(ctx, sudo+"docker-compose version"); err == nil {
+		compose = sudo + "docker-compose"
+		addStep(Step{Name: "detect compose", Command: sudo + "docker-compose version", Output: strings.TrimSpace(out)})
+	} else {
+		return fail(Step{Name: "detect compose", Command: "docker compose version"}, errors.New("docker compose is not available"))
+	}
+
+	action := "stop"
+	if running {
+		action = "up -d"
+	}
+	cmd := compose + " -f /opt/shampoore/docker-compose.yml " + action
+	out, err = remote.Run(ctx, cmd)
+	addStep(Step{Name: "compose " + action, Command: cmd, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "compose " + action, Command: cmd}, err)
+	}
+
+	psCmd := compose + " -f /opt/shampoore/docker-compose.yml ps"
+	out, err = remote.Run(ctx, psCmd)
+	addStep(Step{Name: "compose ps", Command: psCmd, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "compose ps", Command: psCmd}, err)
+	}
+
+	result.Success = true
+	p.logf("provisioner: node %d services running=%v", node.ID, running)
+	return result, nil
+}
+
 func hasEnabledTransport(node panelstore.Node, kind string) bool {
 	for _, tr := range node.Transports {
 		if tr.Enabled && tr.Type == kind {
