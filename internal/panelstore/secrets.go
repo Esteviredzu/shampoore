@@ -6,26 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+
+	"github.com/Esteviredzu/shampoore/internal/capability"
 )
-
-var editableSecretKeys = []string{
-	"encryption_password",
-	"raw_ws_password",
-	"livekit_api_key",
-	"livekit_api_secret",
-	"minio_root_user",
-	"minio_root_password",
-	"s3_bucket",
-}
-
-func editableSecret(key string) bool {
-	for _, candidate := range editableSecretKeys {
-		if key == candidate {
-			return true
-		}
-	}
-	return false
-}
 
 func randomHex(n int) (string, error) {
 	buf := make([]byte, n)
@@ -58,46 +41,74 @@ func validateSecretValue(key, value string) error {
 	return nil
 }
 
-func applyRequestedSecrets(n *Node) error {
+func generateSecret(gen capability.SecretGenerator) (string, error) {
+	switch gen.Kind {
+	case "literal":
+		return gen.Prefix, nil
+	case "base64":
+		value, err := randomBase64(gen.Bytes)
+		if err != nil {
+			return "", err
+		}
+		return gen.Prefix + value, nil
+	case "hex", "":
+		value, err := randomHex(gen.Bytes)
+		if err != nil {
+			return "", err
+		}
+		return gen.Prefix + value, nil
+	default:
+		value, err := randomHex(24)
+		if err != nil {
+			return "", err
+		}
+		return gen.Prefix + value, nil
+	}
+}
+
+func applyRequestedSecrets(n *Node, policy TransportPolicy) error {
 	if len(n.Secrets) == 0 {
 		return nil
 	}
 	if n.GeneratedSecrets == nil {
 		n.GeneratedSecrets = make(map[string]string)
 	}
+	specs := secretSpecIndex(policy)
 	for rawKey, rawValue := range n.Secrets {
 		key := strings.TrimSpace(rawKey)
-		if !editableSecret(key) {
+		spec, ok := specs[key]
+		if !ok || !spec.Editable || !policy.EditableSecret(key) {
 			return invalidf("node %q: unsupported secret %q", n.Name, rawKey)
 		}
 		if err := validateSecretValue(key, rawValue); err != nil {
 			return fmt.Errorf("node %q: %w", n.Name, err)
 		}
 		n.GeneratedSecrets[key] = rawValue
-		switch key {
-		case "minio_root_user":
-			n.GeneratedSecrets["s3_access_key"] = rawValue
-		case "minio_root_password":
-			n.GeneratedSecrets["s3_secret_key"] = rawValue
+		for _, alias := range spec.Aliases {
+			n.GeneratedSecrets[alias] = rawValue
 		}
 	}
 	return nil
 }
 
-func pickNodeSecrets(gen map[string]string) map[string]string {
-	out := make(map[string]string, len(editableSecretKeys))
-	for _, key := range editableSecretKeys {
-		out[key] = gen[key]
+func pickNodeSecrets(gen map[string]string, policy TransportPolicy) map[string]string {
+	specs := policy.Secrets()
+	out := make(map[string]string, len(specs))
+	for _, spec := range specs {
+		if !spec.Editable {
+			continue
+		}
+		out[spec.Key] = gen[spec.Key]
 	}
 	return out
 }
 
-func hydrateNodeView(n *Node) {
+func hydrateNodeView(n *Node, policy TransportPolicy) {
 	n.EncryptionCipher = EncryptionCipherName
-	n.Secrets = pickNodeSecrets(n.GeneratedSecrets)
+	n.Secrets = pickNodeSecrets(n.GeneratedSecrets, policy)
 }
 
-func ensureSecrets(n *Node) error {
+func ensureSecrets(n *Node, policy TransportPolicy) error {
 	if n.NodeSecret == "" {
 		secret, err := randomHex(32)
 		if err != nil {
@@ -109,44 +120,36 @@ func ensureSecrets(n *Node) error {
 		n.GeneratedSecrets = make(map[string]string)
 	}
 	gen := n.GeneratedSecrets
-
-	needed := []struct {
-		key string
-		gen func() (string, error)
-	}{
-		{"encryption_password", func() (string, error) { return randomHex(32) }},
-		{"raw_ws_password", func() (string, error) { return randomHex(32) }},
-		{"livekit_api_key", func() (string, error) { return randomHex(8) }},
-		{"livekit_api_secret", func() (string, error) { return randomBase64(32) }},
-		{"minio_root_user", func() (string, error) {
-			token, err := randomHex(6)
-			return "shampoore-" + token, err
-		}},
-		{"minio_root_password", func() (string, error) { return randomHex(24) }},
-		{"s3_bucket", func() (string, error) {
-			token, err := randomHex(4)
-			return "shampoore-" + token, err
-		}},
-	}
-	for _, item := range needed {
-		if gen[item.key] != "" {
+	specs := policy.Secrets()
+	for _, spec := range specs {
+		if spec.Key == "" || gen[spec.Key] != "" {
 			continue
 		}
-		value, err := item.gen()
+		value, err := generateSecret(spec.Generator)
 		if err != nil {
 			return err
 		}
-		gen[item.key] = value
+		gen[spec.Key] = value
 	}
-	if gen["tunnel_id"] == "" {
-		gen["tunnel_id"] = "shampoore"
-	}
-
-	if gen["s3_access_key"] == "" {
-		gen["s3_access_key"] = gen["minio_root_user"]
-	}
-	if gen["s3_secret_key"] == "" {
-		gen["s3_secret_key"] = gen["minio_root_password"]
+	for _, spec := range specs {
+		value := gen[spec.Key]
+		if value == "" {
+			continue
+		}
+		for _, alias := range spec.Aliases {
+			if gen[alias] == "" {
+				gen[alias] = value
+			}
+		}
 	}
 	return nil
+}
+
+func secretSpecIndex(policy TransportPolicy) map[string]capability.SecretSpec {
+	specs := policy.Secrets()
+	out := make(map[string]capability.SecretSpec, len(specs))
+	for _, spec := range specs {
+		out[spec.Key] = spec
+	}
+	return out
 }

@@ -86,43 +86,47 @@ func (p *Provisioner) panelURL(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("provisioner: public URL is not configured; set it in the panel settings first")
 }
 
-func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File, error) {
+func (p *Provisioner) render(ctx context.Context, node panelstore.Node) (RenderResult, error) {
 	if !node.IsRelay && !node.IsExit {
-		return nil, fmt.Errorf("provisioner: node %q has no role", node.Name)
+		return RenderResult{}, fmt.Errorf("provisioner: node %q has no role", node.Name)
 	}
 	panelURL, err := p.panelURL(ctx)
 	if err != nil && node.IsExit {
-		return nil, err
+		return RenderResult{}, err
 	}
 	localRelay := node.IsRelay && IsLocalHost(node.SSHHost, p.opts.LocalHosts)
 	if node.IsRelay && !node.IsExit {
-		return RenderRelay(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
+		return RenderRelayPlan(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
 	}
 	routes, err := p.store.ListRoutesForExit(ctx, node.ID)
 	if err != nil {
-		return nil, err
+		return RenderResult{}, err
 	}
 
 	nodes, err := p.store.ListNode(ctx)
 	if err != nil {
-		return nil, err
+		return RenderResult{}, err
 	}
 	ruleFiles, err := p.exitRuleFiles(ctx, node)
 	if err != nil {
-		return nil, err
+		return RenderResult{}, err
 	}
 	exitFiles, err := RenderExit(node, routes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
 	if err != nil {
-		return nil, err
+		return RenderResult{}, err
 	}
 	if !node.IsRelay {
-		return exitFiles, nil
+		return RenderResult{Files: exitFiles}, nil
 	}
-	relayFiles, err := RenderRelay(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
+	relayResult, err := RenderRelayPlan(node, RenderOptions{PanelURL: panelURL, LocalRelay: localRelay})
 	if err != nil {
-		return nil, err
+		return RenderResult{}, err
 	}
-	return mergeRoleFiles(relayFiles, exitFiles)
+	merged, err := mergeRoleFiles(relayResult.Files, exitFiles)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	return RenderResult{Files: merged, Steps: relayResult.Steps}, nil
 }
 
 const exitRuleStateFile = "rules.state.json"
@@ -261,10 +265,11 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 		return nil, fmt.Errorf("provisioner: node %q has no ssh_host", node.Name)
 	}
 
-	files, err := p.render(ctx, node)
+	rendered, err := p.render(ctx, node)
 	if err != nil {
 		return &DeployResult{NodeID: node.ID, Steps: []Step{{Name: "render", Error: err.Error()}}}, err
 	}
+	files := rendered.Files
 	binaries, err := p.binaryFiles(node)
 	if err != nil {
 		return &DeployResult{NodeID: node.ID, Steps: []Step{{Name: "binaries", Error: err.Error()}}}, err
@@ -381,16 +386,12 @@ func (p *Provisioner) DeployNode(ctx context.Context, node panelstore.Node) (*De
 		return fail(Step{Name: "compose up", Command: upCmd}, err)
 	}
 
-	if hasEnabledTransport(node, panelstore.TransportSilo) {
-		bucket := strings.TrimSpace(node.GeneratedSecrets["s3_bucket"])
-		if bucket == "" {
-			return fail(Step{Name: "create silo bucket"}, errors.New("silo transport is enabled but s3_bucket is empty"))
-		}
-		bucketCmd := sudo + "docker exec shampoore-silo mkdir -p " + shellQuote("/data/"+bucket)
-		out, err = remote.Run(ctx, bucketCmd)
-		addStep(Step{Name: "create silo bucket", Command: bucketCmd, Output: out, Error: errString(err)})
+	for _, step := range rendered.Steps {
+		command := sudo + step.Command
+		out, err = remote.Run(ctx, command)
+		addStep(Step{Name: step.Name, Command: command, Output: out, Error: errString(err)})
 		if err != nil {
-			return fail(Step{Name: "create silo bucket", Command: bucketCmd}, err)
+			return fail(Step{Name: step.Name, Command: command}, err)
 		}
 	}
 
@@ -488,15 +489,6 @@ func (p *Provisioner) SetNodeRunning(ctx context.Context, node panelstore.Node, 
 	result.Success = true
 	p.logf("provisioner: node %d services running=%v", node.ID, running)
 	return result, nil
-}
-
-func hasEnabledTransport(node panelstore.Node, kind string) bool {
-	for _, tr := range node.Transports {
-		if tr.Enabled && tr.Type == kind {
-			return true
-		}
-	}
-	return false
 }
 
 type CleanupResult struct {

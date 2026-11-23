@@ -11,57 +11,14 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    depends_on:{{ if .HasRawWS }}
-      - relay{{ end }}{{ if .HasLiveKit }}
-      - livekit{{ end }}{{ if .HasSilo }}
-      - silo{{ end }}
+    depends_on:
+{{- range .Services }}
+      - {{ .Name }}
+{{- end }}
 {{ end }}
-{{ if .HasRawWS }}
-  relay:
-    image: debian:bookworm-slim
-    restart: unless-stopped
-    command:
-      - /opt/shampoore/bin/shampoore-relay
-      - -listen
-      - ":8787"
-      - -password
-      - "{{ index .Secrets "raw_ws_password" }}"
-      - -decoy-dir
-      - /opt/shampoore/decoy
-    volumes:
-      - ./bin/shampoore-relay:/opt/shampoore/bin/shampoore-relay:ro
-      - ./decoy:/opt/shampoore/decoy:ro
-{{ if .LocalRelay }}    ports:
-      - "127.0.0.1:8787:8787"
-{{ end }}{{ end }}{{ if .HasLiveKit }}
-  livekit:
-    image: livekit/livekit-server:latest
-    restart: unless-stopped
-    command:
-      - --config
-      - /etc/livekit.yaml
-    ports:
-{{ if .LocalRelay }}      - "127.0.0.1:7880:7880"
-{{ end }}      - "7881:7881"
-      - "7882:7882/udp"
-    volumes:
-      - ./livekit.yaml:/etc/livekit.yaml:ro
-{{ end }}{{ if .HasSilo }}
-  silo:
-    image: docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z
-    container_name: shampoore-silo
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: "{{ index .Secrets "minio_root_user" }}"
-      MINIO_ROOT_PASSWORD: "{{ index .Secrets "minio_root_password" }}"
-      MINIO_SERVER_URL: "https://{{ index .Domains "silo" }}"
-      MINIO_BROWSER_REDIRECT_URL: "https://{{ index .Domains "silo" }}/minio/ui/"
-    volumes:
-      - ./silo-data:/data
-{{ if .LocalRelay }}    ports:
-      - "127.0.0.1:9000:9000"
-{{ end }}{{ end }}
+{{- range .Services }}
+{{ printf "%s" .Compose }}
+{{- end }}
 {{ if not .LocalRelay }}volumes:
   caddy_data:
   caddy_config:

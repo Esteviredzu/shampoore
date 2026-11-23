@@ -106,10 +106,10 @@ func parseSubflow(q url.Values) (subflowSpec, error) {
 	if !ok {
 		return spec, fmt.Errorf("unknown transport type %q", spec.Type)
 	}
-	if d.DecodeURL == nil {
+	if d.Caps.Link == nil && d.DecodeURL == nil {
 		return spec, fmt.Errorf("transport type %q does not support URL encoding", spec.Type)
 	}
-	raw, err := d.DecodeURL(transportQ)
+	raw, err := d.DecodeLink(transportQ)
 	if err != nil {
 		return spec, fmt.Errorf("decode %q: %w", spec.Type, err)
 	}
@@ -158,11 +158,11 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 		if !ok {
 			return fmt.Errorf("multipipe: subflow %d: unknown type %q", i, spec.Type)
 		}
-		if d.EncodeURL == nil {
+		if d.Caps.Link == nil && d.EncodeURL == nil {
 			return fmt.Errorf("multipipe: subflow %d: type %q does not support URL encoding", i, spec.Type)
 		}
 		subQ := url.Values{}
-		if err := d.EncodeURL(spec.Transport, subQ); err != nil {
+		if err := d.EncodeLink(spec.Transport, subQ); err != nil {
 			return fmt.Errorf("multipipe: subflow %d: %w", i, err)
 		}
 		for key, vals := range subQ {

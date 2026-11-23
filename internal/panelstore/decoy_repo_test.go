@@ -19,7 +19,7 @@ func TestNormalizeDecoyRepoURL(t *testing.T) {
 		{"https://codeload.github.com/owner/repo/zip/refs/heads/main.zip", "https://codeload.github.com/owner/repo/zip/refs/heads/main.zip"},
 	}
 	for _, tc := range valid {
-		got, err := normalizeDecoyRepoURL(TransportRawWS, tc.in)
+		got, err := normalizeDecoyRepoURL(TransportRawWS, tc.in, LegacyPolicy{})
 		if err != nil {
 			t.Fatalf("normalizeDecoyRepoURL(%q) error: %v", tc.in, err)
 		}
@@ -40,15 +40,15 @@ func TestNormalizeDecoyRepoURL(t *testing.T) {
 		"ftp://github.com/owner/repo",
 	}
 	for _, raw := range invalid {
-		if got, err := normalizeDecoyRepoURL(TransportRawWS, raw); err == nil {
+		if got, err := normalizeDecoyRepoURL(TransportRawWS, raw, LegacyPolicy{}); err == nil {
 			t.Fatalf("normalizeDecoyRepoURL(%q) = %q, want error", raw, got)
 		}
 	}
 
-	if _, err := normalizeDecoyRepoURL(TransportSilo, "https://github.com/owner/repo"); !errors.Is(err, ErrInvalid) {
+	if _, err := normalizeDecoyRepoURL(TransportSilo, "https://github.com/owner/repo", LegacyPolicy{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("silo decoy url error = %v, want ErrInvalid", err)
 	}
-	if _, err := normalizeDecoyRepoURL(TransportLiveKit, "https://github.com/owner/repo"); !errors.Is(err, ErrInvalid) {
+	if _, err := normalizeDecoyRepoURL(TransportLiveKit, "https://github.com/owner/repo", LegacyPolicy{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("livekit decoy url error = %v, want ErrInvalid", err)
 	}
 }

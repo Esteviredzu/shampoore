@@ -69,10 +69,10 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 		return invalidf("route name is too long")
 	}
 	r.TransportType = strings.TrimSpace(r.TransportType)
-	if !validRouteTransport(r.TransportType) {
+	if !s.transportPolicy().Known(r.TransportType) {
 		return invalidf("route %q: unsupported transport type %q", r.Name, r.TransportType)
 	}
-	if r.TransportType == TransportMulti {
+	if s.transportPolicy().IsMulti(r.TransportType) {
 		return s.validateMultiRoute(ctx, r)
 	}
 	r.MultiStrategy = ""
@@ -99,8 +99,9 @@ func (s *Store) validateRoute(ctx context.Context, r *Route) error {
 
 func (s *Store) validateMultiRoute(ctx context.Context, r *Route) error {
 	r.MultiStrategy = strings.TrimSpace(r.MultiStrategy)
-	if !validMultiStrategy(r.MultiStrategy) {
-		return invalidf("route %q: multi_strategy must be %q or %q", r.Name, MultiStrategyBond, MultiStrategyFlowMux)
+	strategies := s.transportPolicy().MultiStrategies(r.TransportType)
+	if !containsString(strategies, r.MultiStrategy) {
+		return invalidf("route %q: multi_strategy %q is not supported by %q", r.Name, r.MultiStrategy, r.TransportType)
 	}
 	r.SubRouteIDs = normalizeRouteIDs(r.SubRouteIDs)
 	if len(r.SubRouteIDs) < 2 {
@@ -115,7 +116,7 @@ func (s *Store) validateMultiRoute(ctx context.Context, r *Route) error {
 		if err != nil {
 			return fmt.Errorf("route %q: sub-route %d: %w", r.Name, id, err)
 		}
-		if child.TransportType == TransportMulti {
+		if s.transportPolicy().IsMulti(child.TransportType) {
 			return invalidf("route %q: sub-route %d is itself a multi-route (recursion is not allowed)", r.Name, id)
 		}
 		if entryID == 0 {
@@ -147,8 +148,8 @@ func (s *Store) routeConflict(ctx context.Context, r Route, excludeID int64) (in
 	return id, nil
 }
 
-func routeConflictErr(r Route, existingID int64) error {
-	if r.TransportType == TransportMulti {
+func (s *Store) routeConflictErr(r Route, existingID int64) error {
+	if s.transportPolicy().IsMulti(r.TransportType) {
 		return fmt.Errorf("%w: multi-route between entry node %d and exit node %d with strategy %q already exists (route %d)",
 			ErrConflict, r.EntryNodeID, r.ExitNodeID, r.MultiStrategy, existingID)
 	}
@@ -165,7 +166,7 @@ func (s *Store) CreateRoute(ctx context.Context, r Route) (Route, error) {
 	if existingID, err := s.routeConflict(ctx, r, 0); err != nil {
 		return Route{}, err
 	} else if existingID != 0 {
-		return Route{}, routeConflictErr(r, existingID)
+		return Route{}, s.routeConflictErr(r, existingID)
 	}
 	subRouteIDsRaw, err := json.Marshal(r.SubRouteIDs)
 	if err != nil {
@@ -252,7 +253,7 @@ func (s *Store) UpdateRoute(ctx context.Context, r Route) (Route, error) {
 	if existingID, err := s.routeConflict(ctx, r, r.ID); err != nil {
 		return Route{}, err
 	} else if existingID != 0 {
-		return Route{}, routeConflictErr(r, existingID)
+		return Route{}, s.routeConflictErr(r, existingID)
 	}
 	subRouteIDsRaw, err := json.Marshal(r.SubRouteIDs)
 	if err != nil {
@@ -295,7 +296,19 @@ func (s *Store) DeleteRoute(ctx context.Context, id int64) error {
 }
 
 func (s *Store) routeUsedByMulti(ctx context.Context, id int64) (Route, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+routeColumns+` FROM routes WHERE transport_type = ?`, TransportMulti)
+	kinds := s.transportPolicy().MultiKinds()
+	if len(kinds) == 0 {
+		return Route{}, false, nil
+	}
+	placeholders := make([]string, len(kinds))
+	args := make([]any, len(kinds))
+	for i, kind := range kinds {
+		placeholders[i] = "?"
+		args[i] = kind
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+routeColumns+` FROM routes WHERE transport_type IN (`+strings.Join(placeholders, ",")+`)`,
+		args...)
 	if err != nil {
 		return Route{}, false, wrapDBErr(err, "list multi routes")
 	}

@@ -144,30 +144,13 @@ type TrafficDelta struct {
 	DownloadBytes int64  `json:"download_bytes"`
 }
 
-func validTransport(kind string) bool {
-	switch kind {
-	case TransportRawWS, TransportSilo, TransportLiveKit:
-		return true
-	default:
-		return false
-	}
-}
-
-func validRouteTransport(kind string) bool {
-	return validTransport(kind) || kind == TransportMulti
-}
-
-func validMultiStrategy(strategy string) bool {
-	return strategy == MultiStrategyBond || strategy == MultiStrategyFlowMux
-}
-
-func normalizeTransports(in []Transport) ([]Transport, error) {
+func normalizeTransports(in []Transport, policy TransportPolicy) ([]Transport, error) {
 	out := make([]Transport, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
 	for _, tr := range in {
 		kind := strings.TrimSpace(tr.Type)
 		domain := strings.TrimSpace(tr.Domain)
-		if !validTransport(kind) {
+		if !policy.Known(kind) {
 			return nil, invalidf("unsupported transport type %q", tr.Type)
 		}
 		if tr.Enabled && domain == "" {
@@ -176,7 +159,7 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 		if _, ok := seen[kind]; ok {
 			return nil, invalidf("duplicate transport type %q", kind)
 		}
-		decoyURL, err := normalizeDecoyRepoURL(kind, tr.DecoyRepoURL)
+		decoyURL, err := normalizeDecoyRepoURL(kind, tr.DecoyRepoURL, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -192,13 +175,13 @@ func normalizeTransports(in []Transport) ([]Transport, error) {
 	return out, nil
 }
 
-func normalizeDecoyRepoURL(kind, raw string) (string, error) {
+func normalizeDecoyRepoURL(kind, raw string, policy TransportPolicy) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", nil
 	}
-	if kind != TransportRawWS {
-		return "", invalidf("decoy repo URL is only supported for transport %q", TransportRawWS)
+	if !policy.AllowsDecoy(kind) {
+		return "", invalidf("decoy repo URL is not supported for transport %q", kind)
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {

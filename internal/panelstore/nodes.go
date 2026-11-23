@@ -14,7 +14,7 @@ const nodeColumns = `id, name, ssh_host, ssh_port, ssh_user, ssh_private_key, ss
 	is_relay, is_exit, transports_json, node_secret, generated_secrets_json,
 	socks_port, status, last_error, updated_at`
 
-func scanNode(scanner interface{ Scan(...any) error }) (Node, error) {
+func scanNode(scanner interface{ Scan(...any) error }, policy TransportPolicy) (Node, error) {
 	var (
 		n               Node
 		isRelay, isExit int
@@ -45,11 +45,11 @@ func scanNode(scanner interface{ Scan(...any) error }) (Node, error) {
 	if n.GeneratedSecrets == nil {
 		n.GeneratedSecrets = map[string]string{}
 	}
-	hydrateNodeView(&n)
+	hydrateNodeView(&n, policy)
 	return n, nil
 }
 
-func validateNode(n *Node) error {
+func (s *Store) validateNode(n *Node) error {
 	n.Name = strings.TrimSpace(n.Name)
 	if n.Name == "" {
 		return invalidf("node name is required")
@@ -81,7 +81,7 @@ func validateNode(n *Node) error {
 	if n.IsRelay && !n.IsExit {
 		n.SocksPort = 0
 	}
-	transports, err := normalizeTransports(n.Transports)
+	transports, err := normalizeTransports(n.Transports, s.transportPolicy())
 	if err != nil {
 		return fmt.Errorf("node %q: %w", n.Name, err)
 	}
@@ -96,13 +96,14 @@ func validateNode(n *Node) error {
 }
 
 func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
-	if err := validateNode(&n); err != nil {
+	policy := s.transportPolicy()
+	if err := s.validateNode(&n); err != nil {
 		return Node{}, err
 	}
-	if err := applyRequestedSecrets(&n); err != nil {
+	if err := applyRequestedSecrets(&n, policy); err != nil {
 		return Node{}, err
 	}
-	if err := ensureSecrets(&n); err != nil {
+	if err := ensureSecrets(&n, policy); err != nil {
 		return Node{}, err
 	}
 	transportsRaw, err := json.Marshal(n.Transports)
@@ -133,13 +134,13 @@ func (s *Store) CreateNode(ctx context.Context, n Node) (Node, error) {
 		return Node{}, fmt.Errorf("panelstore: create node id: %w", err)
 	}
 	n.ID = id
-	hydrateNodeView(&n)
+	hydrateNodeView(&n, policy)
 	return n, nil
 }
 
 func (s *Store) GetNode(ctx context.Context, id int64) (Node, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes WHERE id = ?`, id)
-	n, err := scanNode(row)
+	n, err := scanNode(row, s.transportPolicy())
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, fmt.Errorf("%w: node %d", ErrNotFound, id)
 	}
@@ -155,7 +156,7 @@ func (s *Store) FindNodeBySecret(ctx context.Context, secret string) (Node, erro
 		return Node{}, fmt.Errorf("%w: empty node secret", ErrNotFound)
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes WHERE node_secret = ?`, secret)
-	n, err := scanNode(row)
+	n, err := scanNode(row, s.transportPolicy())
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, fmt.Errorf("%w: node secret", ErrNotFound)
 	}
@@ -173,7 +174,7 @@ func (s *Store) ListNode(ctx context.Context) ([]Node, error) {
 	defer rows.Close()
 	out := []Node{}
 	for rows.Next() {
-		n, err := scanNode(rows)
+		n, err := scanNode(rows, s.transportPolicy())
 		if err != nil {
 			return nil, wrapDBErr(err, "scan node")
 		}
@@ -186,6 +187,7 @@ func (s *Store) ListNode(ctx context.Context) ([]Node, error) {
 }
 
 func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
+	policy := s.transportPolicy()
 	existing, err := s.GetNode(ctx, n.ID)
 	if err != nil {
 		return Node{}, err
@@ -212,13 +214,13 @@ func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	if n.LastError == "" {
 		n.LastError = existing.LastError
 	}
-	if err := validateNode(&n); err != nil {
+	if err := s.validateNode(&n); err != nil {
 		return Node{}, err
 	}
-	if err := applyRequestedSecrets(&n); err != nil {
+	if err := applyRequestedSecrets(&n, policy); err != nil {
 		return Node{}, err
 	}
-	if err := ensureSecrets(&n); err != nil {
+	if err := ensureSecrets(&n, policy); err != nil {
 		return Node{}, err
 	}
 	n.UpdatedAt = time.Now().UTC()
@@ -249,7 +251,7 @@ func (s *Store) UpdateNode(ctx context.Context, n Node) (Node, error) {
 	if affected == 0 {
 		return Node{}, fmt.Errorf("%w: node %d", ErrNotFound, n.ID)
 	}
-	hydrateNodeView(&n)
+	hydrateNodeView(&n, policy)
 	return n, nil
 }
 
@@ -293,7 +295,19 @@ func (s *Store) pruneDependentMultiRoutes(ctx context.Context, nodeID int64) err
 		return nil
 	}
 
-	multiRows, err := s.db.QueryContext(ctx, `SELECT id, sub_route_ids_json FROM routes WHERE transport_type = ?`, TransportMulti)
+	multiKinds := s.transportPolicy().MultiKinds()
+	if len(multiKinds) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(multiKinds))
+	multiArgs := make([]any, len(multiKinds))
+	for i, kind := range multiKinds {
+		placeholders[i] = "?"
+		multiArgs[i] = kind
+	}
+	multiRows, err := s.db.QueryContext(ctx,
+		`SELECT id, sub_route_ids_json FROM routes WHERE transport_type IN (`+strings.Join(placeholders, ",")+`)`,
+		multiArgs...)
 	if err != nil {
 		return wrapDBErr(err, "list multi routes")
 	}

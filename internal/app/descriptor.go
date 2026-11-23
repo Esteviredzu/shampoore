@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -40,21 +41,41 @@ type Builder func(
 ) (*BuildResult, error)
 
 type RouteParams struct {
-	RouteID    int64
-	RouteName  string
+	RouteID   int64
+	RouteName string
+
+	SubRouteID   int64
+	SubRouteName string
+
+	Role RouteRole
+
 	UserID     string
 	ExitNodeID string
 
 	Domain string
 
-	Secrets map[string]string
+	EncryptionPassword string
+	Secrets            map[string]string
+	Advanced           Values
 }
+
+type RouteContext = RouteParams
 
 func (p RouteParams) Secret(key string) string {
 	if p.Secrets == nil {
 		return ""
 	}
 	return p.Secrets[key]
+}
+
+func (p RouteParams) Namespace() string {
+	if p.RouteID > 0 {
+		return "route-" + strconv.FormatInt(p.RouteID, 10)
+	}
+	if name := strings.TrimSpace(p.RouteName); name != "" {
+		return name
+	}
+	return "route"
 }
 
 func MarshalTransportOptions(cfg any, forceEmptyUsers bool) (json.RawMessage, error) {
@@ -82,7 +103,10 @@ type Descriptor struct {
 
 	Fields []Field
 
+	Caps Capabilities
+
 	DecodeURL func(q url.Values) (json.RawMessage, error)
+
 	EncodeURL func(raw json.RawMessage, q url.Values) error
 
 	Validate func(raw json.RawMessage) error
@@ -92,6 +116,8 @@ type Descriptor struct {
 	Build Builder
 
 	Aliases []string
+
+	DefaultRelay bool
 
 	BuildSubscriptionConfig RouteConfigBuilder
 
@@ -118,6 +144,7 @@ func RegisterDescriptor(d Descriptor) error {
 	if d.Defaults == nil {
 		d.Defaults = NewValues()
 	}
+	d = d.adaptLegacyCapabilities()
 
 	descriptorsMu.Lock()
 	defer descriptorsMu.Unlock()

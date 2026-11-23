@@ -1,0 +1,15 @@
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z
+    container_name: shampoore-silo
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "{{ .RootUser }}"
+      MINIO_ROOT_PASSWORD: "{{ .RootPassword }}"
+      MINIO_SERVER_URL: "https://{{ .Domain }}"
+      MINIO_BROWSER_REDIRECT_URL: "https://{{ .Domain }}/minio/ui/"
+    volumes:
+      - ./silo-data:/data
+{{ if .LocalRelay }}    ports:
+      - "127.0.0.1:9000:9000"
+{{ end }}

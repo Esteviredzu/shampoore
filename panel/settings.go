@@ -211,7 +211,7 @@ func (a *API) localCaddySites(ctx context.Context) ([]CaddySite, error) {
 			if !ok {
 				continue
 			}
-			upstream := loopbackUpstream(descriptor.RelayUpstream)
+			upstream := loopbackUpstream(descriptor.RelayUpstreamAddr())
 			if upstream == "" {
 				continue
 			}

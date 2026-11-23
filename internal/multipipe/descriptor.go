@@ -48,6 +48,10 @@ func init() {
 			"mux_flush_ms":        20,
 			"mux_flush_threshold": 12000,
 		},
+		Caps: app.Capabilities{
+			Multi:     composer{},
+			Multiuser: multiuserCaps{},
+		},
 		Validate: validateTransport,
 		Build:    build,
 	})
@@ -376,7 +380,7 @@ func buildOne(
 	if !ok {
 		return outcome{idx: i, err: fmt.Errorf("multipipe: unknown transport type %q", spec.Type)}
 	}
-	if d.Kind == "multi" {
+	if d.Caps.Multi != nil {
 		return outcome{idx: i, err: fmt.Errorf("multipipe: nested multi is not supported")}
 	}
 
@@ -449,7 +453,7 @@ func validateTransport(raw json.RawMessage) error {
 		if !ok {
 			return fmt.Errorf("multipipe: unknown transport type %q", spec.Type)
 		}
-		if d.Kind == "multi" {
+		if d.Caps.Multi != nil {
 			return fmt.Errorf("multipipe: nested multi is not supported")
 		}
 		if err := spec.Advanced.ValidateTypes(); err != nil {

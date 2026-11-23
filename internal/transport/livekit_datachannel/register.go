@@ -12,6 +12,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/auth"
+	"github.com/Esteviredzu/shampoore/internal/capability"
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -84,7 +85,27 @@ func init() {
 				Placeholder: "shampoore",
 			},
 		},
-		Defaults:  defaults,
+		Defaults: defaults,
+		Caps: app.Capabilities{
+			Relay:     relayProvider{},
+			Multiuser: app.MultiuserConfig{},
+			Secrets: app.SecretProviderFunc(func() []capability.SecretSpec {
+				return []capability.SecretSpec{
+					{
+						Key:       "livekit_api_key",
+						Label:     "LiveKit API Key",
+						Generator: capability.SecretGenerator{Kind: "hex", Bytes: 8},
+						Editable:  true,
+					},
+					{
+						Key:       "livekit_api_secret",
+						Label:     "LiveKit API Secret",
+						Generator: capability.SecretGenerator{Kind: "base64", Bytes: 32},
+						Editable:  true,
+					},
+				}
+			}),
+		},
 		DecodeURL: lk.DecodeURL,
 		EncodeURL: lk.EncodeURL,
 		Validate:  validate,

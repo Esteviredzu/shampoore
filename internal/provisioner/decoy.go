@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
@@ -29,7 +30,11 @@ const (
 
 func decoyRepoURL(node panelstore.Node) string {
 	for _, tr := range node.Transports {
-		if tr.Type != panelstore.TransportRawWS || !tr.Enabled {
+		if !tr.Enabled {
+			continue
+		}
+		descriptor, ok := app.DescriptorFor(tr.Type)
+		if !ok || !descriptor.SupportsDecoy() {
 			continue
 		}
 		if raw := strings.TrimSpace(tr.DecoyRepoURL); raw != "" {

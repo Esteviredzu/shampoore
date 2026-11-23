@@ -15,7 +15,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	policy TransportPolicy
 
 	writeMu sync.Mutex
 }
@@ -153,9 +154,54 @@ var migrations = []string{
 	BEGIN
 		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
 	END;`,
+	`DROP TRIGGER IF EXISTS trg_routes_unique_insert;
+	DROP TRIGGER IF EXISTS trg_routes_unique_update;
+	CREATE TABLE routes_new (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		name               TEXT    NOT NULL UNIQUE,
+		entry_node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		exit_node_id       INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		transport_type     TEXT    NOT NULL,
+		multi_strategy     TEXT    NOT NULL DEFAULT '',
+		sub_route_ids_json TEXT    NOT NULL DEFAULT '[]',
+		enabled            INTEGER NOT NULL DEFAULT 1
+	);
+	INSERT INTO routes_new (id, name, entry_node_id, exit_node_id, transport_type, multi_strategy, sub_route_ids_json, enabled)
+		SELECT id, name, entry_node_id, exit_node_id, transport_type, multi_strategy, sub_route_ids_json, enabled FROM routes;
+	DROP TABLE routes;
+	ALTER TABLE routes_new RENAME TO routes;
+	CREATE INDEX IF NOT EXISTS idx_routes_entry ON routes(entry_node_id);
+	CREATE INDEX IF NOT EXISTS idx_routes_exit  ON routes(exit_node_id);
+	CREATE TRIGGER IF NOT EXISTS trg_routes_unique_insert
+	BEFORE INSERT ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+		  AND multi_strategy = NEW.multi_strategy
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;
+	CREATE TRIGGER IF NOT EXISTS trg_routes_unique_update
+	BEFORE UPDATE ON routes
+	FOR EACH ROW
+	WHEN EXISTS (
+		SELECT 1 FROM routes
+		WHERE id <> OLD.id
+		  AND entry_node_id = NEW.entry_node_id
+		  AND exit_node_id = NEW.exit_node_id
+		  AND transport_type = NEW.transport_type
+		  AND multi_strategy = NEW.multi_strategy
+	)
+	BEGIN
+		SELECT RAISE(ABORT, 'UNIQUE constraint failed: routes.entry_node_id, routes.exit_node_id, routes.transport_type');
+	END;`,
 }
 
-func Open(ctx context.Context, path string) (*Store, error) {
+func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("panelstore: database path is empty")
@@ -173,7 +219,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	s := &Store{db: db}
+	s := &Store{db: db, policy: LegacyPolicy{}}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("panelstore: ping: %w", err)

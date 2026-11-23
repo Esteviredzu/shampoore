@@ -13,6 +13,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/control"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
+	"github.com/Esteviredzu/shampoore/internal/panelstore/apppolicy"
 	"github.com/Esteviredzu/shampoore/internal/provisioner"
 )
 
@@ -78,7 +79,8 @@ func (f *fakeDeployer) SetNodeRunning(_ context.Context, node panelstore.Node, r
 func newControlTestAPI(t *testing.T) (*API, *panelstore.Store, *fakeDeployer, string) {
 	t.Helper()
 	dir := t.TempDir()
-	store, err := panelstore.Open(context.Background(), filepath.Join(dir, "panel.db"))
+	store, err := panelstore.Open(context.Background(), filepath.Join(dir, "panel.db"),
+		panelstore.WithTransportPolicy(apppolicy.Policy{}))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

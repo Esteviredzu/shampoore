@@ -11,6 +11,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/auth"
+	"github.com/Esteviredzu/shampoore/internal/capability"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
@@ -82,7 +83,20 @@ func init() {
 				Hint:     "Server only: run one isolated room session per active user",
 			},
 		},
-		Defaults:  defaults,
+		Defaults:     defaults,
+		DefaultRelay: true,
+		Caps: app.Capabilities{
+			Relay:     relayProvider{},
+			Multiuser: app.MultiuserConfig{},
+			Secrets: app.SecretProviderFunc(func() []capability.SecretSpec {
+				return []capability.SecretSpec{{
+					Key:       "raw_ws_password",
+					Label:     "Raw WS Password",
+					Generator: capability.SecretGenerator{Kind: "hex", Bytes: 32},
+					Editable:  true,
+				}}
+			}),
+		},
 		DecodeURL: decodeURL,
 		EncodeURL: encodeURL,
 		Validate:  validate,

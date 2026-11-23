@@ -58,7 +58,7 @@ func ParseURL(raw string) (*Settings, error) {
 	if !ok {
 		return nil, fmt.Errorf("app: unknown transport type %q", kind)
 	}
-	if d.DecodeURL == nil {
+	if d.Caps.Link == nil && d.DecodeURL == nil {
 		return nil, fmt.Errorf("app: transport %q does not support URL parsing", kind)
 	}
 
@@ -87,7 +87,7 @@ func ParseURL(raw string) (*Settings, error) {
 		s.Advanced[realKey] = vals[0]
 	}
 
-	data, err := d.DecodeURL(q)
+	data, err := d.DecodeLink(q)
 	if err != nil {
 		return nil, fmt.Errorf("app: decode transport %q: %w", kind, err)
 	}
@@ -112,7 +112,7 @@ func EncodeURL(s *Settings) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("app: unknown transport type %q", kind)
 	}
-	if d.EncodeURL == nil {
+	if d.Caps.Link == nil && d.EncodeURL == nil {
 		return "", fmt.Errorf("app: transport %q does not support URL encoding", kind)
 	}
 
@@ -128,7 +128,7 @@ func EncodeURL(s *Settings) (string, error) {
 		q.Set("exit_node_id", s.ExitNodeID)
 	}
 
-	if err := d.EncodeURL(s.Transport, q); err != nil {
+	if err := d.EncodeLink(s.Transport, q); err != nil {
 		return "", fmt.Errorf("app: encode transport %q: %w", kind, err)
 	}
 

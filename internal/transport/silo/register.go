@@ -12,6 +12,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/auth"
+	"github.com/Esteviredzu/shampoore/internal/capability"
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
@@ -36,7 +37,35 @@ func init() {
 			{Key: "user_id", Label: "User ID", Type: app.FieldTypeText, Required: false, Hint: "Isolate objects under <tunnel_id>/users/<user_id>/"},
 			{Key: "multiuser", Label: "Multiuser server", Type: app.FieldTypeBool, Required: false, Hint: "Server only: serve every <tunnel_id>/users/<user_id>/ prefix"},
 		},
-		Defaults:  defaults,
+		Defaults: defaults,
+		Caps: app.Capabilities{
+			Relay:     relayProvider{},
+			Multiuser: app.MultiuserConfig{},
+			Secrets: app.SecretProviderFunc(func() []capability.SecretSpec {
+				return []capability.SecretSpec{
+					{
+						Key:       "minio_root_user",
+						Label:     "MinIO Root User",
+						Generator: capability.SecretGenerator{Kind: "hex", Bytes: 6, Prefix: "shampoore-"},
+						Aliases:   []string{"s3_access_key"},
+						Editable:  true,
+					},
+					{
+						Key:       "minio_root_password",
+						Label:     "MinIO Root Password",
+						Generator: capability.SecretGenerator{Kind: "hex", Bytes: 24},
+						Aliases:   []string{"s3_secret_key"},
+						Editable:  true,
+					},
+					{
+						Key:       "s3_bucket",
+						Label:     "S3 Bucket",
+						Generator: capability.SecretGenerator{Kind: "hex", Bytes: 4, Prefix: "shampoore-"},
+						Editable:  true,
+					},
+				}
+			}),
+		},
 		EncodeURL: encodeURL,
 		DecodeURL: decodeURL,
 		Validate:  validate,

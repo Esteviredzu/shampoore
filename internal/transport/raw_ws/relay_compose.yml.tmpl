@@ -1,0 +1,17 @@
+  relay:
+    image: debian:bookworm-slim
+    restart: unless-stopped
+    command:
+      - /opt/shampoore/bin/shampoore-relay
+      - -listen
+      - ":8787"
+      - -password
+      - "{{ .Password }}"
+      - -decoy-dir
+      - /opt/shampoore/decoy
+    volumes:
+      - ./bin/shampoore-relay:/opt/shampoore/bin/shampoore-relay:ro
+      - ./decoy:/opt/shampoore/decoy:ro
+{{ if .LocalRelay }}    ports:
+      - "127.0.0.1:8787:8787"
+{{ end }}

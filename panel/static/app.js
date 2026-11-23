@@ -326,6 +326,7 @@ async function logout() {
 async function load() {
   try {
     if (!state.templates.length) state.templates = (await api('/api/templates')) || [];
+    syncTransportCatalog();
     const sst = await api('/api/server/status');
     state.serverRunning = sst.running;
     state.configs = (await api('/api/configs')) || [];
@@ -453,15 +454,16 @@ async function openEditDialog(name) {
 }
 
 function openConfigDialog(editName = null, initialData = null) {
+  const configDefaultKind = (state.templates[0] || {}).kind || 'raw_ws';
   let data = initialData ? JSON.parse(JSON.stringify(initialData)) : {};
   if (!editName && !initialData) {
-    data = { type: 'yandex', transport: {}, advanced: {} };
+    data = { type: configDefaultKind, transport: {}, advanced: {} };
   }
   delete data.name;
 
   let form = {
     name: editName || '',
-    type: data.type || 'yandex',
+    type: data.type || configDefaultKind,
     encryption_password: data.encryption_password || '',
     transport: data.transport || {},
     advanced: data.advanced || {}
@@ -492,7 +494,7 @@ function openConfigDialog(editName = null, initialData = null) {
     if (form.name) obj.name = form.name;
     if (form.encryption_password) obj.encryption_password = form.encryption_password;
     
-    if (selectedKind === 'multi') {
+    if (isMultiKind(selectedKind)) {
       obj.transport = {
         strategy: multiStrategy,
         transports: multiSubflows
@@ -563,13 +565,14 @@ function openConfigDialog(editName = null, initialData = null) {
         <hr style="border:none;border-top:1px solid var(--md-outline-variant);margin:8px 0;">
     `;
 
-    if (selectedKind === 'multi') {
+    if (isMultiKind(selectedKind)) {
+      const strategyOptions = multiStrategies(selectedKind).map(s => `
+            <option value="${escAttr(s.id)}" ${multiStrategy === s.id ? 'selected' : ''}>${esc(s.label || s.id)}</option>`).join('');
       html += `
         <div class="field">
           <label>${t('dialog.strategy')}</label>
           <select id="f-strategy" class="input" style="height:56px;">
-            <option value="flowmux" ${multiStrategy === 'flowmux' ? 'selected' : ''}>flowmux</option>
-            <option value="bond" ${multiStrategy === 'bond' ? 'selected' : ''}>bond</option>
+            ${strategyOptions}
           </select>
         </div>
         <div class="field">
@@ -579,7 +582,7 @@ function openConfigDialog(editName = null, initialData = null) {
               <div style="background:var(--md-surface-container-highest); padding:16px; border-radius:16px; margin-bottom:16px;">
                 <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
                   <select class="input" style="flex:1; height:40px;" onchange="window.updateSubflowType(${i}, this.value)">
-                    ${state.templates.filter(k => k.kind !== 'multi').map(k => `<option value="${escAttr(k.kind)}" ${k.kind === t.type ? 'selected' : ''}>${esc(k.display_name)}</option>`).join('')}
+                    ${state.templates.filter(k => !isMultiKind(k.kind)).map(k => `<option value="${escAttr(k.kind)}" ${k.kind === t.type ? 'selected' : ''}>${esc(k.display_name)}</option>`).join('')}
                   </select>
                   <button type="button" class="icon-btn icon-btn--danger" onclick="window.rmSubflow(${i})"><span class="material-symbols-rounded">delete</span></button>
                 </div>
@@ -640,7 +643,7 @@ function openConfigDialog(editName = null, initialData = null) {
     document.getElementById('f-name').addEventListener('input', e => form.name = e.target.value);
     document.getElementById('f-pw').addEventListener('input', e => form.encryption_password = e.target.value);
     
-    if (selectedKind === 'multi') {
+    if (isMultiKind(selectedKind)) {
       document.getElementById('f-strategy').addEventListener('change', e => { multiStrategy = e.target.value; });
     }
   }
@@ -681,7 +684,7 @@ function openConfigDialog(editName = null, initialData = null) {
   };
 
   window.addSubflow = () => {
-    const defaultType = state.templates.find(t => t.kind !== 'multi')?.kind || 'yandex';
+    const defaultType = (TRANSPORT_KINDS[0] || {}).value || 'raw_ws';
     multiSubflows.push({ type: defaultType, transport: {}, rate_limit_kb: 0 });
     renderBody();
   };
@@ -763,14 +766,14 @@ function openConfigDialog(editName = null, initialData = null) {
         const parsed = JSON.parse(jsonCache);
         form = { ...form, ...parsed };
         if (parsed.transport) {
-            if (parsed.type === 'multi') {
-                multiStrategy = parsed.transport.strategy || 'flowmux';
+            if (isMultiKind(parsed.type)) {
+                multiStrategy = parsed.transport.strategy || defaultMultiStrategy(parsed.type);
                 multiSubflows = parsed.transport.transports || [];
             } else {
                 fieldValues = parsed.transport;
             }
         }
-        selectedKind = parsed.type || 'yandex';
+        selectedKind = parsed.type || (TRANSPORT_KINDS[0] || {}).value || 'raw_ws';
       } catch (e) {
         toast(t('dialog.invalidJson'), 'error');
         return false;
@@ -1182,28 +1185,69 @@ function geoUpdatedLabel(source) {
 /* Fleet control plane: dashboard, nodes, routes, users                */
 /* ------------------------------------------------------------------ */
 
-const TRANSPORT_KINDS = [
-  { value: 'raw_ws', label: 'Raw WebSocket' },
-  { value: 'silo', label: 'Silo S3' },
-  { value: 'livekit', label: 'LiveKit' }
-];
+let TRANSPORT_KINDS = [];
 
-/* Editable transport secrets. The panel exposes the real values (instead of an
-   opaque generated blob) so admins can review, rotate and regenerate them. */
-const NODE_SECRET_FIELDS = {
-  raw_ws: [
-    { key: 'raw_ws_password', label: 'nodes.secretRawWSPassword' }
-  ],
-  livekit: [
-    { key: 'livekit_api_key', label: 'nodes.secretLiveKitKey' },
-    { key: 'livekit_api_secret', label: 'nodes.secretLiveKitSecret' }
-  ],
-  silo: [
-    { key: 'minio_root_user', label: 'nodes.secretMinioUser' },
-    { key: 'minio_root_password', label: 'nodes.secretMinioPassword' },
-    { key: 's3_bucket', label: 'nodes.secretS3Bucket' }
-  ]
+/* Editable transport secrets come from /api/templates capabilities. */
+let NODE_SECRET_FIELDS = {};
+
+const SECRET_LABEL_KEYS = {
+  raw_ws_password: 'nodes.secretRawWSPassword',
+  livekit_api_key: 'nodes.secretLiveKitKey',
+  livekit_api_secret: 'nodes.secretLiveKitSecret',
+  minio_root_user: 'nodes.secretMinioUser',
+  minio_root_password: 'nodes.secretMinioPassword',
+  s3_bucket: 'nodes.secretS3Bucket'
 };
+
+function templateCaps(template) {
+  return (template && template.capabilities) || {};
+}
+
+function syncTransportCatalog() {
+  TRANSPORT_KINDS = state.templates
+    .filter(t => templateCaps(t).deployable)
+    .map(t => ({
+      value: t.kind,
+      label: t.display_name,
+      default: !!templateCaps(t).default_relay,
+      decoy: !!templateCaps(t).decoy,
+      secrets: templateCaps(t).secrets || []
+    }));
+  NODE_SECRET_FIELDS = {};
+  for (const t of state.templates) {
+    const specs = templateCaps(t).secrets || [];
+    NODE_SECRET_FIELDS[t.kind] = specs.map(spec => ({
+      key: spec.key,
+      label: SECRET_LABEL_KEYS[spec.key] || spec.label || spec.key,
+      generator: spec.generator || { kind: 'hex', bytes: 24 }
+    }));
+  }
+}
+
+function transportKindInfo(kind) {
+  return TRANSPORT_KINDS.find(k => k.value === kind);
+}
+
+function isMultiKind(kind) {
+  const template = state.templates.find(t => t.kind === kind);
+  return !!(template && templateCaps(template).multi);
+}
+
+function primaryMultiKind() {
+  const template = state.templates.find(t => templateCaps(t).multi);
+  return template ? template.kind : 'multi';
+}
+
+function multiStrategies(kind) {
+  const template = state.templates.find(t => t.kind === (kind || primaryMultiKind()));
+  return templateCaps(template).strategies || [];
+}
+
+function defaultMultiStrategy(kind) {
+  const strategies = multiStrategies(kind);
+  return strategies.length ? strategies[0].id : 'bond';
+}
+
 
 function randomBytes(n) {
   const buf = new Uint8Array(n);
@@ -1220,39 +1264,47 @@ function randomBase64(n) {
   return btoa(String.fromCharCode.apply(null, Array.from(randomBytes(n))));
 }
 
-function generateSecretValue(key) {
-  switch (key) {
-    case 'encryption_password': return randomHex(32);
-    case 'raw_ws_password': return randomHex(32);
-    case 'livekit_api_key': return randomHex(8);
-    case 'livekit_api_secret': return randomBase64(32);
-    case 'minio_root_user': return 'shampoore-' + randomHex(6);
-    case 'minio_root_password': return randomHex(24);
-    case 's3_bucket': return 'shampoore-' + randomHex(4);
-    default: return randomHex(24);
+function generateSecretValue(spec) {
+  const generator = (spec && spec.generator) || { kind: 'hex', bytes: 24 };
+  const bytes = Number(generator.bytes) || 24;
+  const prefix = generator.prefix || '';
+  if (generator.kind === 'literal') return prefix;
+  if (generator.kind === 'base64') return prefix + randomBase64(bytes);
+  return prefix + randomHex(bytes);
+}
+
+function transportSecretSpecs(type) {
+  return NODE_SECRET_FIELDS[type] || [];
+}
+
+function secretSpecByKey(key) {
+  if (key === 'encryption_password') {
+    return { key, generator: { kind: 'hex', bytes: 32 } };
   }
+  for (const specs of Object.values(NODE_SECRET_FIELDS)) {
+    const found = specs.find(spec => spec.key === key);
+    if (found) return found;
+  }
+  return { key, generator: { kind: 'hex', bytes: 24 } };
 }
 
-function transportSecretKeys(type) {
-  return (NODE_SECRET_FIELDS[type] || []).map(field => field.key);
-}
-
-function fillSecretKeys(draft, keys) {
+function fillSecretKeys(draft, specs) {
   if (!draft.secrets) draft.secrets = {};
-  keys.forEach(key => {
-    if (!draft.secrets[key]) draft.secrets[key] = generateSecretValue(key);
+  specs.forEach(spec => {
+    const key = spec.key || spec;
+    if (!draft.secrets[key]) draft.secrets[key] = generateSecretValue(spec);
   });
 }
 
 function fillDraftSecrets(draft, type) {
-  fillSecretKeys(draft, transportSecretKeys(type));
+  fillSecretKeys(draft, transportSecretSpecs(type));
 }
 
 function takenRouteTransports(entryID, exitID, excludeID) {
   const taken = new Set();
   for (const route of fleet.routes || []) {
     if (excludeID && route.id === excludeID) continue;
-    if (route.transport_type === 'multi') continue;
+    if (isMultiKind(route.transport_type)) continue;
     if (route.entry_node_id === entryID && route.exit_node_id === exitID) {
       taken.add(route.transport_type);
     }
@@ -1492,7 +1544,7 @@ function nodeRoles(node) {
 }
 
 function transportLabel(kind) {
-  if (kind === 'multi') return t('routes.multiBadge');
+  if (isMultiKind(kind)) return t('routes.multiBadge');
   const found = TRANSPORT_KINDS.find(k => k.value === kind);
   return found ? found.label : kind;
 }
@@ -1844,14 +1896,15 @@ function renderDeployResult(dialog, result) {
 function emptyNodeDraft(role) {
   const relay = role === 'relay' || role === 'both';
   const exit = role === 'exit' || role === 'both';
+  const defaultKind = (TRANSPORT_KINDS.find(k => k.default) || TRANSPORT_KINDS[0] || {}).value || '';
   const draft = {
     name: '', ssh_host: '', ssh_port: 22, ssh_user: 'root',
     ssh_private_key: '', ssh_password: '', authMode: 'key',
     is_relay: relay, is_exit: exit, socks_port: 1080,
     secrets: {},
-    transports: relay ? [{ type: 'raw_ws', domain: '', decoy_repo_url: '', enabled: true }] : []
+    transports: relay && defaultKind ? [{ type: defaultKind, domain: '', decoy_repo_url: '', enabled: true }] : []
   };
-  if (relay) fillSecretKeys(draft, ['encryption_password']);
+  if (relay) fillSecretKeys(draft, [{ key: 'encryption_password', generator: { kind: 'hex', bytes: 32 } }]);
   draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
   return draft;
 }
@@ -1873,7 +1926,7 @@ function nodeDraftFrom(node) {
     transports: (node.transports || []).map(tr => ({ type: tr.type, domain: tr.domain || '', decoy_repo_url: tr.decoy_repo_url || '', enabled: !!tr.enabled }))
   });
   draft.authMode = draft.ssh_private_key ? 'key' : (draft.ssh_password ? 'password' : 'key');
-  if (draft.is_relay) fillSecretKeys(draft, ['encryption_password']);
+  if (draft.is_relay) fillSecretKeys(draft, [{ key: 'encryption_password', generator: { kind: 'hex', bytes: 32 } }]);
   draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
   return draft;
 }
@@ -1920,7 +1973,7 @@ function openNodeModal(node, role) {
     const secrets = fields.length
       ? `<div class="transport-secrets">${fields.map(field => secretInput(field, (draft.secrets || {})[field.key])).join('')}</div>`
       : '';
-    const decoy = tr.type === 'raw_ws'
+    const decoy = (transportKindInfo(tr.type) || {}).decoy
       ? `<div class="transport-decoy">
           <label class="secret-field">
             <span>${esc(t('nodes.decoyRepoLabel'))}</span>
@@ -2037,10 +2090,11 @@ function openNodeModal(node, role) {
     if (relay) relay.addEventListener('change', e => {
       draft.is_relay = e.target.checked;
       if (draft.is_relay && !draft.transports.length) {
-        draft.transports.push({ type: 'raw_ws', domain: '', decoy_repo_url: '', enabled: true });
+        const defaultKind = (TRANSPORT_KINDS.find(k => k.default) || TRANSPORT_KINDS[0] || {}).value;
+        if (defaultKind) draft.transports.push({ type: defaultKind, domain: '', decoy_repo_url: '', enabled: true });
       }
       if (draft.is_relay) {
-        fillSecretKeys(draft, ['encryption_password']);
+        fillSecretKeys(draft, [{ key: 'encryption_password', generator: { kind: 'hex', bytes: 32 } }]);
         draft.transports.forEach(tr => fillDraftSecrets(draft, tr.type));
       }
       renderNodeBody();
@@ -2076,7 +2130,7 @@ function openNodeModal(node, role) {
       transports: draft.is_relay ? draft.transports.map(tr => {
         const item = { type: tr.type, domain: tr.domain, enabled: tr.enabled };
         const decoyURL = String(tr.decoy_repo_url || '').trim();
-        if (tr.type === 'raw_ws' && decoyURL) item.decoy_repo_url = decoyURL;
+        if ((transportKindInfo(tr.type) || {}).decoy && decoyURL) item.decoy_repo_url = decoyURL;
         return item;
       }) : []
     };
@@ -2123,7 +2177,7 @@ function fleetNodeRandomSecret(key) {
   const draft = fleet.nodeDraft;
   if (!draft) return;
   if (!draft.secrets) draft.secrets = {};
-  draft.secrets[key] = generateSecretValue(key);
+  draft.secrets[key] = generateSecretValue(secretSpecByKey(key));
   if (fleet.renderNodeBody) fleet.renderNodeBody();
 }
 
@@ -2180,7 +2234,7 @@ function renderRoutes() {
     return;
   }
   const rows = fleet.routes.map(route => {
-    const isMulti = route.transport_type === 'multi';
+    const isMulti = isMultiKind(route.transport_type);
     const transportCell = isMulti
       ? `<span class="transport-chip transport-chip--multi">${esc(t('routes.multiBadge'))} · ${esc(multiStrategyLabel(route.multi_strategy))}</span>
          <div class="table-sub">${esc(subRouteNames(route.sub_route_ids))}</div>`
@@ -2215,11 +2269,11 @@ async function fleetToggleRoute(id, enabled) {
     await api(`/api/routes/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(route.transport_type === 'multi'
+      body: JSON.stringify(isMultiKind(route.transport_type)
         ? {
             name: route.name,
-            transport_type: 'multi',
-            multi_strategy: route.multi_strategy || 'bond',
+            transport_type: route.transport_type,
+            multi_strategy: route.multi_strategy || defaultMultiStrategy(route.transport_type),
             sub_route_ids: route.sub_route_ids || [],
             enabled: enabled
           }
@@ -2266,14 +2320,14 @@ function openRouteModal(route) {
   const editID = route ? route.id : null;
   const relays = fleet.nodes.filter(n => n.is_relay);
   const exits = fleet.nodes.filter(n => n.is_exit);
-  const isMulti = !!route && route.transport_type === 'multi';
+  const isMulti = !!route && isMultiKind(route.transport_type);
   const draft = {
     mode: isMulti ? 'multi' : 'single',
     name: route ? route.name : '',
     entry_node_id: route ? route.entry_node_id : (relays[0] ? relays[0].id : 0),
     exit_node_id: route ? route.exit_node_id : (exits[0] ? exits[0].id : 0),
-    transport_type: route && route.transport_type !== 'multi' ? route.transport_type : TRANSPORT_KINDS[0].value,
-    multi_strategy: route && route.multi_strategy ? route.multi_strategy : 'bond',
+    transport_type: route && !isMultiKind(route.transport_type) ? route.transport_type : (TRANSPORT_KINDS[0] || {}).value,
+    multi_strategy: route && route.multi_strategy ? route.multi_strategy : defaultMultiStrategy(primaryMultiKind()),
     sub_route_ids: route && Array.isArray(route.sub_route_ids) ? route.sub_route_ids.slice() : [],
     enabled: route ? !!route.enabled : true
   };
@@ -2295,14 +2349,16 @@ function openRouteModal(route) {
   }
 
   function strategyOptions() {
-    return [
-      { value: 'bond', label: t('routes.strategyBond') },
-      { value: 'flowmux', label: t('routes.strategyFlowmux') }
-    ].map(option => `<option value="${option.value}" ${option.value === draft.multi_strategy ? 'selected' : ''}>${esc(option.label)}</option>`).join('');
+    return multiStrategies(primaryMultiKind()).map(option => {
+      const label = option.id === 'bond' ? t('routes.strategyBond')
+        : option.id === 'flowmux' ? t('routes.strategyFlowmux')
+        : (option.label || option.id);
+      return `<option value="${escAttr(option.id)}" ${option.id === draft.multi_strategy ? 'selected' : ''}>${esc(label)}</option>`;
+    }).join('');
   }
 
   function childRoutes() {
-    return (fleet.routes || []).filter(r => r.transport_type !== 'multi' && (!editID || r.id !== editID));
+    return (fleet.routes || []).filter(r => !isMultiKind(r.transport_type) && (!editID || r.id !== editID));
   }
 
   function childCheckboxes() {
@@ -2390,8 +2446,8 @@ function openRouteModal(route) {
     const payload = draft.mode === 'multi'
       ? {
           name: draft.name,
-          transport_type: 'multi',
-          multi_strategy: draft.multi_strategy || 'bond',
+          transport_type: primaryMultiKind(),
+          multi_strategy: draft.multi_strategy || defaultMultiStrategy(primaryMultiKind()),
           sub_route_ids: (draft.sub_route_ids || []).slice(),
           enabled: draft.enabled
         }
@@ -2423,7 +2479,7 @@ function fleetRouteSetMode(mode) {
   const draft = fleet.routeDraft;
   if (!draft) return;
   draft.mode = mode === 'multi' ? 'multi' : 'single';
-  if (draft.mode === 'single' && draft.transport_type === 'multi') {
+  if (draft.mode === 'single' && isMultiKind(draft.transport_type)) {
     const taken = takenRouteTransports(draft.entry_node_id, draft.exit_node_id, fleet.routeEditID);
     const next = TRANSPORT_KINDS.find(k => !taken.has(k.value));
     draft.transport_type = next ? next.value : TRANSPORT_KINDS[0].value;

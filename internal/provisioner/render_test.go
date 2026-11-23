@@ -13,8 +13,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 
-	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/raw_ws"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/all"
 	"github.com/Esteviredzu/shampoore/internal/transport/silo"
 )
 

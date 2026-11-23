@@ -205,6 +205,14 @@ func patchUsers(settings *app.Settings, users []auth.UserSpec) (bool, error) {
 	if settings == nil || len(settings.Transport) == 0 {
 		return false, nil
 	}
+	if descriptor, ok := app.DescriptorFor(settings.Type); ok && descriptor.Caps.Multiuser != nil {
+		updated, changed, err := descriptor.Caps.Multiuser.PatchUsers(settings.Transport, users)
+		if err != nil || !changed {
+			return changed, err
+		}
+		settings.Transport = updated
+		return true, nil
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(settings.Transport, &raw); err != nil {
 		return false, err

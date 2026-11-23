@@ -15,17 +15,12 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
+	"github.com/Esteviredzu/shampoore/internal/panelstore/apppolicy"
 	"github.com/Esteviredzu/shampoore/internal/provisioner"
 	"github.com/Esteviredzu/shampoore/internal/version"
 	"github.com/Esteviredzu/shampoore/panel"
 
-	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/raw_ws"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/silo"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_raw"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/yandex_telemost_squares"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/all"
 )
 
 func main() {
@@ -104,7 +99,7 @@ func main() {
 		panel.WithUpdateToken(os.Getenv("SHAMPOORE_GITHUB_TOKEN")),
 	)
 	if strings.TrimSpace(*dbPath) != "" {
-		store, err = panelstore.Open(ctx, *dbPath)
+		store, err = panelstore.Open(ctx, *dbPath, panelstore.WithTransportPolicy(apppolicy.Policy{}))
 		if err != nil {
 			logger.Error("panel: database: ", err)
 			os.Exit(1)
@@ -236,7 +231,7 @@ func runCleanupAllNodes(dbPath, publicURL string, logger *logging.Logger) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := panelstore.Open(ctx, dbPath)
+	store, err := panelstore.Open(ctx, dbPath, panelstore.WithTransportPolicy(apppolicy.Policy{}))
 	if err != nil {
 		logger.Error("panel: database: ", err)
 		return 1

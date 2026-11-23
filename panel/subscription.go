@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -14,16 +13,6 @@ import (
 type OfflineBundle struct {
 	Name  string   `json:"name"`
 	Links []string `json:"links"`
-}
-
-type multiSubflow struct {
-	Type      string          `json:"type"`
-	Transport json.RawMessage `json:"transport,omitempty"`
-}
-
-type multiTransportConfig struct {
-	Strategy   string         `json:"strategy"`
-	Transports []multiSubflow `json:"transports"`
 }
 
 func (a *API) offlineBundle(r *http.Request, user panelstore.User) (OfflineBundle, error) {
@@ -74,16 +63,18 @@ func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app
 		if !route.Enabled || !user.RouteAllowed(route.ID) {
 			continue
 		}
-		if route.TransportType == panelstore.TransportMulti {
-			settings, err := multiRouteSettings(route, routeByID, byID, user)
-			if err != nil {
-				if a.logger != nil {
-					a.logger.Warn("panel: skip multi route: ", err)
+		if route.TransportType != "" {
+			if descriptor, ok := app.DescriptorFor(route.TransportType); ok && descriptor.Caps.Multi != nil {
+				settings, err := multiRouteSettings(route, routeByID, byID, user)
+				if err != nil {
+					if a.logger != nil {
+						a.logger.Warn("panel: skip multi route: ", err)
+					}
+					continue
 				}
+				out = append(out, settings)
 				continue
 			}
-			out = append(out, settings)
-			continue
 		}
 		if settings, ok := singleRouteSettings(route, byID, user); ok {
 			out = append(out, settings)
@@ -115,16 +106,20 @@ func singleRouteSettingsIn(
 		return app.Settings{}, false
 	}
 	descriptor, ok := app.DescriptorFor(route.TransportType)
-	if !ok || descriptor.BuildSubscriptionConfig == nil {
+	if !ok || descriptor.Caps.Client == nil {
 		return app.Settings{}, false
 	}
-	settings, err := descriptor.BuildSubscriptionConfig(app.RouteParams{
-		RouteID:    namespace.ID,
-		RouteName:  namespace.Name,
-		UserID:     user.ID,
-		ExitNodeID: strconv.FormatInt(exit.ID, 10),
-		Domain:     tr.Domain,
-		Secrets:    entry.GeneratedSecrets,
+	settings, err := descriptor.ClientConfig(app.RouteContext{
+		Role:               app.RouteRoleSubscription,
+		RouteID:            namespace.ID,
+		RouteName:          namespace.Name,
+		SubRouteID:         route.ID,
+		SubRouteName:       route.Name,
+		UserID:             user.ID,
+		ExitNodeID:         strconv.FormatInt(exit.ID, 10),
+		Domain:             tr.Domain,
+		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
+		Secrets:            entry.GeneratedSecrets,
 	})
 	if err != nil {
 		return app.Settings{}, false
@@ -144,9 +139,9 @@ func multiRouteSettings(
 	byID map[int64]panelstore.Node,
 	user panelstore.User,
 ) (app.Settings, error) {
-	strategy := strings.TrimSpace(route.MultiStrategy)
-	if strategy != panelstore.MultiStrategyBond && strategy != panelstore.MultiStrategyFlowMux {
-		return app.Settings{}, fmt.Errorf("multi route %d: unsupported strategy %q", route.ID, route.MultiStrategy)
+	descriptor, ok := app.DescriptorFor(route.TransportType)
+	if !ok || descriptor.Caps.Multi == nil {
+		return app.Settings{}, fmt.Errorf("multi route %d: transport %q is not a multi composer", route.ID, route.TransportType)
 	}
 	entry, ok := byID[route.EntryNodeID]
 	if !ok {
@@ -156,34 +151,35 @@ func multiRouteSettings(
 	if !ok {
 		return app.Settings{}, fmt.Errorf("multi route %d: exit node %d not found", route.ID, route.ExitNodeID)
 	}
-	cfg := multiTransportConfig{Strategy: strategy}
+	req := app.MultiRequest{
+		Strategy:           route.MultiStrategy,
+		RouteID:            route.ID,
+		RouteName:          route.Name,
+		UserID:             user.ID,
+		ExitNodeID:         strconv.FormatInt(exit.ID, 10),
+		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
+	}
 	for _, id := range route.SubRouteIDs {
 		child, ok := routeByID[id]
-		if !ok || child.TransportType == panelstore.TransportMulti || !child.Enabled {
+		if !ok || !child.Enabled {
+			continue
+		}
+		childDescriptor, ok := app.DescriptorFor(child.TransportType)
+		if !ok || childDescriptor.Caps.Multi != nil {
 			continue
 		}
 		childSettings, ok := singleRouteSettingsIn(child, byID, user, route)
 		if !ok {
 			continue
 		}
-		cfg.Transports = append(cfg.Transports, multiSubflow{
+		req.Subflows = append(req.Subflows, app.SubflowSpec{
 			Type:      childSettings.Type,
+			Name:      child.Name,
 			Transport: childSettings.Transport,
 		})
 	}
-	if len(cfg.Transports) == 0 {
-		return app.Settings{}, fmt.Errorf("multi route %d: no enabled sub-routes", route.ID)
+	if err := descriptor.Caps.Multi.Validate(req); err != nil {
+		return app.Settings{}, fmt.Errorf("multi route %d: %w", route.ID, err)
 	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return app.Settings{}, err
-	}
-	return app.Settings{
-		Name:               route.Name,
-		Type:               panelstore.TransportMulti,
-		UserID:             user.ID,
-		ExitNodeID:         strconv.FormatInt(exit.ID, 10),
-		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
-		Transport:          raw,
-	}, nil
+	return descriptor.Caps.Multi.BuildSubscription(req)
 }

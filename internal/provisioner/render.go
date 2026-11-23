@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/capability"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
 )
 
@@ -30,15 +31,22 @@ type relaySite struct {
 	Domains  []string
 }
 
+type relayService struct {
+	Name    string
+	Compose []byte
+}
+
 type relayData struct {
 	Node       panelstore.Node
 	Secrets    map[string]string
 	Sites      []relaySite
-	Domains    map[string]string
-	HasRawWS   bool
-	HasLiveKit bool
-	HasSilo    bool
+	Services   []relayService
 	LocalRelay bool
+}
+
+type RenderResult struct {
+	Files []File
+	Steps []capability.NodeStep
 }
 
 type exitData struct {
@@ -51,54 +59,84 @@ type exitData struct {
 }
 
 func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
+	result, err := RenderRelayPlan(node, opts)
+	if err != nil {
+		return nil, err
+	}
+	return result.Files, nil
+}
+
+func RenderRelayPlan(node panelstore.Node, opts RenderOptions) (RenderResult, error) {
 	if !node.IsRelay {
-		return nil, fmt.Errorf("provisioner: node %q is not a relay", node.Name)
+		return RenderResult{}, fmt.Errorf("provisioner: node %q is not a relay", node.Name)
 	}
 	data := relayData{
 		Node:       node,
 		Secrets:    cloneSecrets(node.GeneratedSecrets),
-		Domains:    make(map[string]string),
 		LocalRelay: opts.LocalRelay,
 	}
 	siteIndex := make(map[string]int)
+	seenServices := make(map[string]struct{})
+	var steps []capability.NodeStep
+	var extraFiles []File
 	for _, tr := range node.Transports {
 		if !tr.Enabled || strings.TrimSpace(tr.Domain) == "" {
 			continue
 		}
 		descriptor, ok := app.DescriptorFor(tr.Type)
-		if !ok || strings.TrimSpace(descriptor.RelayUpstream) == "" {
+		if !ok || descriptor.Caps.Relay == nil {
 			continue
 		}
-		for _, key := range descriptor.RelaySecrets {
+		for _, key := range descriptor.Caps.Relay.RelaySecrets() {
 			if strings.TrimSpace(data.Secrets[key]) == "" {
-				return nil, fmt.Errorf("provisioner: relay %q has no %s for %s", node.Name, key, tr.Type)
+				return RenderResult{}, fmt.Errorf("provisioner: relay %q has no %s for %s", node.Name, key, tr.Type)
 			}
 		}
 		domain := app.SiteAddress(tr.Domain)
-		if _, ok := data.Domains[descriptor.Kind]; !ok {
-			data.Domains[descriptor.Kind] = domain
+		asset, err := descriptor.Caps.Relay.RelayAsset(capability.RelayContext{
+			NodeID:     node.ID,
+			NodeName:   node.Name,
+			Domain:     domain,
+			LocalRelay: opts.LocalRelay,
+			Secrets:    data.Secrets,
+		})
+		if err != nil {
+			return RenderResult{}, fmt.Errorf("provisioner: relay %q: %w", node.Name, err)
 		}
-		switch descriptor.Kind {
-		case panelstore.TransportRawWS:
-			data.HasRawWS = true
-		case "livekit_datachannel":
+		name := strings.TrimSpace(asset.Name)
+		if name == "" {
+			name = descriptor.Kind
+		}
+		if _, ok := seenServices[name]; !ok && len(asset.Compose) > 0 {
+			seenServices[name] = struct{}{}
+			data.Services = append(data.Services, relayService{Name: name, Compose: asset.Compose})
+		}
+		for _, file := range asset.Files {
+			extraFiles = append(extraFiles, File{Name: file.Name, Mode: file.Mode, Data: file.Data})
+		}
+		steps = append(steps, asset.Steps...)
 
-			data.HasLiveKit = true
-		case panelstore.TransportSilo:
-			data.HasSilo = true
+		upstream := strings.TrimSpace(asset.Upstream)
+		if upstream == "" {
+			continue
 		}
-		idx, ok := siteIndex[descriptor.RelayUpstream]
+		idx, ok := siteIndex[upstream]
 		if !ok {
 			idx = len(data.Sites)
-			siteIndex[descriptor.RelayUpstream] = idx
-			data.Sites = append(data.Sites, relaySite{Upstream: descriptor.RelayUpstream})
+			siteIndex[upstream] = idx
+			data.Sites = append(data.Sites, relaySite{Upstream: upstream})
 		}
 		data.Sites[idx].Domains = append(data.Sites[idx].Domains, domain)
 	}
 	if len(data.Sites) == 0 {
-		return nil, fmt.Errorf("provisioner: relay %q has no enabled transports with domains", node.Name)
+		return RenderResult{}, fmt.Errorf("provisioner: relay %q has no enabled transports with domains", node.Name)
 	}
-	return renderTemplates("templates/relay/*.tmpl", data)
+	files, err := renderTemplates("templates/relay/*.tmpl", data)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	files = append(files, extraFiles...)
+	return RenderResult{Files: files, Steps: steps}, nil
 }
 
 func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelstore.Node, opts RenderOptions) ([]File, error) {
@@ -235,7 +273,8 @@ func exitRouteSettings(
 	route panelstore.Route,
 	routesByID map[int64]panelstore.Route,
 ) (app.Settings, error) {
-	if route.TransportType == panelstore.TransportMulti {
+	descriptor, ok := app.DescriptorFor(route.TransportType)
+	if ok && descriptor.Caps.Multi != nil {
 		return multiExitSettings(node, entry, route, routesByID)
 	}
 	return singleExitSettings(node, entry, route, route)
@@ -251,16 +290,29 @@ func singleExitSettings(
 		return app.Settings{}, fmt.Errorf("provisioner: route %d entry node %q has no enabled %s transport", route.ID, entry.Name, route.TransportType)
 	}
 	descriptor, ok := app.DescriptorFor(route.TransportType)
-	if !ok || descriptor.BuildServerConfig == nil {
+	if !ok || descriptor.Caps.Server == nil {
 		return app.Settings{}, fmt.Errorf("provisioner: unsupported route transport %q", route.TransportType)
 	}
-	settings, err := descriptor.BuildServerConfig(app.RouteParams{
-		RouteID:    namespace.ID,
-		RouteName:  namespace.Name,
-		ExitNodeID: strconv.FormatInt(node.ID, 10),
-		Domain:     tr.Domain,
-		Secrets:    entry.GeneratedSecrets,
-	})
+	ctx := app.RouteContext{
+		Role:               app.RouteRoleExit,
+		RouteID:            namespace.ID,
+		RouteName:          namespace.Name,
+		UserID:             "",
+		ExitNodeID:         strconv.FormatInt(node.ID, 10),
+		Domain:             tr.Domain,
+		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
+		Secrets:            entry.GeneratedSecrets,
+	}
+	var settings app.Settings
+	var err error
+	if route.ID != namespace.ID {
+		ctx.Role = app.RouteRoleExitSubflow
+		ctx.SubRouteID = route.ID
+		ctx.SubRouteName = route.Name
+		settings, err = descriptor.ExitSubflowConfig(ctx)
+	} else {
+		settings, err = descriptor.ExitConfig(ctx)
+	}
 	if err != nil {
 		return app.Settings{}, fmt.Errorf("provisioner: route %d: %w", route.ID, err)
 	}
@@ -270,58 +322,46 @@ func singleExitSettings(
 	return settings, nil
 }
 
-type multiSubflow struct {
-	Type      string          `json:"type"`
-	Transport json.RawMessage `json:"transport,omitempty"`
-}
-
-type multiSettingsPayload struct {
-	Strategy   string         `json:"strategy"`
-	Transports []multiSubflow `json:"transports"`
-}
-
 func multiExitSettings(
 	node, entry panelstore.Node,
 	route panelstore.Route,
 	routesByID map[int64]panelstore.Route,
 ) (app.Settings, error) {
-	if route.MultiStrategy != panelstore.MultiStrategyBond &&
-		route.MultiStrategy != panelstore.MultiStrategyFlowMux {
-		return app.Settings{}, fmt.Errorf("provisioner: route %d: unsupported multi strategy %q",
-			route.ID, route.MultiStrategy)
+	descriptor, ok := app.DescriptorFor(route.TransportType)
+	if !ok || descriptor.Caps.Multi == nil {
+		return app.Settings{}, fmt.Errorf("provisioner: route %d: transport %q is not a multi composer",
+			route.ID, route.TransportType)
 	}
-	payload := multiSettingsPayload{Strategy: route.MultiStrategy}
+	req := app.MultiRequest{
+		Strategy:           route.MultiStrategy,
+		RouteID:            route.ID,
+		RouteName:          route.Name,
+		ExitNodeID:         strconv.FormatInt(node.ID, 10),
+		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
+	}
 	for _, id := range route.SubRouteIDs {
 		child, ok := routesByID[id]
 		if !ok {
 			return app.Settings{}, fmt.Errorf("provisioner: multi route %d: sub-route %d not found", route.ID, id)
 		}
-		if child.TransportType == panelstore.TransportMulti {
+		childDescriptor, ok := app.DescriptorFor(child.TransportType)
+		if ok && childDescriptor.Caps.Multi != nil {
 			return app.Settings{}, fmt.Errorf("provisioner: multi route %d: nested multi route %d", route.ID, id)
 		}
 		childSettings, err := singleExitSettings(node, entry, child, route)
 		if err != nil {
 			return app.Settings{}, err
 		}
-		payload.Transports = append(payload.Transports, multiSubflow{
+		req.Subflows = append(req.Subflows, app.SubflowSpec{
 			Type:      childSettings.Type,
+			Name:      child.Name,
 			Transport: childSettings.Transport,
 		})
 	}
-	if len(payload.Transports) == 0 {
-		return app.Settings{}, fmt.Errorf("provisioner: multi route %d has no subflows", route.ID)
+	if err := descriptor.Caps.Multi.Validate(req); err != nil {
+		return app.Settings{}, fmt.Errorf("provisioner: route %d: %w", route.ID, err)
 	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return app.Settings{}, err
-	}
-	return app.Settings{
-		Name:               route.Name,
-		Type:               panelstore.TransportMulti,
-		ExitNodeID:         strconv.FormatInt(node.ID, 10),
-		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
-		Transport:          raw,
-	}, nil
+	return descriptor.Caps.Multi.BuildExit(req)
 }
 
 func renderTemplates(pattern string, data any) ([]File, error) {
