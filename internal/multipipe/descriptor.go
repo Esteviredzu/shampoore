@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/app"
+	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multipipe/bond"
 	"github.com/Esteviredzu/shampoore/internal/multipipe/flowmux"
+	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
@@ -124,10 +126,14 @@ func build(
 		sides      []app.SideService
 		providers  []app.Provider
 		connected  []func() []string
+		sessions   []app.SessionServer
+		registry   *auth.UserRegistry
 	)
 
 	for _, o := range outcomes {
-		transports = append(transports, o.res.Transport)
+		if o.res.Transport != nil {
+			transports = append(transports, o.res.Transport)
+		}
 		names = append(names, o.name)
 		bypass = append(bypass, o.res.BypassHosts...)
 		sides = append(sides, o.res.Side...)
@@ -137,11 +143,18 @@ func build(
 		if o.res.ConnectedIPs != nil {
 			connected = append(connected, o.res.ConnectedIPs)
 		}
+		if o.res.SessionServer != nil {
+			sessions = append(sessions, o.res.SessionServer)
+		}
+		if registry == nil && o.res.UserRegistry != nil {
+			registry = o.res.UserRegistry
+		}
 	}
 
 	result := &app.BuildResult{
-		BypassHosts: bypass,
-		Side:        sides,
+		BypassHosts:  bypass,
+		Side:         sides,
+		UserRegistry: registry,
 	}
 	if len(providers) > 0 {
 		result.Provider = &multiProvider{providers: providers}
@@ -154,6 +167,11 @@ func build(
 			}
 			return out
 		}
+	}
+
+	if role == "server" {
+		return buildServerMulti(cfg, outcomes, sessions, names, registry, logger, eff, result,
+			s.EncryptionPassword, s.ExitNodeID)
 	}
 
 	switch cfg.Strategy {
@@ -180,6 +198,7 @@ func build(
 			return nil, fmt.Errorf("multipipe: bond: %w", err)
 		}
 		bm.SetIdentity(s.UserID, s.ExitNodeID)
+		bm.SetEncryptionPassword(s.EncryptionPassword)
 		result.StreamMux = bm
 		logger.Info("multipipe: bond enabled, subflows=", len(transports))
 		return result, nil
@@ -189,6 +208,129 @@ func build(
 		return nil, fmt.Errorf("multipipe: unknown strategy %q (want flowmux|bond)", cfg.Strategy)
 	}
 }
+
+func buildServerMulti(
+	cfg config,
+	outcomes []outcome,
+	sessions []app.SessionServer,
+	names []string,
+	registry *auth.UserRegistry,
+	logger logging.ContextLogger,
+	eff app.Values,
+	result *app.BuildResult,
+	password string,
+	exitNodeID string,
+) (*app.BuildResult, error) {
+	if len(sessions) != len(outcomes) {
+		stopAll(outcomes)
+		return nil, fmt.Errorf(
+			"multipipe: server mode requires multiuser subflows; %d of %d provide a session server",
+			len(sessions), len(outcomes))
+	}
+	tubeNames := make([]string, 0, len(outcomes))
+	for _, o := range outcomes {
+		tubeNames = append(tubeNames, o.name)
+	}
+
+	switch cfg.Strategy {
+	case "bond":
+		muxCfg := tunnel.Config{
+			FlushThreshold: eff.Int("mux_flush_threshold", 12000),
+			FlushInterval:  time.Duration(eff.Int("mux_flush_ms", 20)) * time.Millisecond,
+			Registry:       registry,
+		}
+		srv := bond.NewServer(tubeNames, sessions, logger, muxCfg, registry)
+		srv.SetEncryptionPassword(password)
+		srv.SetExitNodeID(exitNodeID)
+		for i, child := range sessions {
+			agg, ok := child.(app.AggregableSession)
+			if !ok {
+				stopAll(outcomes)
+				return nil, fmt.Errorf("multipipe: subflow %q cannot be aggregated for bond", tubeNames[i])
+			}
+			agg.SetTransportSink(srv.Sink(tubeNames[i]))
+		}
+		result.SessionServer = srv
+		result.StreamMux = nil
+		logger.Info("multipipe: server bond aggregator enabled, tubes=", len(tubeNames))
+		return result, nil
+
+	case "", "flowmux":
+
+		result.SessionServer = newCompositeSessionServer(sessions)
+		logger.Info("multipipe: server flowmux enabled, subflows=", len(tubeNames))
+		return result, nil
+
+	default:
+		stopAll(outcomes)
+		return nil, fmt.Errorf("multipipe: unknown strategy %q (want flowmux|bond)", cfg.Strategy)
+	}
+}
+
+type compositeSessionServer struct {
+	children []app.SessionServer
+
+	mu      sync.Mutex
+	handler app.SessionHandler
+	started bool
+}
+
+func newCompositeSessionServer(children []app.SessionServer) *compositeSessionServer {
+	return &compositeSessionServer{children: children}
+}
+
+func (c *compositeSessionServer) SetSessionHandler(handler app.SessionHandler) {
+	c.mu.Lock()
+	c.handler = handler
+	c.mu.Unlock()
+	for _, child := range c.children {
+		child.SetSessionHandler(handler)
+	}
+}
+
+func (c *compositeSessionServer) Start(ctx context.Context) error {
+	c.mu.Lock()
+	if c.started {
+		c.mu.Unlock()
+		return nil
+	}
+	c.started = true
+	handler := c.handler
+	c.mu.Unlock()
+
+	for i, child := range c.children {
+		if handler != nil {
+			child.SetSessionHandler(handler)
+		}
+		if err := child.Start(ctx); err != nil {
+			for j := i - 1; j >= 0; j-- {
+				_ = c.children[j].Stop(context.Background())
+			}
+			c.mu.Lock()
+			c.started = false
+			c.mu.Unlock()
+			return fmt.Errorf("multipipe: start subflow session %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (c *compositeSessionServer) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	if !c.started {
+		c.mu.Unlock()
+		return nil
+	}
+	c.started = false
+	c.mu.Unlock()
+
+	for i := len(c.children) - 1; i >= 0; i-- {
+		_ = c.children[i].Stop(ctx)
+	}
+	return nil
+}
+
+var _ app.SessionServer = (*compositeSessionServer)(nil)
 
 func buildAll(
 	ctx context.Context,
@@ -253,11 +395,11 @@ func buildOne(
 	if err != nil {
 		return outcome{idx: i, err: fmt.Errorf("multipipe: transport %d (%s): %w", i, spec.Type, err)}
 	}
-	if res.Transport == nil {
+	if res.Transport == nil && res.SessionServer == nil {
 		return outcome{idx: i, err: fmt.Errorf("multipipe: transport %d (%s): build returned no transport", i, spec.Type)}
 	}
 
-	if spec.RateLimitKB > 0 {
+	if spec.RateLimitKB > 0 && res.Transport != nil {
 		logger.Info("multipipe: subflow ", i, " (", spec.Type,
 			") rate-limited to ", spec.RateLimitKB, " KB/s")
 		res.Transport = transport.NewRateLimited(res.Transport, spec.RateLimitKB)

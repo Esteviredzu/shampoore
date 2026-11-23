@@ -13,6 +13,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/app"
 	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
 	"github.com/Esteviredzu/shampoore/internal/panelstore"
+	"github.com/Esteviredzu/shampoore/internal/transport/silo"
 )
 
 func TestSubscriptionRejectsExpiredAndOverLimit(t *testing.T) {
@@ -433,6 +434,19 @@ func TestSubscriptionMultiRoutes(t *testing.T) {
 			if raw["password"] != relay.GeneratedSecrets["raw_ws_password"] {
 				t.Fatalf("bond raw_ws password = %v", raw["password"])
 			}
+
+			if raw["room"] != "route-"+itoa(bond.ID) {
+				t.Fatalf("bond raw_ws room = %v, want route-%s", raw["room"], itoa(bond.ID))
+			}
+		}
+		if tc.strategy == panelstore.MultiStrategyFlowMux {
+			var raw map[string]any
+			if err := json.Unmarshal(cfg.Transports[0].Transport, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if raw["tunnel_id"] != "route-"+itoa(flow.ID) {
+				t.Fatalf("flowmux silo tunnel_id = %v, want route-%s", raw["tunnel_id"], itoa(flow.ID))
+			}
 		}
 	}
 
@@ -479,5 +493,141 @@ func TestSubscriptionMultiRoutes(t *testing.T) {
 	}
 	if multiLinks != 2 {
 		t.Fatalf("multi links = %d, want 2 (bond=%d flowmux=%d)", multiLinks, bond.ID, flow.ID)
+	}
+}
+
+type siloMultiChild struct {
+	Type      string          `json:"type"`
+	Transport json.RawMessage `json:"transport"`
+}
+
+type siloMultiConfig struct {
+	Strategy   string           `json:"strategy"`
+	Transports []siloMultiChild `json:"transports"`
+}
+
+func siloTunnelID(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode silo transport: %v", err)
+	}
+	id, _ := cfg["tunnel_id"].(string)
+	return id
+}
+
+func TestSubscriptionSiloPrefixesAreIsolated(t *testing.T) {
+	api, store, _, _ := newControlTestAPI(t)
+	topo := seedTopology(t, store)
+	ctx := context.Background()
+
+	var single panelstore.Route
+	for _, route := range topo.routes {
+		if route.TransportType == panelstore.TransportSilo {
+			single = route
+			break
+		}
+	}
+	if single.ID == 0 {
+		t.Fatal("silo route not found")
+	}
+	bond, err := store.CreateRoute(ctx, panelstore.Route{
+		Name:          "bond-silo",
+		TransportType: panelstore.TransportMulti,
+		MultiStrategy: panelstore.MultiStrategyBond,
+		SubRouteIDs:   []int64{topo.routes[0].ID, single.ID},
+		Enabled:       true,
+	})
+	if err != nil {
+		t.Fatalf("create bond route: %v", err)
+	}
+
+	rec := perform(api.PublicHandler(), http.MethodGet, "/sub/"+topo.user.SubToken, "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscription = %d: %s", rec.Code, rec.Body.String())
+	}
+	var settings []app.Settings
+	if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	var singleSettings, multiSettings *app.Settings
+	for i := range settings {
+		switch settings[i].Name {
+		case single.Name:
+			singleSettings = &settings[i]
+		case bond.Name:
+			multiSettings = &settings[i]
+		}
+	}
+	if singleSettings == nil || multiSettings == nil {
+		t.Fatalf("silo/multi settings not found in %d entries", len(settings))
+	}
+
+	singleTunnel := siloTunnelID(t, singleSettings.Transport)
+	if want := "route-" + itoa(single.ID); singleTunnel != want {
+		t.Fatalf("single silo tunnel_id = %q, want %q", singleTunnel, want)
+	}
+	var payload siloMultiConfig
+	if err := json.Unmarshal(multiSettings.Transport, &payload); err != nil {
+		t.Fatalf("decode multi transport: %v", err)
+	}
+	childTunnel := ""
+	for _, child := range payload.Transports {
+		if child.Type == "silo" {
+			childTunnel = siloTunnelID(t, child.Transport)
+		}
+	}
+	if want := "route-" + itoa(bond.ID); childTunnel != want {
+		t.Fatalf("bond silo tunnel_id = %q, want %q", childTunnel, want)
+	}
+
+	singlePrefix := silo.C2SPrefix(singleTunnel, topo.user.ID)
+	childPrefix := silo.C2SPrefix(childTunnel, topo.user.ID)
+	wantSingle := singleTunnel + "/users/" + topo.user.ID + "/c2s/"
+	if singlePrefix != wantSingle {
+		t.Fatalf("single prefix = %q, want %q", singlePrefix, wantSingle)
+	}
+	if singlePrefix == childPrefix ||
+		strings.HasPrefix(singlePrefix, childPrefix) ||
+		strings.HasPrefix(childPrefix, singlePrefix) {
+		t.Fatalf("silo prefixes overlap: single=%q bond-child=%q", singlePrefix, childPrefix)
+	}
+
+	rec = perform(api.Handler(), http.MethodGet, "/api/users/"+topo.user.ID+"/bundle", "", authRequest())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bundle = %d: %s", rec.Code, rec.Body.String())
+	}
+	var bundle OfflineBundle
+	if err := json.Unmarshal(rec.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	foundSingle, foundChild := false, false
+	for _, link := range bundle.Links {
+		parsed, err := app.ParseURL(link)
+		if err != nil {
+			t.Fatalf("parse bundle link %q: %v", link, err)
+		}
+		switch parsed.Type {
+		case panelstore.TransportSilo:
+			if got := silo.C2SPrefix(siloTunnelID(t, parsed.Transport), topo.user.ID); got == singlePrefix {
+				foundSingle = true
+			}
+		case panelstore.TransportMulti:
+			var mp siloMultiConfig
+			if err := json.Unmarshal(parsed.Transport, &mp); err != nil {
+				t.Fatalf("decode bundle multi transport: %v", err)
+			}
+			for _, child := range mp.Transports {
+				if child.Type != "silo" {
+					continue
+				}
+				if got := silo.C2SPrefix(siloTunnelID(t, child.Transport), topo.user.ID); got == childPrefix {
+					foundChild = true
+				}
+			}
+		}
+	}
+	if !foundSingle || !foundChild {
+		t.Fatalf("bundle links lost route namespaces: single=%v child=%v", foundSingle, foundChild)
 	}
 }

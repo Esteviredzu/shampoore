@@ -56,3 +56,10 @@ func (r *rateLimited) WalkLayers() []Layer {
 	}
 	return nil
 }
+
+func (r *rateLimited) Authenticated() bool {
+	if a, ok := r.Transport.(interface{ Authenticated() bool }); ok {
+		return a.Authenticated()
+	}
+	return false
+}

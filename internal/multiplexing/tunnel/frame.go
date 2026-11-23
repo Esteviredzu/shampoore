@@ -20,6 +20,10 @@ const (
 	frameTypeHello byte = 5
 	frameTypeError byte = 6
 
+	frameTypePing    byte = 7
+	frameTypePong    byte = 8
+	frameTypeOpenAck byte = 9
+
 	FrameHeaderSize = 30
 
 	frameOffMagic    = 0
@@ -42,6 +46,10 @@ const (
 	FrameReset FrameType = FrameType(frameTypeReset)
 	FrameHello FrameType = FrameType(frameTypeHello)
 	FrameError FrameType = FrameType(frameTypeError)
+
+	FramePing    FrameType = FrameType(frameTypePing)
+	FramePong    FrameType = FrameType(frameTypePong)
+	FrameOpenAck FrameType = FrameType(frameTypeOpenAck)
 )
 
 type Hello struct {
@@ -138,6 +146,15 @@ func EncodeFrame(f *TunnelFrame) ([]byte, error) {
 			return nil, fmt.Errorf("tunnel: marshal error frame: %w", err)
 		}
 		payload = b
+
+	case FramePing, FramePong, FrameOpenAck:
+		if len(f.Data) > 0 {
+			return nil, fmt.Errorf("tunnel: control frame cannot contain data")
+		}
+		if len(f.Metadata) > 0 {
+			return nil, fmt.Errorf("tunnel: control frame cannot contain metadata")
+		}
+		payload = nil
 
 	default:
 		return nil, fmt.Errorf("tunnel: unknown frame type: %d", byte(f.Type))
@@ -266,8 +283,15 @@ func (d *FrameDecoder) Feed(data []byte) ([]*TunnelFrame, error) {
 			}
 			frame.Error = &errInfo
 
+		case FramePing, FramePong, FrameOpenAck:
+			if len(payload) > 0 {
+				return frames, fmt.Errorf("tunnel: control frame has payload")
+			}
+
 		default:
-			return frames, fmt.Errorf("tunnel: unknown frame type: %d", ftype)
+
+			d.off = base + total
+			continue
 		}
 
 		frames = append(frames, frame)

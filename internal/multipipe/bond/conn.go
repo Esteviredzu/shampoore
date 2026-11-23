@@ -1,7 +1,9 @@
 package bond
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,27 +29,98 @@ const (
 	enqueueDeadline = 30 * time.Second
 	enqueueWaitTick = 200 * time.Millisecond
 
-	maxReorderChunks  = 1024
-	defaultGapTimeout = 5 * time.Second
+	maxReorderChunks = 1024
+
+	defaultGapTimeout = 15 * time.Second
 	minGapTick        = 10 * time.Millisecond
 
+	defaultNackInterval = 200 * time.Millisecond
+
+	maxSentChunks = 2048
+	maxSentBytes  = 8 * 1024 * 1024
+
+	maxRetiredSessions = 8
+
+	maxReadyChunks = 4096
+
 	maxConsecutiveResets = 8
+
+	keepaliveSendTimeout = 5 * time.Second
+
+	warmupChunks = 8
 )
 
+var keepaliveInterval = 3 * time.Second
+
 var errSubflowReceiveStopped = errors.New("subflow receive stopped")
+
+var errPeerSessionReset = fmt.Errorf("%w: bond: peer session reset", transport.ErrTransportReset)
+
+type chunkKind uint8
+
+const (
+	chunkPrimary chunkKind = iota
+
+	chunkDuplicate
+
+	chunkRetransmit
+)
 
 type queuedChunk struct {
 	seq  uint32
 	data []byte
+	kind chunkKind
+
+	epoch uint32
 }
 
 type connOptions struct {
-	maxReorder int
-	gapTimeout time.Duration
+	maxReorder    int
+	gapTimeout    time.Duration
+	nackInterval  time.Duration
+	maxSentChunks int
+	maxSentBytes  int
+
+	retiredLocal []uint32
 }
 
 func defaultConnOptions() connOptions {
-	return connOptions{maxReorder: maxReorderChunks, gapTimeout: defaultGapTimeout}
+	return connOptions{
+		maxReorder:    maxReorderChunks,
+		gapTimeout:    defaultGapTimeout,
+		nackInterval:  defaultNackInterval,
+		maxSentChunks: maxSentChunks,
+		maxSentBytes:  maxSentBytes,
+	}
+}
+
+func aggregateMaxPayload(tubes []tubeLike) int {
+	maxPayload := 65535
+	for _, t := range tubes {
+		if m := t.MaxMessageSize(); m > 200 && m-100 < maxPayload {
+			maxPayload = m - 100
+		}
+	}
+	if maxPayload < 1024 {
+		maxPayload = 1024
+	}
+	if maxPayload > 60000 {
+		maxPayload = 60000
+	}
+	return maxPayload
+}
+
+func newSessionID() uint32 {
+	var buf [4]byte
+	for attempt := 0; attempt < 8; attempt++ {
+		if _, err := rand.Read(buf[:]); err != nil {
+			break
+		}
+		if id := binary.BigEndian.Uint32(buf[:]); id != 0 {
+			return id
+		}
+	}
+	return uint32(time.Now().UnixNano()) | 1
 }
 
 type BondConn struct {
@@ -58,19 +131,50 @@ type BondConn struct {
 	maxPayload int
 	logger     logging.ContextLogger
 
-	maxReorder int
-	gapTimeout time.Duration
+	maxReorder    int
+	gapTimeout    time.Duration
+	nackInterval  time.Duration
+	maxSentChunks int
+	maxSentBytes  int
 
-	sendSeq atomic.Uint32
-	recvSeq uint32
+	session uint32
 
 	readySignal chan struct{}
+	nackSignal  chan struct{}
+
+	windowSignal chan struct{}
+
+	resetSignal chan struct{}
+	softReset   atomic.Bool
+
+	readyMu    sync.Mutex
+	readyQueue [][]byte
 
 	mu       sync.Mutex
 	reorder  map[uint32][]byte
 	gapSince time.Time
 	readCh   chan []byte
 	readBuf  []byte
+	readMu   sync.Mutex
+
+	recvSeq      uint32
+	recvAckState atomic.Uint64
+
+	remoteSession    uint32
+	remoteSessionSet bool
+	retiredSessions  map[uint32]struct{}
+	retiredOrder     []uint32
+
+	retiredLocal map[uint32]struct{}
+
+	sentMu    sync.Mutex
+	unacked   map[uint32][]byte
+	sentBytes int
+	sentAck   uint32
+
+	sendSeq uint32
+
+	sendEpoch atomic.Uint32
 
 	readers atomic.Int32
 
@@ -93,6 +197,18 @@ func NewBondConn(
 	return newBondConn(ctx, names, tubes, logger, defaultConnOptions())
 }
 
+func newBondConnWithRetired(
+	ctx context.Context,
+	names []string,
+	tubes []tubeLike,
+	logger logging.ContextLogger,
+	retired []uint32,
+) *BondConn {
+	opts := defaultConnOptions()
+	opts.retiredLocal = append([]uint32(nil), retired...)
+	return newBondConn(ctx, names, tubes, logger, opts)
+}
+
 func newBondConn(
 	ctx context.Context,
 	names []string,
@@ -106,39 +222,53 @@ func newBondConn(
 	if opts.gapTimeout <= 0 {
 		opts.gapTimeout = defaultGapTimeout
 	}
+	if opts.nackInterval <= 0 {
+		opts.nackInterval = defaultNackInterval
+	}
+	if opts.maxSentChunks <= 0 {
+		opts.maxSentChunks = maxSentChunks
+	}
+	if opts.maxSentBytes <= 0 {
+		opts.maxSentBytes = maxSentBytes
+	}
 
 	c, cancel := context.WithCancel(ctx)
-
-	maxPayload := 65535
-	for _, t := range tubes {
-		if m := t.MaxMessageSize(); m > 200 && m-100 < maxPayload {
-			maxPayload = m - 100
+	maxPayload := aggregateMaxPayload(tubes)
+	retiredLocal := make(map[uint32]struct{}, len(opts.retiredLocal))
+	for _, id := range opts.retiredLocal {
+		if id != 0 {
+			retiredLocal[id] = struct{}{}
 		}
-	}
-	if maxPayload < 1024 {
-		maxPayload = 1024
-	}
-	if maxPayload > 60000 {
-		maxPayload = 60000
 	}
 
 	bc := &BondConn{
-		ctx:         c,
-		cancel:      cancel,
-		sched:       newScheduler(names, tubes),
-		maxPayload:  maxPayload,
-		logger:      logger,
-		maxReorder:  opts.maxReorder,
-		gapTimeout:  opts.gapTimeout,
-		readySignal: make(chan struct{}, 1),
-		reorder:     make(map[uint32][]byte),
-		readCh:      make(chan []byte, 512),
-		failed:      make(chan struct{}),
-		readErr:     make(chan error, 1),
-		closed:      make(chan struct{}),
+		ctx:             c,
+		cancel:          cancel,
+		sched:           newScheduler(names, tubes),
+		maxPayload:      maxPayload,
+		logger:          logger,
+		maxReorder:      opts.maxReorder,
+		gapTimeout:      opts.gapTimeout,
+		nackInterval:    opts.nackInterval,
+		maxSentChunks:   opts.maxSentChunks,
+		maxSentBytes:    opts.maxSentBytes,
+		session:         newSessionID(),
+		readySignal:     make(chan struct{}, 1),
+		nackSignal:      make(chan struct{}, 1),
+		windowSignal:    make(chan struct{}, 1),
+		resetSignal:     make(chan struct{}, 1),
+		reorder:         make(map[uint32][]byte),
+		readCh:          make(chan []byte, 512),
+		retiredSessions: make(map[uint32]struct{}),
+		retiredLocal:    retiredLocal,
+		unacked:         make(map[uint32][]byte),
+		failed:          make(chan struct{}),
+		readErr:         make(chan error, 1),
+		closed:          make(chan struct{}),
 	}
 
 	bc.readers.Store(int32(len(bc.sched.subflows)))
+	bc.sendEpoch.Store(1)
 	for _, sf := range bc.sched.subflows {
 		bc.wg.Add(1)
 		go bc.readLoop(sf)
@@ -146,11 +276,55 @@ func newBondConn(
 		go bc.workerLoop(sf)
 	}
 	bc.wg.Add(1)
+	go bc.dispatchLoop()
+	bc.wg.Add(1)
 	go bc.statsLoop()
 	bc.wg.Add(1)
 	go bc.gapLoop()
+	bc.wg.Add(1)
+	go bc.nackLoop()
+	bc.wg.Add(1)
+	go bc.keepaliveLoop()
 
 	return bc
+}
+
+func (bc *BondConn) keepaliveLoop() {
+	defer bc.wg.Done()
+
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bc.closed:
+			return
+		case <-bc.failed:
+			return
+		case <-bc.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		ack, ackSession := bc.outboundAck()
+		frame := encodeControlFrame(controlPing, bc.session, ack, ackSession, nil)
+		for _, sf := range bc.sched.subflows {
+			if bc.ctx.Err() != nil || bc.isClosed() || bc.terminalErr() != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(bc.ctx, keepaliveSendTimeout)
+			err := sf.tube.Send(ctx, frame)
+			cancel()
+			if err != nil {
+				bc.sched.MarkDead(sf, err)
+				if bc.logger != nil {
+					bc.logger.Debug("bond: keepalive on ", sf.name, " failed: ", err)
+				}
+				continue
+			}
+			bc.sched.MarkAlive(sf)
+		}
+	}
 }
 
 func (bc *BondConn) fail(reason error) {
@@ -206,16 +380,24 @@ func (bc *BondConn) workerLoop(sf *subflow) {
 			case bc.readySignal <- struct{}{}:
 			default:
 			}
+			sf.inflight.Add(1)
 			bc.sendChunk(sf, chunk)
+			sf.inflight.Add(-1)
 		}
 	}
 }
 
 func (bc *BondConn) sendChunk(sf *subflow, chunk queuedChunk) {
-	buf := make([]byte, frameHeaderSize+len(chunk.data))
-	binary.BigEndian.PutUint32(buf[0:4], chunk.seq)
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(chunk.data)))
-	copy(buf[frameHeaderSize:], chunk.data)
+
+	if chunk.epoch != 0 && chunk.epoch != bc.sendEpoch.Load() {
+		return
+	}
+	ack, ackSession := bc.outboundAck()
+	buf, err := encodeFrame(chunk.seq, ack, ackSession, bc.session, chunk.data)
+	if err != nil {
+		bc.fail(fmt.Errorf("bond: encode chunk seq=%d: %w", chunk.seq, err))
+		return
+	}
 
 	tried := map[*subflow]struct{}{sf: {}}
 	path := sf
@@ -235,14 +417,36 @@ func (bc *BondConn) sendChunk(sf *subflow, chunk queuedChunk) {
 			return
 		}
 
+		if bc.ctx.Err() != nil || bc.isClosed() {
+
+			return
+		}
+
 		lastErr = err
-		bc.sched.MarkDead(path, err)
-		if bc.logger != nil {
-			bc.logger.Warn("bond: send on ", path.name, " failed: ", err)
+		switch chunk.kind {
+		case chunkDuplicate:
+
+			if bc.logger != nil {
+				bc.logger.Debug("bond: duplicate seq=", chunk.seq, " on ", path.name, " dropped: ", err)
+			}
+			return
+		default:
+			bc.sched.MarkDead(path, err)
+			if bc.logger != nil {
+				bc.logger.Warn("bond: send on ", path.name, " failed: ", err)
+			}
 		}
 
 		alt := bc.sched.pickAlive(tried)
 		if alt == nil {
+			if chunk.kind == chunkRetransmit {
+
+				if bc.logger != nil {
+					bc.logger.Debug("bond: retransmit seq=", chunk.seq,
+						" found no live subflow (last error: ", lastErr, ")")
+				}
+				return
+			}
 			bc.fail(fmt.Errorf(
 				"bond: chunk seq=%d lost: no alive subflow could deliver it (last error: %v)",
 				chunk.seq, lastErr))
@@ -256,9 +460,8 @@ func (bc *BondConn) sendChunk(sf *subflow, chunk queuedChunk) {
 func (bc *BondConn) readLoop(sf *subflow) {
 	defer bc.wg.Done()
 	defer func() {
-
 		bc.sched.MarkDead(sf, errSubflowReceiveStopped)
-		if bc.readers.Add(-1) == 0 && bc.terminalErr() == nil && !bc.isClosed() {
+		if bc.readers.Add(-1) == 0 && bc.terminalErr() == nil && !bc.isClosed() && bc.ctx.Err() == nil {
 			bc.fail(errors.New("bond: all subflows stopped receiving"))
 		}
 	}()
@@ -267,16 +470,33 @@ func (bc *BondConn) readLoop(sf *subflow) {
 	for {
 		data, err := sf.tube.Receive(bc.ctx)
 		if err != nil {
-			if errors.Is(err, transport.ErrTransportReset) && bc.ctx.Err() == nil {
 
+			if bc.ctx.Err() != nil || bc.isClosed() || bc.terminalErr() != nil {
+				return
+			}
+			if errors.Is(err, transport.ErrTransportReset) {
+				resets++
 				if bc.logger != nil {
 					bc.logger.Warn("bond: subflow ", sf.name, " transport reset: ", err)
 				}
-				resets++
-				if resets > maxConsecutiveResets {
+				if resets > maxConsecutiveResets && bc.readers.Load() > 1 {
 
-					bc.fail(fmt.Errorf("bond: subflow %s keeps resetting without delivering data", sf.name))
+					if bc.logger != nil {
+						bc.logger.Warn("bond: subflow ", sf.name,
+							" keeps resetting without delivering data; dropping it")
+					}
 					return
+				}
+				if resets > 1 {
+					delay := time.Duration(resets) * 50 * time.Millisecond
+					if delay > 500*time.Millisecond {
+						delay = 500 * time.Millisecond
+					}
+					select {
+					case <-bc.ctx.Done():
+						return
+					case <-time.After(delay):
+					}
 				}
 				continue
 			}
@@ -284,13 +504,61 @@ func (bc *BondConn) readLoop(sf *subflow) {
 		}
 		resets = 0
 
-		seq, payload, err := decodeFrame(data)
+		bc.sched.MarkAlive(sf)
+
+		if len(data) == 0 {
+			if bc.logger != nil {
+				bc.logger.Debug("bond: ignoring empty message from ", sf.name)
+			}
+			continue
+		}
+
+		frame, err := decodeFrame(data)
 		if err != nil {
 
-			bc.fail(fmt.Errorf("bond: bad frame from %s: %w", sf.name, err))
+			bc.fail(fmt.Errorf("bond: bad frame from %s (%d bytes): %w%s",
+				sf.name, len(data), err, framingHint(data)))
 			return
 		}
-		bc.deliver(seq, payload)
+		if !bc.noteRemoteSession(frame.session) {
+
+			continue
+		}
+		if bc.staleLocalAck(frame.ackSession) {
+
+			continue
+		}
+
+		if frame.ackSession == bc.session {
+			bc.ackSent(frame.ack)
+		}
+
+		if frame.isControl() {
+
+			kind, args, ok := decodeControl(frame.payload)
+			if !ok {
+				if bc.logger != nil {
+					bc.logger.Debug("bond: ignoring unknown control frame from ", sf.name)
+				}
+				continue
+			}
+			if kind == controlNack {
+				bc.handleNack(args)
+			}
+			continue
+		}
+		bc.deliver(frame.seq, frame.payload)
+	}
+}
+
+func framingHint(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte("SPV2")):
+		return " (encrypted SPV2 message reached bond without SecurePipe: check encryption_password and the subflow wrapping)"
+	case bytes.HasPrefix(data, []byte("TUN1")):
+		return " (raw TUN1 frame reached bond: the peer is not using bond framing; check the multi strategy)"
+	default:
+		return ""
 	}
 }
 
@@ -313,10 +581,14 @@ func (bc *BondConn) deliver(seq uint32, payload []byte) {
 	}
 
 	bc.reorder[seq] = payload
+	newGap := false
 	if seq != bc.recvSeq && bc.gapSince.IsZero() {
 		bc.gapSince = time.Now()
+		newGap = true
 	}
 
+	ready := false
+	overflow := false
 	for {
 		next, ok := bc.reorder[bc.recvSeq]
 		if !ok {
@@ -324,21 +596,388 @@ func (bc *BondConn) deliver(seq uint32, payload []byte) {
 		}
 		delete(bc.reorder, bc.recvSeq)
 		bc.recvSeq++
-		select {
-		case bc.readCh <- next:
-		case <-bc.closed:
-			bc.mu.Unlock()
-			return
-		case <-bc.failed:
-			bc.mu.Unlock()
-			return
+		if !bc.enqueueReadyLocked(next) {
+			overflow = true
+			break
 		}
+		ready = true
+	}
+	if ready {
+		bc.recvAckState.Store(ackState(bc.recvSeq, bc.remoteSession))
 	}
 
 	if len(bc.reorder) == 0 {
 		bc.gapSince = time.Time{}
 	}
 	bc.mu.Unlock()
+
+	if overflow {
+		bc.fail(fmt.Errorf("bond: dispatch queue overflow (consumer is not reading)"))
+		return
+	}
+
+	if newGap {
+
+		select {
+		case bc.nackSignal <- struct{}{}:
+		default:
+		}
+	}
+
+	if ready {
+		select {
+		case bc.readySignal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func ackState(ack, session uint32) uint64 {
+	return uint64(ack)<<32 | uint64(session)
+}
+
+func (bc *BondConn) outboundAck() (uint32, uint32) {
+	packed := bc.recvAckState.Load()
+	return uint32(packed >> 32), uint32(packed)
+}
+
+func (bc *BondConn) noteRemoteSession(session uint32) bool {
+	if session == 0 {
+		return true
+	}
+	bc.mu.Lock()
+	if !bc.remoteSessionSet {
+		bc.remoteSession = session
+		bc.remoteSessionSet = true
+		bc.recvAckState.Store(ackState(bc.recvSeq, session))
+		bc.mu.Unlock()
+		return true
+	}
+	if session == bc.remoteSession {
+		bc.mu.Unlock()
+		return true
+	}
+	if _, retired := bc.retiredSessions[session]; retired {
+		bc.mu.Unlock()
+		return false
+	}
+	previous := bc.remoteSession
+	bc.retireSessionLocked(previous)
+	bc.remoteSession = session
+	bc.reorder = make(map[uint32][]byte)
+	bc.recvSeq = 0
+	bc.recvAckState.Store(ackState(0, session))
+	bc.gapSince = time.Time{}
+	bc.mu.Unlock()
+
+	bc.resetSentState()
+	bc.signalPeerReset()
+
+	if bc.logger != nil {
+		bc.logger.Warn("bond: peer session changed (", previous, " -> ", session,
+			"); resetting unacked/reorder and restarting both streams from seq=0")
+	}
+	return true
+}
+
+func (bc *BondConn) signalPeerReset() {
+	bc.softReset.Store(true)
+	select {
+	case bc.resetSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (bc *BondConn) takePeerReset() bool {
+	return bc.softReset.Swap(false)
+}
+
+func (bc *BondConn) staleLocalAck(ackSession uint32) bool {
+	if ackSession == 0 || ackSession == bc.session || len(bc.retiredLocal) == 0 {
+		return false
+	}
+	_, retired := bc.retiredLocal[ackSession]
+	return retired
+}
+
+func (bc *BondConn) retireSessionLocked(session uint32) {
+	if session == 0 {
+		return
+	}
+	if _, ok := bc.retiredSessions[session]; ok {
+		return
+	}
+	bc.retiredSessions[session] = struct{}{}
+	bc.retiredOrder = append(bc.retiredOrder, session)
+	for len(bc.retiredOrder) > maxRetiredSessions {
+		delete(bc.retiredSessions, bc.retiredOrder[0])
+		bc.retiredOrder = bc.retiredOrder[1:]
+	}
+}
+
+func (bc *BondConn) reserveChunk(data []byte) (queuedChunk, error) {
+	for {
+		select {
+		case <-bc.closed:
+			return queuedChunk{}, net.ErrClosed
+		case <-bc.failed:
+			return queuedChunk{}, bc.failErr
+		default:
+		}
+
+		bc.sentMu.Lock()
+		if bc.sentWindowOpenLocked() {
+			seq := bc.sendSeq
+			bc.sendSeq++
+			bc.unacked[seq] = data
+			bc.sentBytes += len(data)
+			chunk := queuedChunk{
+				seq:   seq,
+				data:  data,
+				kind:  chunkPrimary,
+				epoch: bc.sendEpoch.Load(),
+			}
+			bc.sentMu.Unlock()
+			return chunk, nil
+		}
+		bc.sentMu.Unlock()
+
+		select {
+		case <-bc.closed:
+			return queuedChunk{}, net.ErrClosed
+		case <-bc.failed:
+			return queuedChunk{}, bc.failErr
+		case <-bc.ctx.Done():
+			if err := bc.terminalErr(); err != nil {
+				return queuedChunk{}, err
+			}
+			return queuedChunk{}, net.ErrClosed
+		case <-bc.windowSignal:
+		}
+	}
+}
+
+func (bc *BondConn) sentWindowOpenLocked() bool {
+	if len(bc.unacked) >= bc.maxSentChunks {
+		return false
+	}
+	return bc.sentBytes < bc.maxSentBytes || len(bc.unacked) == 0
+}
+
+func (bc *BondConn) signalSendWindow() {
+	select {
+	case bc.windowSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (bc *BondConn) ackSent(ack uint32) {
+	if ack == 0 {
+		return
+	}
+	bc.sentMu.Lock()
+
+	if ack <= bc.sentAck || ack > bc.sendSeq {
+		bc.sentMu.Unlock()
+		return
+	}
+	if ack-bc.sentAck > uint32(len(bc.unacked)) {
+		for seq, data := range bc.unacked {
+			if seq < ack {
+				bc.sentBytes -= len(data)
+				delete(bc.unacked, seq)
+			}
+		}
+	} else {
+		for seq := bc.sentAck; seq != ack; seq++ {
+			if data, ok := bc.unacked[seq]; ok {
+				bc.sentBytes -= len(data)
+				delete(bc.unacked, seq)
+			}
+		}
+	}
+	bc.sentAck = ack
+	bc.sentMu.Unlock()
+	bc.signalSendWindow()
+}
+
+func (bc *BondConn) resetSentState() {
+	bc.sentMu.Lock()
+	bc.sendEpoch.Add(1)
+	bc.sendSeq = 0
+	bc.sentAck = 0
+	bc.unacked = make(map[uint32][]byte)
+	bc.sentBytes = 0
+	bc.sentMu.Unlock()
+
+	bc.signalSendWindow()
+}
+
+func (bc *BondConn) sentChunk(seq uint32) ([]byte, uint32, bool) {
+	bc.sentMu.Lock()
+	defer bc.sentMu.Unlock()
+	data, ok := bc.unacked[seq]
+	return data, bc.sendEpoch.Load(), ok
+}
+
+func (bc *BondConn) unackedCount() int {
+	bc.sentMu.Lock()
+	defer bc.sentMu.Unlock()
+	return len(bc.unacked)
+}
+
+func (bc *BondConn) missingSeqs() []uint32 {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if len(bc.reorder) == 0 || bc.gapSince.IsZero() {
+		return nil
+	}
+	highest := bc.recvSeq
+	for seq := range bc.reorder {
+		if seq > highest {
+			highest = seq
+		}
+	}
+	limit := bc.recvSeq + maxNackSeqs
+	if limit < bc.recvSeq || limit > highest {
+		limit = highest
+	}
+	missing := make([]uint32, 0, maxNackSeqs)
+	for seq := bc.recvSeq; seq <= limit; seq++ {
+		if _, ok := bc.reorder[seq]; !ok {
+			missing = append(missing, seq)
+		}
+	}
+	return missing
+}
+
+func (bc *BondConn) nackLoop() {
+	defer bc.wg.Done()
+
+	ticker := time.NewTicker(bc.nackInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bc.closed:
+			return
+		case <-bc.failed:
+			return
+		case <-bc.ctx.Done():
+			return
+		case <-bc.nackSignal:
+		case <-ticker.C:
+		}
+		bc.sendNack()
+	}
+}
+
+func (bc *BondConn) sendNack() {
+	if bc.terminalErr() != nil || bc.isClosed() || bc.ctx.Err() != nil {
+		return
+	}
+	missing := bc.missingSeqs()
+	if len(missing) == 0 {
+		return
+	}
+	sf := bc.sched.pickControl()
+	if sf == nil {
+		return
+	}
+	ack, ackSession := bc.outboundAck()
+	frame := encodeControlFrame(controlNack, bc.session, ack, ackSession, missing)
+	ctx, cancel := context.WithTimeout(bc.ctx, writeTimeout)
+	err := sf.tube.Send(ctx, frame)
+	cancel()
+	if err != nil {
+		bc.sched.MarkDead(sf, err)
+		if bc.logger != nil {
+			bc.logger.Debug("bond: nack on ", sf.name, " failed: ", err)
+		}
+		return
+	}
+	bc.sched.MarkAlive(sf)
+	if bc.logger != nil {
+		bc.logger.Debug("bond: nack seqs=", missing, " via ", sf.name)
+	}
+}
+
+func (bc *BondConn) handleNack(seqs []uint32) {
+	if len(seqs) == 0 || bc.terminalErr() != nil || bc.isClosed() || bc.ctx.Err() != nil {
+		return
+	}
+	bc.wg.Add(1)
+	go func() {
+		defer bc.wg.Done()
+		retransmitted := 0
+		for _, seq := range seqs {
+			if bc.terminalErr() != nil || bc.isClosed() || bc.ctx.Err() != nil {
+				return
+			}
+			data, epoch, ok := bc.sentChunk(seq)
+			if !ok {
+				continue
+			}
+			sf := bc.sched.pickControl()
+			if sf == nil {
+				return
+			}
+			bc.sendChunk(sf, queuedChunk{seq: seq, data: data, kind: chunkRetransmit, epoch: epoch})
+			retransmitted++
+		}
+		if retransmitted > 0 && bc.logger != nil {
+			bc.logger.Debug("bond: retransmitted ", retransmitted, " chunks after nack")
+		}
+	}()
+}
+
+func (bc *BondConn) enqueueReadyLocked(chunk []byte) bool {
+	bc.readyMu.Lock()
+	defer bc.readyMu.Unlock()
+	if len(bc.readyQueue) >= maxReadyChunks {
+		return false
+	}
+	bc.readyQueue = append(bc.readyQueue, chunk)
+	return true
+}
+
+func (bc *BondConn) dequeueReady() []byte {
+	bc.readyMu.Lock()
+	defer bc.readyMu.Unlock()
+	if len(bc.readyQueue) == 0 {
+		return nil
+	}
+	chunk := bc.readyQueue[0]
+	bc.readyQueue[0] = nil
+	bc.readyQueue = bc.readyQueue[1:]
+	return chunk
+}
+
+func (bc *BondConn) dispatchLoop() {
+	defer bc.wg.Done()
+	for {
+		if chunk := bc.dequeueReady(); chunk != nil {
+			select {
+			case bc.readCh <- chunk:
+				continue
+			case <-bc.closed:
+				return
+			case <-bc.failed:
+				return
+			case <-bc.ctx.Done():
+				return
+			}
+		}
+		select {
+		case <-bc.closed:
+			return
+		case <-bc.failed:
+			return
+		case <-bc.ctx.Done():
+			return
+		case <-bc.readySignal:
+		}
+	}
 }
 
 func (bc *BondConn) gapLoop() {
@@ -384,18 +1023,6 @@ func (bc *BondConn) gapLoop() {
 	}
 }
 
-func decodeFrame(data []byte) (uint32, []byte, error) {
-	if len(data) < frameHeaderSize {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-	seq := binary.BigEndian.Uint32(data[0:4])
-	n := binary.BigEndian.Uint32(data[4:8])
-	if int(n) > len(data)-frameHeaderSize {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-	return seq, data[frameHeaderSize : frameHeaderSize+int(n)], nil
-}
-
 func (bc *BondConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -410,20 +1037,22 @@ func (bc *BondConn) Write(p []byte) (int, error) {
 	}
 
 	total := 0
-	deadline := time.Now().Add(enqueueDeadline)
 
 	for len(p) > 0 {
 		n := len(p)
 		if n > bc.maxPayload {
 			n = bc.maxPayload
 		}
-		chunk := queuedChunk{
-			seq:  bc.sendSeq.Add(1) - 1,
-			data: make([]byte, n),
-		}
-		copy(chunk.data, p[:n])
+		data := make([]byte, n)
+		copy(data, p[:n])
 		p = p[n:]
 
+		chunk, err := bc.reserveChunk(data)
+		if err != nil {
+			return total, err
+		}
+
+		deadline := time.Now().Add(enqueueDeadline)
 		if err := bc.enqueue(chunk, deadline); err != nil {
 			return total, err
 		}
@@ -433,36 +1062,70 @@ func (bc *BondConn) Write(p []byte) (int, error) {
 }
 
 func (bc *BondConn) enqueue(chunk queuedChunk, deadline time.Time) error {
+	if chunk.seq == 0 {
+		return bc.enqueueFirst(chunk, deadline)
+	}
+	_, err := bc.enqueueChunk(chunk, deadline)
+	return err
+}
+
+func (bc *BondConn) enqueueFirst(chunk queuedChunk, deadline time.Time) error {
+	primary, err := bc.enqueueChunk(chunk, deadline)
+	if err != nil {
+		return err
+	}
+
+	dup := chunk
+	dup.kind = chunkDuplicate
+	copies := 0
+	for _, sf := range bc.sched.subflows {
+		if sf == primary || bc.sched.isDead(sf) {
+			continue
+		}
+		select {
+
+		case sf.queue <- dup:
+			copies++
+		default:
+		}
+	}
+	if copies > 0 && bc.logger != nil {
+		bc.logger.Debug("bond: first chunk seq=0 duplicated on ", copies, " extra subflows")
+	}
+	return nil
+}
+
+func (bc *BondConn) enqueueChunk(chunk queuedChunk, deadline time.Time) (*subflow, error) {
 	for {
 		select {
 		case <-bc.closed:
-			return net.ErrClosed
+			return nil, net.ErrClosed
 		case <-bc.failed:
-			return bc.failErr
+			return nil, bc.failErr
 		default:
 		}
 
-		if sf := bc.sched.pickNonFull(nil); sf != nil {
+		if sf := bc.sched.pickNonFull(nil, chunk.seq < warmupChunks); sf != nil {
 			select {
 			case sf.queue <- chunk:
-				return nil
+				return sf, nil
 			default:
 				continue
 			}
 		}
 
 		if bc.sched.allDead() {
-			return fmt.Errorf("bond: all subflows dead")
+			return nil, fmt.Errorf("bond: all subflows dead")
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("bond: enqueue timeout (all queues full)")
+			return nil, fmt.Errorf("bond: enqueue timeout (all queues full)")
 		}
 
 		select {
 		case <-bc.closed:
-			return net.ErrClosed
+			return nil, net.ErrClosed
 		case <-bc.failed:
-			return bc.failErr
+			return nil, bc.failErr
 		case <-bc.readySignal:
 		case <-time.After(enqueueWaitTick):
 		}
@@ -479,10 +1142,28 @@ func (bc *BondConn) ReadContext(ctx context.Context, p []byte) (int, error) {
 }
 
 func (bc *BondConn) readContext(ctx context.Context, p []byte) (int, error) {
+	bc.readMu.Lock()
 	if len(bc.readBuf) > 0 {
 		n := copy(p, bc.readBuf)
 		bc.readBuf = bc.readBuf[n:]
+		bc.readMu.Unlock()
 		return n, nil
+	}
+	bc.readMu.Unlock()
+
+	if err := bc.terminalErr(); err != nil {
+		select {
+		case buffered := <-bc.readErr:
+			if buffered != nil {
+				return 0, buffered
+			}
+		default:
+		}
+		return 0, err
+	}
+
+	if bc.takePeerReset() {
+		return 0, errPeerSessionReset
 	}
 
 	select {
@@ -491,23 +1172,33 @@ func (bc *BondConn) readContext(ctx context.Context, p []byte) (int, error) {
 	default:
 	}
 
-	select {
-	case data, ok := <-bc.readCh:
-		if !ok {
-			return 0, io.EOF
-		}
-		n := copy(p, data)
-		if n < len(data) {
-			bc.readBuf = data[n:]
-		}
-		return n, nil
-	case err := <-bc.readErr:
+	for {
+		select {
+		case data, ok := <-bc.readCh:
+			if !ok {
+				return 0, io.EOF
+			}
+			n := copy(p, data)
+			if n < len(data) {
+				bc.readMu.Lock()
+				bc.readBuf = data[n:]
+				bc.readMu.Unlock()
+			}
+			return n, nil
+		case err := <-bc.readErr:
+			return 0, err
+		case <-bc.resetSignal:
 
-		return 0, err
-	case <-bc.closed:
-		return 0, net.ErrClosed
-	case <-ctx.Done():
-		return 0, ctx.Err()
+			if bc.takePeerReset() {
+				return 0, errPeerSessionReset
+			}
+		case <-bc.failed:
+			return 0, bc.failErr
+		case <-bc.closed:
+			return 0, net.ErrClosed
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 }
 
@@ -536,13 +1227,15 @@ func (bc *BondConn) statsLoop() {
 			tag := ""
 			if s.Dead {
 				tag = " DEAD"
+			} else if !s.Confirmed {
+				tag = " cold"
 			}
 			parts = append(parts, fmt.Sprintf(
 				"%s{q=%d/%d rate=%dB/s%s}",
 				s.Name, s.QueueLen, s.QueueCap, rate, tag,
 			))
 		}
-		bc.logger.Info("bond[stats] ", joinStrings(parts, " "))
+		bc.logger.Info("bond[stats] ", joinStrings(parts, " "), " unacked=", bc.unackedCount())
 	}
 }
 
@@ -557,23 +1250,20 @@ func joinStrings(parts []string, sep string) string {
 	return out
 }
 
+const closeDrainTimeout = 2 * time.Second
+
 func (bc *BondConn) Close() error {
 	bc.closeOnce.Do(func() {
-
 		if bc.terminalErr() == nil {
-			drainDeadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(drainDeadline) {
-				empty := true
-				for _, sf := range bc.sched.subflows {
-					if len(sf.queue) > 0 {
-						empty = false
-						break
-					}
-				}
-				if empty {
+			deadline := time.Now().Add(closeDrainTimeout)
+			for time.Now().Before(deadline) {
+				if bc.sched.empty() {
 					break
 				}
-				time.Sleep(20 * time.Millisecond)
+				select {
+				case <-bc.ctx.Done():
+				case <-time.After(5 * time.Millisecond):
+				}
 			}
 		}
 		close(bc.closed)

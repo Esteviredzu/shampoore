@@ -195,15 +195,20 @@ func TestBondCarriesSubscriptionIdentity(t *testing.T) {
 		}
 		var decoded []bondFrame
 		for _, raw := range frames {
-			if len(raw) < 8 {
+
+			if len(raw) < 20 {
 				continue
 			}
 			seq := binary.BigEndian.Uint32(raw[0:4])
-			size := int(binary.BigEndian.Uint32(raw[4:8]))
-			if size < 0 || 8+size > len(raw) {
+			if seq == ^uint32(0) {
+
 				continue
 			}
-			decoded = append(decoded, bondFrame{seq: seq, data: raw[8 : 8+size]})
+			size := int(binary.BigEndian.Uint32(raw[16:20]))
+			if size < 0 || 20+size > len(raw) {
+				continue
+			}
+			decoded = append(decoded, bondFrame{seq: seq, data: raw[20 : 20+size]})
 		}
 		for i := 0; i < len(decoded); i++ {
 			for j := i + 1; j < len(decoded); j++ {
@@ -215,6 +220,10 @@ func TestBondCarriesSubscriptionIdentity(t *testing.T) {
 		var out []byte
 		next := uint32(0)
 		for _, f := range decoded {
+			if f.seq < next {
+
+				continue
+			}
 			if f.seq != next {
 				return nil
 			}

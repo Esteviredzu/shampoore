@@ -18,18 +18,22 @@ import (
 const (
 	DefaultMaxMessageSize = 16 << 20
 	defaultPingInterval   = 30 * time.Second
+	defaultPongWait       = 45 * time.Second
 	defaultWriteTimeout   = 10 * time.Second
 
 	streamPath    = "/ws/stream"
 	minTickDelay  = 300 * time.Millisecond
 	maxTickJitter = 300 * time.Millisecond
 	telemetryRead = 16 << 10
+
+	clientQueueCap = 256
 )
 
 type Server struct {
 	password       string
 	maxMessageSize int64
 	pingInterval   time.Duration
+	pongWait       time.Duration
 	roomUpgrader   websocket.Upgrader
 	decoyUpgrader  websocket.Upgrader
 
@@ -44,9 +48,50 @@ type Server struct {
 	rooms map[string]map[*client]struct{}
 }
 
+type clientMessage struct {
+	typ  int
+	data []byte
+}
+
 type client struct {
 	conn *websocket.Conn
-	mu   sync.Mutex
+	send chan clientMessage
+	done chan struct{}
+
+	closeOnce sync.Once
+}
+
+func newClient(conn *websocket.Conn) *client {
+	return &client{
+		conn: conn,
+		send: make(chan clientMessage, clientQueueCap),
+		done: make(chan struct{}),
+	}
+}
+
+func (c *client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
+}
+
+func (c *client) enqueue(msg clientMessage) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.send <- msg:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
 }
 
 func New(password string) *Server {
@@ -54,6 +99,7 @@ func New(password string) *Server {
 		password:       strings.TrimSpace(password),
 		maxMessageSize: DefaultMaxMessageSize,
 		pingInterval:   defaultPingInterval,
+		pongWait:       defaultPongWait,
 		feed:           NewFeed(FeedOptions{}),
 		now:            time.Now,
 		tickDelay:      defaultTickDelay,
@@ -159,12 +205,23 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveTunnel(room string, conn *websocket.Conn) {
 	conn.SetReadLimit(s.maxMessageSize)
 
-	c := &client{conn: conn}
+	wait := s.pongWait
+	if wait <= 0 {
+		wait = defaultPongWait
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(wait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wait))
+	})
+
+	c := newClient(conn)
 	s.add(room, c)
 	defer func() {
 		s.remove(room, c)
-		_ = conn.Close()
+		c.close()
 	}()
+
+	go s.writeLoop(c)
 
 	stopPing := make(chan struct{})
 	defer close(stopPing)
@@ -191,7 +248,9 @@ func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = conn.Close() }()
 
 	conn.SetReadLimit(telemetryRead)
-	c := &client{conn: conn}
+	c := newClient(conn)
+	go s.writeLoop(c)
+	defer func() { c.close() }()
 
 	closed := make(chan struct{})
 	go func() {
@@ -224,12 +283,23 @@ func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		c.mu.Lock()
-		_ = conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
-		err = conn.WriteMessage(websocket.TextMessage, data)
-		c.mu.Unlock()
-		if err != nil {
+		if !c.enqueue(clientMessage{typ: websocket.TextMessage, data: data}) {
 			return
+		}
+	}
+}
+
+func (s *Server) writeLoop(c *client) {
+	for {
+		select {
+		case <-c.done:
+			return
+		case msg := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
+			if err := c.conn.WriteMessage(msg.typ, msg.data); err != nil {
+				c.close()
+				return
+			}
 		}
 	}
 }
@@ -241,13 +311,11 @@ func (s *Server) pingLoop(c *client, stop <-chan struct{}) {
 		select {
 		case <-stop:
 			return
+		case <-c.done:
+			return
 		case <-ticker.C:
-			c.mu.Lock()
-			_ = c.conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
-			err := c.conn.WriteMessage(websocket.PingMessage, nil)
-			c.mu.Unlock()
-			if err != nil {
-				_ = c.conn.Close()
+			if !c.enqueue(clientMessage{typ: websocket.PingMessage}) {
+				c.close()
 				return
 			}
 		}
@@ -284,13 +352,11 @@ func (s *Server) broadcast(room string, from *client, msgType int, data []byte) 
 	}
 	s.mu.Unlock()
 
+	msg := clientMessage{typ: msgType, data: data}
 	for _, c := range targets {
-		c.mu.Lock()
-		_ = c.conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
-		err := c.conn.WriteMessage(msgType, data)
-		c.mu.Unlock()
-		if err != nil {
-			_ = c.conn.Close()
+
+		if !c.enqueue(msg) {
+			c.close()
 		}
 	}
 }
@@ -312,7 +378,7 @@ func (s *Server) CloseAll() {
 	s.rooms = make(map[string]map[*client]struct{})
 	s.mu.Unlock()
 	for _, c := range all {
-		_ = c.conn.Close()
+		c.close()
 	}
 }
 

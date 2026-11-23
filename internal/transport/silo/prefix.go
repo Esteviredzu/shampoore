@@ -29,28 +29,47 @@ func sanitizeUserID(userID string) (string, error) {
 	return id, nil
 }
 
-func UserPrefix(userID string) string {
-	return "users/" + userID + "/"
+func namespaceRoot(tunnelID string) string {
+	ns := strings.Trim(strings.TrimSpace(tunnelID), "/")
+	if ns == "" {
+		ns = "default"
+	}
+	return ns + "/"
+}
+
+func UserPrefix(tunnelID, userID string) string {
+	return namespaceRoot(tunnelID) + "users/" + userID + "/"
 }
 
 func buildPrefixes(cfg *Config, role string) (writePrefix, readPrefix string) {
-	base := cfg.TunnelID
+	base := namespaceRoot(cfg.TunnelID)
 	if cfg.UserID != "" {
-		base = "users/" + cfg.UserID
+		base += "users/" + cfg.UserID + "/"
 	}
-	writePrefix = base + "/c2s/"
-	readPrefix = base + "/s2c/"
+	writePrefix = base + "c2s/"
+	readPrefix = base + "s2c/"
 	if role == "server" {
 		writePrefix, readPrefix = readPrefix, writePrefix
 	}
 	return writePrefix, readPrefix
 }
 
+func C2SPrefix(tunnelID, userID string) string {
+	write, _ := buildPrefixes(&Config{TunnelID: tunnelID, UserID: userID}, "client")
+	return write
+}
+
 func ParseUserFromKey(key string) (string, bool) {
-	if !strings.HasPrefix(key, "users/") {
-		return "", false
+	var rest string
+	if strings.HasPrefix(key, "users/") {
+		rest = strings.TrimPrefix(key, "users/")
+	} else {
+		slash := strings.Index(key, "/users/")
+		if slash < 0 {
+			return "", false
+		}
+		rest = key[slash+len("/users/"):]
 	}
-	rest := strings.TrimPrefix(key, "users/")
 	slash := strings.IndexByte(rest, '/')
 	if slash <= 0 {
 		return "", false

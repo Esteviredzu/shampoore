@@ -127,6 +127,59 @@ func TestPatchUsersSkipsNonMultiuser(t *testing.T) {
 	}
 }
 
+func TestPatchUsersFillsMultiChildren(t *testing.T) {
+	raw := json.RawMessage(`{
+		"strategy": "bond",
+		"transports": [
+			{"type": "raw_ws", "transport": {"multiuser": true, "room": "route-9"}},
+			{"type": "silo", "transport": {"multiuser": true, "tunnel_id": "route-9"}},
+			{"type": "livekit_datachannel", "transport": {"multiuser": false}}
+		]
+	}`)
+	settings := &app.Settings{Type: "multi", Transport: raw}
+	users := []auth.UserSpec{{UserID: "alice", Enabled: true}}
+
+	changed, err := patchUsers(settings, users)
+	if err != nil {
+		t.Fatalf("patch users: %v", err)
+	}
+	if !changed {
+		t.Fatal("multi config was not patched")
+	}
+
+	var payload struct {
+		Transports []struct {
+			Transport map[string]json.RawMessage `json:"transport"`
+		} `json:"transports"`
+	}
+	if err := json.Unmarshal(settings.Transport, &payload); err != nil {
+		t.Fatalf("decode patched transport: %v", err)
+	}
+	if len(payload.Transports) != 3 {
+		t.Fatalf("subflows = %d, want 3", len(payload.Transports))
+	}
+	for i := 0; i < 2; i++ {
+		var got []auth.UserSpec
+		if err := json.Unmarshal(payload.Transports[i].Transport["users"], &got); err != nil {
+			t.Fatalf("subflow %d users: %v", i, err)
+		}
+		if len(got) != 1 || got[0].UserID != "alice" {
+			t.Fatalf("subflow %d users = %+v", i, got)
+		}
+	}
+	if _, ok := payload.Transports[2].Transport["users"]; ok {
+		t.Fatal("non-multiuser subflow was patched")
+	}
+
+	again, err := patchUsers(settings, users)
+	if err != nil {
+		t.Fatalf("second patch: %v", err)
+	}
+	if again {
+		t.Fatal("identical users list was reported as a change")
+	}
+}
+
 func TestStateKeysAreStable(t *testing.T) {
 	keys := []string{stateKey("a", "u1"), stateKey("a", "u2"), stateKey("b", "u1")}
 	sort.Strings(keys)

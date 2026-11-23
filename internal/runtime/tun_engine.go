@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	gvisorstack "gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -17,6 +18,26 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/runtime/muxproxy"
 )
+
+type tunIfreq struct {
+	Name  [unix.IFNAMSIZ]byte
+	Flags uint16
+	pad   [22]byte
+}
+
+func verifyTUNFD(fd int) error {
+	var req tunIfreq
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(unix.TUNGETIFF),
+		uintptr(unsafe.Pointer(&req)),
+	)
+	if errno != 0 {
+		return fmt.Errorf("tun: fd %d is not a TUN device: %w", fd, errno)
+	}
+	return nil
+}
 
 type tunEngine struct {
 	device device.Device
@@ -31,6 +52,9 @@ func newTunEngine(fd, mtu int) (*tunEngine, error) {
 	}
 	if mtu <= 0 {
 		mtu = 1500
+	}
+	if err := verifyTUNFD(fd); err != nil {
+		return nil, err
 	}
 
 	dev, err := fdbased.Open(strconv.Itoa(fd), uint32(mtu), 0)

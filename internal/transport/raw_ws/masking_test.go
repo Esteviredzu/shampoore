@@ -83,9 +83,6 @@ func TestMaskingDelayBounds(t *testing.T) {
 		if d := tr.nextRotationDelay(); d < defaultRotationMin || d > defaultRotationMax {
 			t.Fatalf("rotation delay %s outside 15..35m", d)
 		}
-		if d := tr.nextGrace(); d < defaultRotateGraceMin || d > defaultRotateGraceMax {
-			t.Fatalf("grace %s outside 2..3s", d)
-		}
 	}
 }
 
@@ -182,8 +179,7 @@ func TestConnectionRotationIsMakeBeforeBreak(t *testing.T) {
 	tr := newTestTransport(srv.URL, false)
 	tr.rotationMin = 120 * time.Millisecond
 	tr.rotationMax = 150 * time.Millisecond
-	tr.graceMin = 80 * time.Millisecond
-	tr.graceMax = 100 * time.Millisecond
+	tr.rotateIdle = time.Millisecond
 
 	cancel := startTransport(t, tr)
 	defer cancel()

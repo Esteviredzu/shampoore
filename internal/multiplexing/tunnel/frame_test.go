@@ -137,6 +137,63 @@ func TestHelloFrameRejectsDataAndMetadata(t *testing.T) {
 	}
 }
 
+func TestControlFramesRoundTrip(t *testing.T) {
+	id := StreamID(uuid.New())
+	for _, frame := range []*TunnelFrame{
+		{Type: FramePing, Epoch: 3},
+		{Type: FramePong, Epoch: 4},
+		{StreamID: id, Type: FrameOpenAck, Epoch: 5},
+	} {
+		encoded, err := EncodeFrame(frame)
+		if err != nil {
+			t.Fatalf("encode %v: %v", frame.Type, err)
+		}
+		decoder := NewFrameDecoder()
+		frames, err := decoder.Feed(encoded)
+		if err != nil {
+			t.Fatalf("decode %v: %v", frame.Type, err)
+		}
+		if len(frames) != 1 || frames[0].Type != frame.Type || frames[0].StreamID != frame.StreamID {
+			t.Fatalf("frame mismatch: %+v", frames)
+		}
+	}
+}
+
+func TestFrameDecoderSkipsUnknownTypes(t *testing.T) {
+	id := StreamID(uuid.New())
+	unknown, err := EncodeFrame(&TunnelFrame{StreamID: id, Type: FrameData, Epoch: 1, Data: []byte("x")})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	unknown[frameOffType] = 250
+	next, err := EncodeFrame(&TunnelFrame{StreamID: id, Type: FrameData, Epoch: 2, Data: []byte("keep")})
+	if err != nil {
+		t.Fatalf("encode next: %v", err)
+	}
+
+	decoder := NewFrameDecoder()
+	frames, err := decoder.Feed(append(append([]byte(nil), unknown...), next...))
+	if err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want the known frame only", len(frames))
+	}
+	if string(frames[0].Data) != "keep" {
+		t.Fatalf("payload = %q, want keep", frames[0].Data)
+	}
+}
+
+func TestControlFrameRejectsPayload(t *testing.T) {
+	if _, err := EncodeFrame(&TunnelFrame{Type: FramePing, Data: []byte("x")}); err == nil {
+		t.Fatal("ping with data was accepted")
+	}
+	if _, err := EncodeFrame(&TunnelFrame{Type: FrameOpenAck, Metadata: map[string]any{"x": 1}}); err == nil {
+		t.Fatal("open ack with metadata was accepted")
+	}
+}
+
 func TestFrameDecoderSplitFeed(t *testing.T) {
 	id := StreamID(uuid.New())
 	first, err := EncodeFrame(&TunnelFrame{

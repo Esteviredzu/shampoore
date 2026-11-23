@@ -1,11 +1,14 @@
 package livekit
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
 
@@ -15,7 +18,22 @@ import (
 const (
 	maxPacketSize = 12_000
 	recvQueueSize = 4096
+
+	recvOverflowWait = 50 * time.Millisecond
+
+	resetDedupWindow = 250 * time.Millisecond
 )
+
+var (
+	heartbeatPayload = []byte("LKHB\x00\x01\x02\x03")
+
+	pipeHeartbeatInterval = 5 * time.Second
+	pipeHeartbeatTimeout  = 20 * time.Second
+)
+
+func isHeartbeatPayload(data []byte) bool {
+	return len(data) == len(heartbeatPayload) && bytes.Equal(data, heartbeatPayload)
+}
 
 type Pipe struct {
 	localMu  sync.RWMutex
@@ -23,7 +41,21 @@ type Pipe struct {
 	topic    string
 	remoteID atomic.Pointer[string]
 
-	recvCh chan []byte
+	recvCh  chan []byte
+	resetCh chan error
+
+	lastRecv      atomic.Int64
+	peerHeartbeat atomic.Bool
+	deadFired     atomic.Bool
+
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
+
+	deadMu sync.Mutex
+	onDead func()
+
+	resetMu   sync.Mutex
+	lastReset time.Time
 
 	ctxMu     sync.Mutex
 	ctx       context.Context
@@ -45,15 +77,81 @@ func newPipe(
 	remoteID string,
 ) *Pipe {
 	p := &Pipe{
-		local:  local,
-		topic:  topic,
-		recvCh: make(chan []byte, recvQueueSize),
-		closed: make(chan struct{}),
+		local:             local,
+		topic:             topic,
+		recvCh:            make(chan []byte, recvQueueSize),
+		resetCh:           make(chan error, 1),
+		closed:            make(chan struct{}),
+		heartbeatInterval: pipeHeartbeatInterval,
+		heartbeatTimeout:  pipeHeartbeatTimeout,
 	}
+	p.lastRecv.Store(time.Now().UnixNano())
 	if remoteID != "" {
 		p.SetRemoteID(remoteID)
 	}
 	return p
+}
+
+func (p *Pipe) SetDeadHandler(fn func()) {
+	p.deadMu.Lock()
+	p.onDead = fn
+	p.deadMu.Unlock()
+}
+
+func (p *Pipe) ResetLiveness() {
+	p.lastRecv.Store(time.Now().UnixNano())
+	p.deadFired.Store(false)
+}
+
+func (p *Pipe) noteIncoming() {
+	p.lastRecv.Store(time.Now().UnixNano())
+}
+
+func (p *Pipe) PeerJoined(id string) bool {
+	previous := p.GetRemoteID()
+	p.SetRemoteID(id)
+	p.ResetLiveness()
+	return previous == ""
+}
+
+func (p *Pipe) PeerLeft() {
+	p.SetRemoteID("")
+	p.peerHeartbeat.Store(false)
+	p.ResetLiveness()
+}
+
+func (p *Pipe) SignalReset(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+
+	p.resetMu.Lock()
+	if len(p.resetCh) > 0 {
+		p.resetMu.Unlock()
+		return
+	}
+	if !p.lastReset.IsZero() && time.Since(p.lastReset) < resetDedupWindow {
+		p.resetMu.Unlock()
+		return
+	}
+	p.lastReset = time.Now()
+	p.resetMu.Unlock()
+
+	p.DrainIncoming()
+	select {
+	case p.resetCh <- err:
+	default:
+	}
+}
+
+func (p *Pipe) DrainIncoming() {
+	for {
+		select {
+		case <-p.recvCh:
+		default:
+			return
+		}
+	}
 }
 
 func (p *Pipe) UpdateLocal(l *lksdk.LocalParticipant) {
@@ -78,8 +176,74 @@ func (p *Pipe) Start(ctx context.Context) error {
 	}
 	p.ctxMu.Lock()
 	p.ctx, p.cancel = context.WithCancel(ctx)
+	runCtx := p.ctx
 	p.ctxMu.Unlock()
+	p.ResetLiveness()
+	go p.heartbeatLoop(runCtx)
 	return nil
+}
+
+func (p *Pipe) heartbeatLoop(ctx context.Context) {
+	interval := p.heartbeatInterval
+	if interval <= 0 {
+		interval = pipeHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.closed:
+			return
+		case <-ticker.C:
+		}
+
+		p.sendHeartbeat()
+
+		if !p.peerHeartbeat.Load() {
+			continue
+		}
+		timeout := p.heartbeatTimeout
+		if timeout <= 0 {
+			timeout = pipeHeartbeatTimeout
+		}
+		if time.Since(time.Unix(0, p.lastRecv.Load())) >= timeout {
+			p.fireDead()
+		}
+	}
+}
+
+func (p *Pipe) sendHeartbeat() {
+	rid := p.GetRemoteID()
+	if rid == "" {
+		return
+	}
+	p.localMu.RLock()
+	local := p.local
+	p.localMu.RUnlock()
+	if local == nil {
+		return
+	}
+	opts := []lksdk.DataPublishOption{
+		lksdk.WithDataPublishReliable(true),
+		lksdk.WithDataPublishTopic(p.topic),
+		lksdk.WithDataPublishDestination([]string{rid}),
+	}
+	_ = local.PublishDataPacket(lksdk.UserData(heartbeatPayload), opts...)
+}
+
+func (p *Pipe) fireDead() {
+	if p.deadFired.Swap(true) {
+		return
+	}
+	p.deadMu.Lock()
+	fn := p.onDead
+	p.deadMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
@@ -92,6 +256,11 @@ func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 		return
 	default:
 	}
+	p.noteIncoming()
+	if isHeartbeatPayload(data) {
+		p.peerHeartbeat.Store(true)
+		return
+	}
 
 	select {
 	case p.recvCh <- data:
@@ -101,7 +270,25 @@ func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 		p.ctr.MessagesRecv.Add(1)
 		p.ctr.FramesRecv.Add(1)
 	default:
+		p.pushWithBackpressure(data)
+	}
+}
+
+func (p *Pipe) pushWithBackpressure(data []byte) {
+	timer := time.NewTimer(recvOverflowWait)
+	defer timer.Stop()
+
+	select {
+	case p.recvCh <- data:
+		n := int64(len(data))
+		p.ctr.UsefulRecv.Add(n)
+		p.ctr.NetworkRecv.Add(n)
+		p.ctr.MessagesRecv.Add(1)
+		p.ctr.FramesRecv.Add(1)
+	case <-p.closed:
+	case <-timer.C:
 		p.dropped.Add(1)
+		p.SignalReset(fmt.Errorf("%w: livekit: receive queue overflow", transport.ErrTransportReset))
 	}
 }
 
@@ -152,6 +339,8 @@ func (p *Pipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 		return nil, ctx.Err()
 	case <-p.closed:
 		return nil, io.EOF
+	case err := <-p.resetCh:
+		return nil, err
 	case data := <-p.recvCh:
 		p.bytesRecv.Add(int64(len(data)))
 		return data, nil

@@ -17,6 +17,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type relayConn struct {
@@ -318,6 +319,53 @@ func TestMultiServerServesTwoUsersOnOneRelay(t *testing.T) {
 	waitUntil(t, 5*time.Second, "bob session stop after disabling", func() bool {
 		return relay.roomSize("base-bob") == 1
 	})
+}
+
+func TestMultiServerAggregatedSessionRetries(t *testing.T) {
+	registry := testUserRegistry(t, "alice")
+	cfg := Config{
+		ServerURL:       "ws://127.0.0.1:1",
+		Room:            "base",
+		Password:        "secret",
+		AllowInsecureWS: true,
+		Multiuser:       true,
+	}
+	server := newMultiServer(cfg, testLogger{}, registry, app.Values{
+		"mux_flush_ms":        5,
+		"mux_flush_threshold": 12000,
+	})
+
+	registrations := make(chan chan struct{}, 8)
+	server.SetTransportSink(func(userID string, tr transport.Transport) (func(), <-chan struct{}) {
+		done := make(chan struct{})
+		registrations <- done
+		return func() { _ = tr.Stop(context.Background()) }, done
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = server.Stop(stopCtx)
+	}()
+
+	var first chan struct{}
+	select {
+	case first = <-registrations:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sink was not called for the active user")
+	}
+
+	close(first)
+	select {
+	case <-registrations:
+	case <-time.After(3 * time.Second):
+		t.Fatal("aggregated session was not re-registered after it ended")
+	}
 }
 
 func TestRawWSConfigUserRoomJSON(t *testing.T) {

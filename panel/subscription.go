@@ -93,6 +93,15 @@ func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app
 }
 
 func singleRouteSettings(route panelstore.Route, byID map[int64]panelstore.Node, user panelstore.User) (app.Settings, bool) {
+	return singleRouteSettingsIn(route, byID, user, route)
+}
+
+func singleRouteSettingsIn(
+	route panelstore.Route,
+	byID map[int64]panelstore.Node,
+	user panelstore.User,
+	namespace panelstore.Route,
+) (app.Settings, bool) {
 	entry, ok := byID[route.EntryNodeID]
 	if !ok {
 		return app.Settings{}, false
@@ -110,8 +119,8 @@ func singleRouteSettings(route panelstore.Route, byID map[int64]panelstore.Node,
 		return app.Settings{}, false
 	}
 	settings, err := descriptor.BuildSubscriptionConfig(app.RouteParams{
-		RouteID:    route.ID,
-		RouteName:  route.Name,
+		RouteID:    namespace.ID,
+		RouteName:  namespace.Name,
 		UserID:     user.ID,
 		ExitNodeID: strconv.FormatInt(exit.ID, 10),
 		Domain:     tr.Domain,
@@ -153,7 +162,7 @@ func multiRouteSettings(
 		if !ok || child.TransportType == panelstore.TransportMulti || !child.Enabled {
 			continue
 		}
-		childSettings, ok := singleRouteSettings(child, byID, user)
+		childSettings, ok := singleRouteSettingsIn(child, byID, user, route)
 		if !ok {
 			continue
 		}

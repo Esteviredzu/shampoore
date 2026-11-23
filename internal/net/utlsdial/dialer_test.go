@@ -2,6 +2,7 @@ package utlsdial
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -121,6 +122,67 @@ func TestNewHTTPTransportGET(t *testing.T) {
 	}
 	if resp.TLS == nil || resp.TLS.NegotiatedProtocol == "" {
 		t.Fatalf("transport did not expose negotiated ALPN: %+v", resp.TLS)
+	}
+}
+
+func TestNewHTTP1TransportForcesHTTP1PUT(t *testing.T) {
+	const putSize = 300 * 1024
+	payload := bytes.Repeat([]byte("shampoore-silo"), putSize/len("shampoore-silo"))
+	payload = append(payload, []byte("tail")...)
+
+	srv := newCaddyTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			t.Error("PUT handler got no TLS state")
+			http.Error(w, "tls required", http.StatusBadRequest)
+			return
+		}
+		if got := r.TLS.NegotiatedProtocol; got != "http/1.1" {
+			t.Errorf("negotiated ALPN = %q, want http/1.1", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read PUT body: %v", err)
+			http.Error(w, "read", http.StatusBadRequest)
+			return
+		}
+		if !bytes.Equal(body, payload) {
+			t.Errorf("PUT body = %d bytes, want %d", len(body), len(payload))
+			http.Error(w, "body mismatch", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	tr := NewHTTP1Transport(ProfileChrome)
+	defer tr.CloseIdleConnections()
+	if tr.ForceAttemptHTTP2 {
+		t.Fatal("HTTP/1.1 transport still forces HTTP/2")
+	}
+	if tr.Protocols == nil || tr.Protocols.HTTP2() || !tr.Protocols.HTTP1() {
+		t.Fatalf("unexpected protocols: %+v", tr.Protocols)
+	}
+
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/bucket/key", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if resp.ProtoMajor != 1 {
+		t.Fatalf("response protocol = %s, want HTTP/1.x", resp.Proto)
+	}
+	if resp.TLS == nil || resp.TLS.NegotiatedProtocol != "http/1.1" {
+		t.Fatalf("unexpected negotiated protocol: %+v", resp.TLS)
 	}
 }
 

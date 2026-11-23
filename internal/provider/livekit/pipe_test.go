@@ -2,13 +2,16 @@ package livekit
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
-func TestPushIncomingDropsWhenQueueFull(t *testing.T) {
+func TestPushIncomingOverflowSignalsReset(t *testing.T) {
 	p := newPipe(nil, "topic", "")
 	defer func() {
 		if err := p.Stop(context.Background()); err != nil {
@@ -24,7 +27,7 @@ func TestPushIncomingDropsWhenQueueFull(t *testing.T) {
 	}
 
 	started := time.Now()
-	p.PushIncoming([]byte("dropped-packet"), "")
+	p.PushIncoming([]byte("overflow-packet"), "")
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("PushIncoming blocked for %s on a full queue", elapsed)
 	}
@@ -32,12 +35,35 @@ func TestPushIncomingDropsWhenQueueFull(t *testing.T) {
 	if got := p.Dropped(); got != 1 {
 		t.Fatalf("dropped=%d, want 1", got)
 	}
-	if got := len(p.recvCh); got != recvQueueSize {
-		t.Fatalf("queue length changed: %d", got)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := p.ReceiveMessage(ctx); !errors.Is(err, transport.ErrTransportReset) {
+		t.Fatalf("receive error = %v, want ErrTransportReset", err)
 	}
-	snap := p.ctr.Snapshot()
-	if snap.MessagesRecv != 0 || snap.UsefulRecv != 0 {
-		t.Fatalf("dropped packet was accounted as received: %+v", snap)
+}
+
+func TestSignalResetDeduplicatesReconnectBurst(t *testing.T) {
+	p := newPipe(nil, "topic", "")
+	defer func() { _ = p.Stop(context.Background()) }()
+
+	p.SignalReset(nil)
+	p.SignalReset(nil)
+	p.SignalReset(nil)
+
+	if got := len(p.resetCh); got != 1 {
+		t.Fatalf("pending resets = %d, want a single reset for one reconnect burst", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := p.ReceiveMessage(ctx); err == nil {
+		t.Fatal("expected the pending reset")
+	}
+
+	p.SignalReset(nil)
+	if got := len(p.resetCh); got != 0 {
+		t.Fatalf("duplicate reset was queued: %d", got)
 	}
 }
 

@@ -191,6 +191,31 @@ func waitForProbeCalls(t *testing.T, calls *atomic.Int32, want int32, timeout ti
 	t.Fatalf("probe calls = %d, want at least %d", calls.Load(), want)
 }
 
+func waitForHealthCode(t *testing.T, code string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	needle := `"error_code":"` + code + `"`
+	for time.Now().Before(deadline) {
+		if strings.Contains(GetHealth(), needle) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("health did not report %q: %s", code, GetHealth())
+}
+
+func waitForResetCalls(t *testing.T, calls *atomic.Int32, want int32, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if calls.Load() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("transport reset calls = %d, want at least %d", calls.Load(), want)
+}
+
 func TestHealthTUNStartsConnectingThenRunning(t *testing.T) {
 	resetMobileState(t)
 
@@ -210,18 +235,22 @@ func TestHealthTUNStartsConnectingThenRunning(t *testing.T) {
 	if GetState() != StateConnecting {
 		t.Fatalf("state = %q, want %q", GetState(), StateConnecting)
 	}
-	if health := GetHealth(); !strings.Contains(health, `"tunnel_up":true`) {
-		t.Fatalf("health does not report tunnel_up: %s", health)
+	if health := GetHealth(); strings.Contains(health, `"tunnel_up":true`) {
+		t.Fatalf("tunnel_up must not be reported before the first successful probe: %s", health)
 	}
 
 	releaseOnce.Do(func() { close(release) })
 	waitForState(t, StateRunning, 2*time.Second)
+	if health := GetHealth(); !strings.Contains(health, `"tunnel_up":true`) {
+		t.Fatalf("health does not report tunnel_up after a successful probe: %s", health)
+	}
 }
 
-func TestHealthExitUnreachableStopsUntilManualCheck(t *testing.T) {
+func TestHealthExitUnreachableKeepsTunnelAlive(t *testing.T) {
 	resetMobileState(t)
 	healthFailureLimit = 3
 	healthRetryInitial = 10 * time.Millisecond
+	healthReconnectMax = 100 * time.Millisecond
 
 	var calls atomic.Int32
 	var down atomic.Bool
@@ -234,40 +263,50 @@ func TestHealthExitUnreachableStopsUntilManualCheck(t *testing.T) {
 		return nil
 	}
 
-	startTUNForHealth(t)
-	waitForState(t, StateError, 2*time.Second)
-	if got := GetStateMessage(); got != HealthMessageExitUnreachable {
-		t.Fatalf("message = %q, want %q", got, HealthMessageExitUnreachable)
+	listener := newRecordingListener()
+	SetStateListener(listener)
+	t.Cleanup(func() { SetStateListener(nil) })
+
+	bundle := startTUNForHealth(t)
+	waitForHealthCode(t, HealthCodeExitUnreachable, 2*time.Second)
+
+	if GetState() == StateError {
+		t.Fatalf("transient probe failures must not tear the VPN down, state = %q", GetState())
 	}
-	if health := GetHealth(); !strings.Contains(health, `"error_code":"`+HealthCodeExitUnreachable+`"`) {
-		t.Fatalf("health does not contain exit_unreachable: %s", health)
+	if got := GetStateMessage(); got == HealthMessageExitUnreachable {
+		t.Fatalf("fatal health message leaked into state: %q", got)
+	}
+	if listener.has(StateError) {
+		t.Fatal("listener observed a fatal error state during transient probe failures")
 	}
 
-	probesAtError := calls.Load()
-	time.Sleep(150 * time.Millisecond)
-	if got := calls.Load(); got != probesAtError {
-		t.Fatalf("core retried after error: probes %d -> %d", probesAtError, got)
-	}
-	if GetState() != StateError {
-		t.Fatalf("state changed after error without a manual check: %q", GetState())
-	}
+	waitForResetCalls(t, &bundle.transport.resetCalls, 1, 2*time.Second)
 
 	down.Store(false)
-	stateMu.Lock()
-	ctl := healthCtl
-	stateMu.Unlock()
-	if ctl == nil {
-		t.Fatal("health controller is not active")
-	}
-	ctl.trigger(healthTrigger{})
 	waitForState(t, StateRunning, 2*time.Second)
 	if health := GetHealth(); !strings.Contains(health, `"exit_reachable":true`) {
-		t.Fatalf("health does not report exit_reachable: %s", health)
+		t.Fatalf("health does not report exit_reachable after recovery: %s", health)
 	}
+}
+
+func TestHealthProbesPeriodicallyWhileRunning(t *testing.T) {
+	resetMobileState(t)
+	healthProbeInterval = 20 * time.Millisecond
+
+	var calls atomic.Int32
+	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
+		calls.Add(1)
+		return nil
+	}
+
+	startTUNForHealth(t)
+	waitForState(t, StateRunning, 2*time.Second)
+	waitForProbeCalls(t, &calls, 3, 2*time.Second)
 }
 
 func TestHealthDoesNotProbeWhenHealthy(t *testing.T) {
 	resetMobileState(t)
+	healthProbeInterval = time.Hour
 
 	var calls atomic.Int32
 	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
@@ -304,15 +343,21 @@ func TestHealthStreamFailureMeansNoInternet(t *testing.T) {
 	}
 
 	ctl.trigger(healthTrigger{streamFailure: true})
-	waitForState(t, StateError, 2*time.Second)
-	if got := GetStateMessage(); got != HealthMessageNoInternet {
-		t.Fatalf("message = %q, want %q", got, HealthMessageNoInternet)
+	waitForHealthCode(t, HealthCodeNoInternet, 2*time.Second)
+	if GetState() != StateRunning {
+		t.Fatalf("transient stream failure must keep the tunnel up, state = %q", GetState())
+	}
+	if got := GetStateMessage(); got == HealthMessageNoInternet {
+		t.Fatalf("fatal no-internet message leaked into state: %q", got)
 	}
 
 	ctl.recordInboundActivity()
 	waitForState(t, StateRunning, 2*time.Second)
 	if health := GetHealth(); !strings.Contains(health, `"internet_verified":true`) {
 		t.Fatalf("health does not report internet_verified: %s", health)
+	}
+	if health := GetHealth(); strings.Contains(health, `"error_code":"`+HealthCodeNoInternet+`"`) {
+		t.Fatalf("health kept the stale outage code: %s", health)
 	}
 }
 
@@ -366,33 +411,169 @@ func TestNotifyNetworkChangedTriggersProbe(t *testing.T) {
 	waitForProbeCalls(t, &calls, before+1, time.Second)
 }
 
-func TestStopClientFromHealthErrorStopsRuntime(t *testing.T) {
+func TestStopClientWhileExitUnreachableStopsRuntime(t *testing.T) {
 	resetMobileState(t)
 	healthFailureLimit = 2
 	healthRetryInitial = 10 * time.Millisecond
+	healthReconnectMax = 50 * time.Millisecond
 
 	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
 		return errors.New("exit down")
 	}
 
 	bundle := startTUNForHealth(t)
-	waitForState(t, StateError, 2*time.Second)
+	waitForHealthCode(t, HealthCodeExitUnreachable, 2*time.Second)
+	if GetState() == StateError {
+		t.Fatalf("transient outage must not produce a fatal state, got %q", GetState())
+	}
 
 	StopClient()
 	waitForState(t, StateIdle, 3*time.Second)
 
 	if bundle.provider.stopCalls.Load() == 0 || bundle.mux.stopCall.Load() == 0 {
-		t.Fatal("health error path leaked runtime resources")
+		t.Fatal("health path leaked runtime resources")
 	}
 	if IsRunning() {
 		t.Fatal("client is still running after StopClient")
 	}
 }
 
+func TestProbeInternetThroughMuxReportsEgressOK(t *testing.T) {
+	client, server := net.Pipe()
+	inner := &probeMux{open: func(_ context.Context, meta map[string]any) (multiplexing.Stream, error) {
+		return &pipeStream{conn: server, id: "net", meta: meta}, nil
+	}}
+	go func() {
+		_, _ = client.Write([]byte(netProbeReply))
+		_ = client.Close()
+	}()
+
+	supported, err := probeInternetThroughMux(context.Background(), inner)
+	if !supported || err != nil {
+		t.Fatalf("supported=%v err=%v, want supported and no error", supported, err)
+	}
+}
+
+func TestProbeInternetThroughMuxReportsEgressFailure(t *testing.T) {
+	client, server := net.Pipe()
+	inner := &probeMux{open: func(_ context.Context, meta map[string]any) (multiplexing.Stream, error) {
+		return &pipeStream{conn: server, id: "net", meta: meta}, nil
+	}}
+	go func() {
+		_, _ = client.Write([]byte(netProbeErrPrefix + "dial failed\n"))
+		_ = client.Close()
+	}()
+
+	supported, err := probeInternetThroughMux(context.Background(), inner)
+	if !supported {
+		t.Fatal("egress failure was treated as an unsupported exit node")
+	}
+	if err == nil || !strings.Contains(err.Error(), "dial failed") {
+		t.Fatalf("err = %v, want the exit reason", err)
+	}
+}
+
+func TestProbeInternetThroughMuxFallsBackOnOldExit(t *testing.T) {
+	client, server := net.Pipe()
+	inner := &probeMux{open: func(_ context.Context, meta map[string]any) (multiplexing.Stream, error) {
+		return &pipeStream{conn: server, id: "net", meta: meta}, nil
+	}}
+	_ = client.Close()
+
+	supported, err := probeInternetThroughMux(context.Background(), inner)
+	if supported || err != nil {
+		t.Fatalf("supported=%v err=%v, want an unsupported exit node without an error", supported, err)
+	}
+}
+
+func TestHealthRequiresInternetProbeWhenSupported(t *testing.T) {
+	resetMobileState(t)
+	healthFailureLimit = 2
+	healthRetryInitial = 10 * time.Millisecond
+	healthReconnectMax = 50 * time.Millisecond
+	healthProbeInterval = time.Hour
+
+	var egress atomic.Bool
+	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error { return nil }
+	internetProbe = func(context.Context, multiplexing.StreamMultiplexer) (bool, error) {
+		if egress.Load() {
+			return true, nil
+		}
+		return true, errors.New("no egress")
+	}
+
+	startTUNForHealth(t)
+	time.Sleep(150 * time.Millisecond)
+	if GetState() == StateRunning {
+		t.Fatal("connected was reported while the exit had no internet")
+	}
+
+	egress.Store(true)
+	stateMu.Lock()
+	ctl := healthCtl
+	stateMu.Unlock()
+	if ctl == nil {
+		t.Fatal("health controller is not active")
+	}
+	ctl.trigger(healthTrigger{})
+	waitForState(t, StateRunning, 2*time.Second)
+}
+
+func TestSingleProbeFailureDoesNotResetTransport(t *testing.T) {
+	resetMobileState(t)
+	healthFailureLimit = 3
+	healthRetryInitial = 5 * time.Millisecond
+
+	var calls atomic.Int32
+	exitProbe = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
+		if calls.Add(1) == 1 {
+			return errors.New("blip")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	bundle := startTUNForHealth(t)
+	time.Sleep(80 * time.Millisecond)
+	if got := bundle.transport.resetCalls.Load(); got != 0 {
+		t.Fatalf("a single failed probe reset the transport %d times", got)
+	}
+}
+
+func TestRunningDowngradesToConnectingWhenExitUnreachable(t *testing.T) {
+	resetMobileState(t)
+	healthFailureLimit = 2
+	healthRetryInitial = 10 * time.Millisecond
+	healthReconnectMax = 50 * time.Millisecond
+	healthProbeInterval = time.Hour
+
+	var down atomic.Bool
+	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
+		if down.Load() {
+			return errors.New("exit down")
+		}
+		return nil
+	}
+
+	startTUNForHealth(t)
+	waitForState(t, StateRunning, 2*time.Second)
+
+	down.Store(true)
+	stateMu.Lock()
+	ctl := healthCtl
+	stateMu.Unlock()
+	if ctl == nil {
+		t.Fatal("health controller is not active")
+	}
+	ctl.trigger(healthTrigger{})
+	waitForState(t, StateConnecting, 2*time.Second)
+}
+
 func TestTUNNeverReportsRunningWhenExitIsDown(t *testing.T) {
 	resetMobileState(t)
 	healthFailureLimit = 3
 	healthRetryInitial = 10 * time.Millisecond
+	healthReconnectMax = 50 * time.Millisecond
 
 	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
 		return errors.New("exit down")
@@ -403,12 +584,15 @@ func TestTUNNeverReportsRunningWhenExitIsDown(t *testing.T) {
 	t.Cleanup(func() { SetStateListener(nil) })
 
 	startTUNForHealth(t)
-	waitForState(t, StateError, 2*time.Second)
+	waitForHealthCode(t, HealthCodeExitUnreachable, 2*time.Second)
 
 	if listener.has(StateRunning) {
 		t.Fatal("core reported running while the exit node was unreachable")
 	}
-	if health := GetHealth(); !strings.Contains(health, `"error_code":"`+HealthCodeExitUnreachable+`"`) {
-		t.Fatalf("health does not report exit_unreachable: %s", health)
+	if listener.has(StateError) {
+		t.Fatal("core reported a fatal error instead of retrying in the background")
+	}
+	if got := GetState(); got != StateConnecting {
+		t.Fatalf("state = %q, want %q while the exit is still unreachable", got, StateConnecting)
 	}
 }

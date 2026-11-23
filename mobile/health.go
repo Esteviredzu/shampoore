@@ -1,12 +1,14 @@
 package mobile
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,11 @@ const (
 	exitProbeMetadataKey = "probe"
 	exitProbeMetadataVal = "exit"
 	exitProbeReply       = "ok\n"
+
+	netProbeMetadataVal   = "net"
+	netProbeReply         = "ok\n"
+	netProbeErrPrefix     = "err:"
+	netProbeReplyMaxBytes = 256
 )
 
 var (
@@ -36,7 +43,14 @@ var (
 	healthFailureCooldown = 5 * time.Second
 	healthNoInternetGrace = 30 * time.Second
 
-	exitProbe = probeExitThroughMux
+	healthProbeInterval = 30 * time.Second
+
+	healthReconnectMax = 30 * time.Second
+
+	healthReconnectMinInterval = 20 * time.Second
+
+	exitProbe     = probeExitThroughMux
+	internetProbe = probeInternetThroughMux
 )
 
 type HealthStatus struct {
@@ -87,6 +101,51 @@ func probeExitThroughMux(ctx context.Context, mux multiplexing.StreamMultiplexer
 		return fmt.Errorf("health: unexpected exit probe reply %q", string(buf))
 	}
 	return nil
+}
+
+func probeInternetThroughMux(ctx context.Context, mux multiplexing.StreamMultiplexer) (bool, error) {
+	if mux == nil {
+		return false, errors.New("health: multiplexer is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	stream, err := mux.OpenStream(ctx, map[string]any{
+		exitProbeMetadataKey: netProbeMetadataVal,
+	})
+	if err != nil {
+		return false, fmt.Errorf("health: open net probe: %w", err)
+	}
+	defer stream.Close()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	reader := bufio.NewReader(io.LimitReader(stream, netProbeReplyMaxBytes))
+	line, readErr := reader.ReadString('\n')
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		if readErr == nil || errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return true, fmt.Errorf("health: read net probe: %w", readErr)
+	}
+	if strings.HasPrefix(line, netProbeErrPrefix) {
+		return true, fmt.Errorf("health: exit has no internet: %s",
+			strings.TrimSpace(strings.TrimPrefix(line, netProbeErrPrefix)))
+	}
+	if line != strings.TrimRight(netProbeReply, "\r\n") {
+		return true, fmt.Errorf("health: unexpected net probe reply %q", line)
+	}
+	return true, nil
 }
 
 func GetHealth() string {
@@ -146,15 +205,23 @@ type healthController struct {
 	rt           *app.Runtime
 	mux          multiplexing.StreamMultiplexer
 	probe        func(context.Context, multiplexing.StreamMultiplexer) error
+	netProbe     func(context.Context, multiplexing.StreamMultiplexer) (bool, error)
 	timeout      time.Duration
 	failureLimit int
 	retryInitial time.Duration
+	reconnectMax time.Duration
+	reconnectMin time.Duration
+	probeEvery   time.Duration
+
+	reconnect func()
 
 	triggerCh chan healthTrigger
 	done      chan struct{}
 
-	mu       sync.Mutex
-	failures int
+	mu            sync.Mutex
+	failures      int
+	backoff       time.Duration
+	lastReconnect time.Time
 }
 
 func newHealthController(ctx context.Context, rt *app.Runtime, mux multiplexing.StreamMultiplexer) *healthController {
@@ -170,22 +237,43 @@ func newHealthController(ctx context.Context, rt *app.Runtime, mux multiplexing.
 	if retryInitial <= 0 {
 		retryInitial = time.Second
 	}
+	reconnectMax := healthReconnectMax
+	if reconnectMax < retryInitial {
+		reconnectMax = retryInitial
+	}
+	reconnectMin := healthReconnectMinInterval
+	if reconnectMin < 0 {
+		reconnectMin = 0
+	}
+	probeEvery := healthProbeInterval
+	if probeEvery <= 0 {
+		probeEvery = 30 * time.Second
+	}
+	var reconnect func()
+	if rt != nil {
+		reconnect = rt.NotifyNetworkChanged
+	}
 	return &healthController{
 		ctx:          ctx,
 		rt:           rt,
 		mux:          mux,
 		probe:        exitProbe,
+		netProbe:     internetProbe,
 		timeout:      timeout,
 		failureLimit: limit,
 		retryInitial: retryInitial,
+		reconnectMax: reconnectMax,
+		reconnectMin: reconnectMin,
+		probeEvery:   probeEvery,
+		reconnect:    reconnect,
 		triggerCh:    make(chan healthTrigger, 4),
 		done:         make(chan struct{}),
+		backoff:      retryInitial,
 	}
 }
 
 func (c *healthController) start() {
 	stateMu.Lock()
-	tunnelHealth.TunnelUp = true
 	healthCtl = c
 	stateMu.Unlock()
 	go c.run()
@@ -240,6 +328,10 @@ func (c *healthController) run() {
 			return
 		case trigger = <-c.triggerCh:
 			disarm()
+
+			c.mu.Lock()
+			c.backoff = c.retryInitial
+			c.mu.Unlock()
 		case <-timerC:
 			timerC = nil
 		}
@@ -248,29 +340,68 @@ func (c *healthController) run() {
 		if canceled {
 			return
 		}
+		if err == nil && c.netProbe != nil {
+			supported, netErr, netCanceled := c.netProbeOnce()
+			if netCanceled {
+				return
+			}
+			if supported && netErr != nil {
+				err = netErr
+			}
+		}
 
 		if err == nil {
 			c.mu.Lock()
 			c.failures = 0
+			c.backoff = c.retryInitial
 			c.mu.Unlock()
 			if trigger.streamFailure {
 				c.recordNoInternet()
 			} else {
 				c.recordProbeSuccess()
 			}
+
+			arm(c.probeEvery)
 			continue
 		}
 
 		c.mu.Lock()
 		c.failures++
 		failures := c.failures
+		backoff := c.backoff
+		if backoff <= 0 {
+			backoff = c.retryInitial
+		}
+		next := backoff * 2
+		if next < backoff || next > c.reconnectMax {
+			next = c.reconnectMax
+		}
+		c.backoff = next
 		c.mu.Unlock()
+
 		c.recordProbeFailure(failures, err)
 
-		if failures < c.failureLimit {
-			arm(c.retryInitial)
+		if failures >= c.failureLimit {
+			c.requestReconnect()
 		}
+		arm(backoff)
 	}
+}
+
+func (c *healthController) requestReconnect() {
+	if c.reconnect == nil {
+		return
+	}
+	if c.reconnectMin > 0 {
+		c.mu.Lock()
+		if !c.lastReconnect.IsZero() && time.Since(c.lastReconnect) < c.reconnectMin {
+			c.mu.Unlock()
+			return
+		}
+		c.lastReconnect = time.Now()
+		c.mu.Unlock()
+	}
+	c.reconnect()
 }
 
 func (c *healthController) probeOnce() (error, bool) {
@@ -284,6 +415,22 @@ func (c *healthController) probeOnce() (error, bool) {
 		log.Printf("mobile: exit health probe failed: %v", err)
 	}
 	return err, false
+}
+
+func (c *healthController) netProbeOnce() (bool, error, bool) {
+	if c.netProbe == nil {
+		return false, nil, false
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
+	supported, err := c.netProbe(ctx, c.mux)
+	cancel()
+	if c.ctx.Err() != nil {
+		return false, nil, true
+	}
+	if supported && err != nil {
+		log.Printf("mobile: internet health probe failed: %v", err)
+	}
+	return supported, err, false
 }
 
 func (c *healthController) recordProbeSuccess() {
@@ -327,29 +474,34 @@ func (c *healthController) recordProbeFailure(failures int, probeErr error) {
 		stateMu.Unlock()
 		return
 	}
+
 	tunnelHealth.TunnelUp = true
+	tunnelHealth.ExitReachable = false
 	tunnelHealth.LastProbeUnix = now
 	tunnelHealth.ConsecutiveFailures = failures
+	tunnelHealth.ErrorCode = HealthCodeExitUnreachable
 	if probeErr != nil {
 		tunnelHealth.LastError = probeErr.Error()
 	}
 
-	changed := false
+	var (
+		downgraded bool
+		listener   StateListener
+	)
 	if failures >= c.failureLimit {
-		tunnelHealth.ExitReachable = false
-		if state != StateError || stateMessage != HealthMessageExitUnreachable {
-			state = StateError
-			stateMessage = HealthMessageExitUnreachable
-			tunnelHealth.ErrorCode = HealthCodeExitUnreachable
-			healthError = true
-			changed = true
+		healthError = true
+
+		if state == StateRunning {
+			state = StateConnecting
+			stateMessage = ""
+			downgraded = true
+			listener = stateListener
 		}
 	}
-	listener := stateListener
 	stateMu.Unlock()
 
-	if changed && listener != nil {
-		listener.OnStateChanged(StateError, HealthMessageExitUnreachable)
+	if downgraded && listener != nil {
+		listener.OnStateChanged(StateConnecting, "")
 	}
 }
 
@@ -368,6 +520,7 @@ func (c *healthController) recordNoInternet() {
 		stateMu.Unlock()
 		return
 	}
+
 	tunnelHealth.TunnelUp = true
 	tunnelHealth.ExitReachable = true
 	tunnelHealth.InternetVerified = false
@@ -376,19 +529,7 @@ func (c *healthController) recordNoInternet() {
 	tunnelHealth.ConsecutiveFailures = 0
 	tunnelHealth.ErrorCode = HealthCodeNoInternet
 	tunnelHealth.LastError = "user traffic failed without a response"
-
-	changed := state != StateError || stateMessage != HealthMessageNoInternet
-	if changed {
-		state = StateError
-		stateMessage = HealthMessageNoInternet
-		healthError = true
-	}
-	listener := stateListener
 	stateMu.Unlock()
-
-	if changed && listener != nil {
-		listener.OnStateChanged(StateError, HealthMessageNoInternet)
-	}
 }
 
 func (c *healthController) recordInboundActivity() {

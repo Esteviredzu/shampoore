@@ -103,13 +103,6 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File,
 		return nil, err
 	}
 
-	singleRoutes := make([]panelstore.Route, 0, len(routes))
-	for _, route := range routes {
-		if route.TransportType == panelstore.TransportMulti {
-			continue
-		}
-		singleRoutes = append(singleRoutes, route)
-	}
 	nodes, err := p.store.ListNode(ctx)
 	if err != nil {
 		return nil, err
@@ -118,7 +111,7 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) ([]File,
 	if err != nil {
 		return nil, err
 	}
-	exitFiles, err := RenderExit(node, singleRoutes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
+	exitFiles, err := RenderExit(node, routes, nodes, RenderOptions{PanelURL: panelURL, RuleFiles: ruleFiles})
 	if err != nil {
 		return nil, err
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/names"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const (
@@ -128,7 +129,10 @@ func (p *Provider) connect() error {
 			pipe := p.pipe
 			p.pipeMu.Unlock()
 			if pipe != nil {
-				pipe.SetRemoteID(rp.Identity())
+				if pipe.PeerJoined(rp.Identity()) {
+
+					pipe.SignalReset(fmt.Errorf("%w: livekit: peer joined", transport.ErrTransportReset))
+				}
 			}
 		},
 		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
@@ -137,7 +141,7 @@ func (p *Provider) connect() error {
 			pipe := p.pipe
 			p.pipeMu.Unlock()
 			if pipe != nil && pipe.GetRemoteID() == rp.Identity() {
-				pipe.SetRemoteID("")
+				pipe.PeerLeft()
 			}
 		},
 		OnDisconnected: func() {
@@ -148,10 +152,7 @@ func (p *Provider) connect() error {
 				return
 			}
 			p.logger.Warn("livekit: room disconnected unexpectedly")
-			select {
-			case p.disconnected <- struct{}{}:
-			default:
-			}
+			p.signalDisconnected()
 		},
 	}
 
@@ -172,10 +173,11 @@ func (p *Provider) connect() error {
 
 	p.roomMu.Lock()
 	p.room = room
-	p.closing = false
+
 	p.roomMu.Unlock()
 
 	p.pipeMu.Lock()
+	reused := p.pipe != nil
 	if p.pipe == nil {
 		p.pipe = newPipe(room.LocalParticipant, p.cfg.DataTopic, "")
 	} else {
@@ -184,10 +186,28 @@ func (p *Provider) connect() error {
 	pipe := p.pipe
 	p.pipeMu.Unlock()
 
+	pipe.SetDeadHandler(func() {
+		p.roomMu.Lock()
+		busy := p.closing || p.room == nil
+		p.roomMu.Unlock()
+		if busy {
+			return
+		}
+		p.logger.Warn("livekit: peer heartbeat lost, reconnecting")
+		p.signalDisconnected()
+	})
+	pipe.ResetLiveness()
 	pipe.SetRemoteID("")
 	if rps := room.GetRemoteParticipants(); len(rps) > 0 {
 		pipe.SetRemoteID(rps[0].Identity())
 	}
+	if reused {
+		pipe.SignalReset(fmt.Errorf("%w: livekit: room reconnected", transport.ErrTransportReset))
+	}
+
+	p.roomMu.Lock()
+	p.closing = false
+	p.roomMu.Unlock()
 
 	p.logger.Info("livekit: room=", roomName,
 		" identity=", p.identity,
@@ -195,6 +215,13 @@ func (p *Provider) connect() error {
 		" topic=", p.cfg.DataTopic)
 
 	return nil
+}
+
+func (p *Provider) signalDisconnected() {
+	select {
+	case p.disconnected <- struct{}{}:
+	default:
+	}
 }
 
 func (p *Provider) supervise() {
@@ -276,10 +303,14 @@ func (p *Provider) NotifyNetworkChanged() {
 	if p.stopped.Load() {
 		return
 	}
-	select {
-	case p.disconnected <- struct{}{}:
-	default:
+	p.roomMu.Lock()
+	busy := p.closing || p.room == nil
+	p.roomMu.Unlock()
+	if busy {
+
+		return
 	}
+	p.signalDisconnected()
 }
 
 func (p *Provider) Start(ctx context.Context) error { return p.start(ctx) }

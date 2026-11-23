@@ -219,6 +219,7 @@ func build(
 			"mux_flush_ms":        eff.Int("mux_flush_ms", 20),
 			"mux_flush_threshold": eff.Int("mux_flush_threshold", 12000),
 		})
+		srv.SetExitNodeID(s.ExitNodeID)
 		logger.Info("raw_ws: multiuser server ready (room=", cfg.Room,
 			" users=", len(cfg.Users), ")")
 		return &app.BuildResult{

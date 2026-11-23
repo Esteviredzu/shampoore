@@ -15,7 +15,7 @@ import (
 
 	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/raw_ws"
-	_ "github.com/Esteviredzu/shampoore/internal/transport/silo"
+	"github.com/Esteviredzu/shampoore/internal/transport/silo"
 )
 
 func secretsFor(name string) map[string]string {
@@ -365,6 +365,110 @@ func TestRenderExit(t *testing.T) {
 	}
 }
 
+func TestRenderExitMultiBondAggregatesSubflows(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               1,
+		Name:             "relay",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+			{Type: panelstore.TransportSilo, Domain: "s3.example.com", Enabled: true},
+		},
+	}
+	exit := panelstore.Node{
+		ID:               2,
+		Name:             "exit",
+		IsExit:           true,
+		SocksPort:        1080,
+		NodeSecret:       "exit-secret",
+		GeneratedSecrets: secretsFor("exit"),
+	}
+	childWS := panelstore.Route{
+		ID: 7, Name: "route-raw", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportRawWS, Enabled: true,
+	}
+	childSilo := panelstore.Route{
+		ID: 8, Name: "route-silo", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportSilo, Enabled: true,
+	}
+	multi := panelstore.Route{
+		ID: 9, Name: "bond-route", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportMulti, MultiStrategy: panelstore.MultiStrategyBond,
+		SubRouteIDs: []int64{childWS.ID, childSilo.ID}, Enabled: true,
+	}
+
+	files, err := RenderExit(exit, []panelstore.Route{childWS, childSilo, multi},
+		[]panelstore.Node{relay, exit}, RenderOptions{PanelURL: "https://panel.example.com"})
+	if err != nil {
+		t.Fatalf("render exit: %v", err)
+	}
+	m := fileMap(files)
+	file, ok := m["configs/route-9.json"]
+	if !ok {
+		t.Fatalf("multi config was not rendered: %v", keysOf(m))
+	}
+
+	var settings app.Settings
+	if err := json.Unmarshal(file.Data, &settings); err != nil {
+		t.Fatalf("decode multi settings: %v", err)
+	}
+	if settings.Type != panelstore.TransportMulti {
+		t.Fatalf("multi type = %q", settings.Type)
+	}
+	if settings.EncryptionPassword != secretsFor("relay")["encryption_password"] {
+		t.Fatalf("multi password = %q", settings.EncryptionPassword)
+	}
+
+	var payload struct {
+		Strategy   string `json:"strategy"`
+		Transports []struct {
+			Type      string          `json:"type"`
+			Transport json.RawMessage `json:"transport"`
+		} `json:"transports"`
+	}
+	if err := json.Unmarshal(settings.Transport, &payload); err != nil {
+		t.Fatalf("decode multi transport: %v", err)
+	}
+	if payload.Strategy != panelstore.MultiStrategyBond {
+		t.Fatalf("strategy = %q", payload.Strategy)
+	}
+	if len(payload.Transports) != 2 {
+		t.Fatalf("subflows = %d, want 2", len(payload.Transports))
+	}
+	types := []string{payload.Transports[0].Type, payload.Transports[1].Type}
+	if types[0] != panelstore.TransportRawWS || types[1] != panelstore.TransportSilo {
+		t.Fatalf("subflow types = %v", types)
+	}
+
+	var rawCfg map[string]any
+	if err := json.Unmarshal(payload.Transports[0].Transport, &rawCfg); err != nil {
+		t.Fatalf("decode raw_ws options: %v", err)
+	}
+	if rawCfg["room"] != "route-9" {
+		t.Fatalf("raw_ws room = %v, want route-9", rawCfg["room"])
+	}
+	if rawCfg["multiuser"] != true {
+		t.Fatalf("raw_ws server config is not multiuser: %v", rawCfg["multiuser"])
+	}
+
+	var siloCfg map[string]any
+	if err := json.Unmarshal(payload.Transports[1].Transport, &siloCfg); err != nil {
+		t.Fatalf("decode silo options: %v", err)
+	}
+	if siloCfg["tunnel_id"] != "route-9" {
+		t.Fatalf("silo tunnel_id = %v, want route-9", siloCfg["tunnel_id"])
+	}
+}
+
+func keysOf(m map[string]File) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 func TestRenderExitLiveKitSubscriptionServerConfig(t *testing.T) {
 	relay := panelstore.Node{
 		ID:               1,
@@ -525,4 +629,116 @@ func TestRenderExitAppendsRuleFiles(t *testing.T) {
 	if !ok || string(got.Data) != "1.1.1.0/24\n" {
 		t.Fatalf("rule file = %+v, ok=%v", got, ok)
 	}
+}
+
+func TestRenderExitSiloNamespacesStayIsolated(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               1,
+		Name:             "relay",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+			{Type: panelstore.TransportSilo, Domain: "s3.example.com", Enabled: true},
+		},
+	}
+	exit := panelstore.Node{
+		ID:               2,
+		Name:             "exit",
+		IsExit:           true,
+		SocksPort:        1080,
+		NodeSecret:       "exit-secret",
+		GeneratedSecrets: secretsFor("exit"),
+	}
+	childWS := panelstore.Route{
+		ID: 7, Name: "route-raw", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportRawWS, Enabled: true,
+	}
+	singleSilo := panelstore.Route{
+		ID: 8, Name: "s3", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportSilo, Enabled: true,
+	}
+	multi := panelstore.Route{
+		ID: 9, Name: "bond", EntryNodeID: relay.ID, ExitNodeID: exit.ID,
+		TransportType: panelstore.TransportMulti, MultiStrategy: panelstore.MultiStrategyBond,
+		SubRouteIDs: []int64{childWS.ID, singleSilo.ID}, Enabled: true,
+	}
+
+	files, err := RenderExit(exit, []panelstore.Route{childWS, singleSilo, multi},
+		[]panelstore.Node{relay, exit}, RenderOptions{PanelURL: "https://panel.example.com"})
+	if err != nil {
+		t.Fatalf("render exit: %v", err)
+	}
+	m := fileMap(files)
+
+	decode := func(name string) app.Settings {
+		t.Helper()
+		file, ok := m[name]
+		if !ok {
+			t.Fatalf("missing %s in %v", name, keysOf(m))
+		}
+		var settings app.Settings
+		if err := json.Unmarshal(file.Data, &settings); err != nil {
+			t.Fatalf("decode %s: %v", name, err)
+		}
+		return settings
+	}
+
+	singleCfg := decode("configs/route-8.json")
+	if singleCfg.Type != panelstore.TransportSilo {
+		t.Fatalf("route-8 type = %q", singleCfg.Type)
+	}
+	var singleRaw map[string]any
+	if err := json.Unmarshal(singleCfg.Transport, &singleRaw); err != nil {
+		t.Fatalf("decode route-8 silo options: %v", err)
+	}
+	if singleRaw["tunnel_id"] != "route-8" {
+		t.Fatalf("route-8 tunnel_id = %v, want route-8", singleRaw["tunnel_id"])
+	}
+	if singleRaw["multiuser"] != true {
+		t.Fatalf("route-8 multiuser = %v", singleRaw["multiuser"])
+	}
+
+	multiCfg := decode("configs/route-9.json")
+	var payload siloMultiPayload
+	if err := json.Unmarshal(multiCfg.Transport, &payload); err != nil {
+		t.Fatalf("decode route-9 transport: %v", err)
+	}
+	childTunnelID := ""
+	for _, child := range payload.Transports {
+		if child.Type != panelstore.TransportSilo {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(child.Transport, &raw); err != nil {
+			t.Fatalf("decode bond silo options: %v", err)
+		}
+		childTunnelID, _ = raw["tunnel_id"].(string)
+		if raw["multiuser"] != true {
+			t.Fatalf("bond silo multiuser = %v", raw["multiuser"])
+		}
+	}
+	if childTunnelID != "route-9" {
+		t.Fatalf("bond silo tunnel_id = %q, want route-9", childTunnelID)
+	}
+
+	singlePrefix := silo.C2SPrefix(singleRaw["tunnel_id"].(string), "alice")
+	childPrefix := silo.C2SPrefix(childTunnelID, "alice")
+	if singlePrefix != "route-8/users/alice/c2s/" {
+		t.Fatalf("single silo prefix = %q", singlePrefix)
+	}
+	if childPrefix != "route-9/users/alice/c2s/" {
+		t.Fatalf("bond silo prefix = %q", childPrefix)
+	}
+	if singlePrefix == childPrefix {
+		t.Fatalf("silo prefixes collide: %q", singlePrefix)
+	}
+}
+
+type siloMultiPayload struct {
+	Strategy   string `json:"strategy"`
+	Transports []struct {
+		Type      string          `json:"type"`
+		Transport json.RawMessage `json:"transport"`
+	} `json:"transports"`
 }

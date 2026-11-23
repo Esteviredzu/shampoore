@@ -27,9 +27,13 @@ const (
 	closeFlushTimeout = time.Second
 
 	maxRetiredEpochs = 8
+
+	maxUnknownCloses = 64
 )
 
 var errWriterStopped = errors.New("tunnel: writer stopped")
+
+var errHelloPending = errors.New("tunnel: hello handshake is still pending")
 
 type Config struct {
 	FlushThreshold int
@@ -39,6 +43,38 @@ type Config struct {
 	ExitNodeID string
 
 	Registry *auth.UserRegistry
+
+	OnSessionError func(error)
+
+	OnRemoteEpochChange func(previous, current uint32)
+
+	PingInterval time.Duration
+	PingTimeout  time.Duration
+}
+
+const (
+	defaultPingInterval = 5 * time.Second
+	defaultPingTimeout  = 30 * time.Second
+	maxOpenRetries      = 2
+
+	defaultOpenAckTimeout = 3 * time.Second
+
+	openAckFlushWindows = 8
+)
+
+var openAckTimeout = defaultOpenAckTimeout
+
+var errOpenAckTimeout = errors.New("tunnel: open ack timeout")
+
+func (m *TunnelMultiplexer) openAckWindow() time.Duration {
+	window := openAckTimeout
+	if window != defaultOpenAckTimeout {
+		return window
+	}
+	if adaptive := openAckFlushWindows * m.cfg.FlushInterval; adaptive > window {
+		window = adaptive
+	}
+	return window
 }
 
 func DefaultConfig() Config {
@@ -64,7 +100,13 @@ type TunnelMultiplexer struct {
 	streams map[StreamID]*TunnelStream
 	closed  bool
 
+	unknownClosed map[StreamID]struct{}
+
 	epoch atomic.Uint32
+
+	failed     atomic.Bool
+	peerModern atomic.Bool
+	lastRecv   atomic.Int64
 
 	remoteEpoch    uint32
 	remoteEpochSet bool
@@ -76,6 +118,12 @@ type TunnelMultiplexer struct {
 	sessionExit  string
 	authRejected bool
 	authRequired bool
+
+	helloMu      sync.Mutex
+	helloReady   chan struct{}
+	helloEpoch   uint32
+	helloErr     error
+	helloSettled bool
 
 	incoming chan multiplexing.Stream
 
@@ -118,6 +166,7 @@ func New(
 		writerDone:    make(chan struct{}),
 	}
 	m.epoch.Store(newSessionEpoch())
+	m.helloReady = make(chan struct{})
 	return m
 }
 
@@ -161,6 +210,7 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 	m.closed = false
 	m.epoch.Store(newSessionEpoch())
 	m.streams = make(map[StreamID]*TunnelStream)
+	m.unknownClosed = make(map[StreamID]struct{})
 	m.remoteEpoch = 0
 	m.remoteEpochSet = false
 	m.retiredEpochs = make(map[uint32]struct{})
@@ -171,13 +221,18 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 	m.sessionExit = ""
 	m.authRejected = false
 	m.authRequired = m.cfg.Registry != nil && m.cfg.Registry.Active()
+	m.resetHelloGateLocked()
 	m.mu.Unlock()
+	m.failed.Store(false)
+	m.peerModern.Store(false)
+	m.lastRecv.Store(time.Now().UnixNano())
 
 	m.started = true
 
-	m.wg.Add(2)
+	m.wg.Add(3)
 	go m.receiveLoop()
 	go m.writeLoop(muxCtx, writerDone)
+	go m.heartbeatLoop(muxCtx)
 
 	if m.hasClientIdentity() {
 		helloCtx, helloCancel := context.WithTimeout(muxCtx, 2*time.Second)
@@ -188,6 +243,10 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 }
 
 func (m *TunnelMultiplexer) hasClientIdentity() bool {
+
+	if m.cfg.Registry != nil {
+		return false
+	}
 	return strings.TrimSpace(m.cfg.UserID) != "" || strings.TrimSpace(m.cfg.ExitNodeID) != ""
 }
 
@@ -208,10 +267,127 @@ func (m *TunnelMultiplexer) SessionIdentity() (userID, exitNodeID string) {
 	return m.sessionUser, m.sessionExit
 }
 
+func (m *TunnelMultiplexer) resetHelloGateLocked() {
+	m.helloReady = make(chan struct{})
+	m.helloEpoch = 0
+	m.helloErr = nil
+	m.helloSettled = false
+}
+
+func (m *TunnelMultiplexer) helloSatisfiedLocked() bool {
+	if !m.hasClientIdentity() {
+		return true
+	}
+	return m.helloSettled && m.helloErr == nil && m.helloEpoch == m.epoch.Load()
+}
+
+func (m *TunnelMultiplexer) settleHello(epoch uint32, err error) {
+	m.mu.Lock()
+	if m.epoch.Load() != epoch || m.helloSettled {
+		m.mu.Unlock()
+		return
+	}
+	m.helloErr = err
+	if err == nil {
+		m.helloEpoch = epoch
+	}
+	m.helloSettled = true
+	ready := m.helloReady
+	m.mu.Unlock()
+
+	if ready != nil {
+		close(ready)
+	}
+}
+
+func (m *TunnelMultiplexer) awaitHello(ctx context.Context) error {
+	if !m.hasClientIdentity() {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		m.mu.Lock()
+		closed := m.closed
+		rejected := m.authRejected
+		muxCtx := m.ctx
+		ready := m.helloReady
+		writerDone := m.writerDone
+		satisfied := m.helloSatisfiedLocked()
+		settled := m.helloSettled
+		helloErr := m.helloErr
+		m.mu.Unlock()
+
+		if m.failed.Load() {
+			return fmt.Errorf("%w: tunnel: session is dead", transport.ErrTransportReset)
+		}
+		if closed {
+			return fmt.Errorf("tunnel: multiplexer is closed")
+		}
+		if rejected {
+			return fmt.Errorf("tunnel: session was rejected")
+		}
+		if muxCtx == nil {
+			return fmt.Errorf("tunnel: multiplexer is not started")
+		}
+		if satisfied {
+			return nil
+		}
+		if settled && helloErr != nil {
+			return fmt.Errorf("tunnel: hello handshake failed: %w", helloErr)
+		}
+
+		select {
+		case <-ready:
+		case <-writerDone:
+			return fmt.Errorf("tunnel: multiplexer is closed")
+		case <-muxCtx.Done():
+			if m.failed.Load() {
+				return fmt.Errorf("%w: tunnel: session is dead", transport.ErrTransportReset)
+			}
+			return muxCtx.Err()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (m *TunnelMultiplexer) enqueueOpenFrame(ctx context.Context, f *TunnelFrame) error {
+	m.helloMu.Lock()
+	defer m.helloMu.Unlock()
+
+	m.mu.Lock()
+	satisfied := m.helloSatisfiedLocked()
+	m.mu.Unlock()
+	if !satisfied {
+		return errHelloPending
+	}
+	return m.enqueueFrame(ctx, f)
+}
+
 func (m *TunnelMultiplexer) sendHello(ctx context.Context) {
 	if ctx == nil {
 		return
 	}
+	m.helloMu.Lock()
+	defer m.helloMu.Unlock()
+	m.sendHelloLocked(ctx)
+}
+
+func (m *TunnelMultiplexer) sendHelloLocked(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+
+	m.mu.Lock()
+	epoch := m.epoch.Load()
+	satisfied := m.helloSatisfiedLocked()
+	m.mu.Unlock()
+	if satisfied {
+		return
+	}
+
 	frame := &TunnelFrame{
 		Type: FrameHello,
 		Hello: &Hello{
@@ -221,13 +397,86 @@ func (m *TunnelMultiplexer) sendHello(ctx context.Context) {
 	}
 	if err := m.enqueueFrame(ctx, frame); err != nil {
 		m.logger.Warn("tunnel: send hello: ", err)
+		m.settleHello(epoch, err)
 		return
 	}
-	if err := m.flushOutbound(ctx); err != nil &&
-		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) &&
-		!errors.Is(err, errWriterStopped) {
-		m.logger.Debug("tunnel: flush hello: ", err)
+	if err := m.flushOutbound(ctx); err != nil {
+
+		if !isBenignFlushError(err) {
+			m.logger.Debug("tunnel: flush hello: ", err)
+		}
+	}
+	m.settleHello(epoch, nil)
+}
+
+func (m *TunnelMultiplexer) sendControl(ctx context.Context, f *TunnelFrame) {
+	if ctx == nil {
+		return
+	}
+	if err := m.enqueueFrame(ctx, f); err != nil {
+		m.logger.Debug("tunnel: send control frame: ", err)
+	}
+}
+
+func (m *TunnelMultiplexer) sendPing(ctx context.Context) {
+	m.sendControl(ctx, &TunnelFrame{Type: FramePing})
+}
+
+func (m *TunnelMultiplexer) sendPong(ctx context.Context) {
+	m.sendControl(ctx, &TunnelFrame{Type: FramePong})
+}
+
+func (m *TunnelMultiplexer) sendOpenAck(ctx context.Context, id StreamID) {
+	if ctx == nil {
+		return
+	}
+	if err := m.enqueueFrame(ctx, &TunnelFrame{StreamID: id, Type: FrameOpenAck}); err != nil {
+		m.logger.Debug("tunnel: send open ack: ", err)
+		return
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), m.openAckWindow())
+	defer cancel()
+	if err := m.flushOutbound(flushCtx); err != nil {
+		m.logger.Debug("tunnel: flush open ack: ", err)
+	}
+}
+
+func (m *TunnelMultiplexer) heartbeatLoop(ctx context.Context) {
+	defer m.wg.Done()
+
+	interval := m.cfg.PingInterval
+	if interval <= 0 {
+		interval = defaultPingInterval
+	}
+	timeout := m.cfg.PingTimeout
+	if timeout <= 0 {
+		timeout = defaultPingTimeout
+	}
+
+	m.sendPing(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		m.sendPing(ctx)
+		if !m.peerModern.Load() {
+
+			continue
+		}
+		last := m.lastRecv.Load()
+		if last == 0 {
+			continue
+		}
+		if time.Since(time.Unix(0, last)) > timeout {
+			m.failSession(fmt.Errorf("tunnel: peer silent for %s", timeout))
+			return
+		}
 	}
 }
 
@@ -385,49 +634,130 @@ func (m *TunnelMultiplexer) OpenStream(
 	ctx context.Context,
 	metadata map[string]any,
 ) (multiplexing.Stream, error) {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("tunnel: multiplexer is closed")
-	}
-	if m.authRejected {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("tunnel: session was rejected")
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	if m.ctx == nil {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("tunnel: multiplexer is not started")
-	}
-	id := StreamID(uuid.New())
-	stream := newTunnelStream(m, id, metadata)
-	m.streams[id] = stream
-	m.mu.Unlock()
+	for {
 
-	frame := &TunnelFrame{
-		StreamID: id,
-		Type:     FrameOpen,
-		Metadata: metadata,
-	}
-	if err := m.enqueueFrame(ctx, frame); err != nil {
+		if err := m.awaitHello(ctx); err != nil {
+			return nil, err
+		}
+
 		m.mu.Lock()
-		delete(m.streams, id)
+		if m.closed {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("tunnel: multiplexer is closed")
+		}
+		if m.authRejected {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("tunnel: session was rejected")
+		}
+		if m.ctx == nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("tunnel: multiplexer is not started")
+		}
+		id := StreamID(uuid.New())
+		stream := newTunnelStream(m, id, metadata)
+		m.streams[id] = stream
 		m.mu.Unlock()
-		return nil, err
-	}
-	if err := m.flushOutbound(ctx); err != nil &&
-		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) &&
-		!errors.Is(err, errWriterStopped) {
-		m.logger.Debug("tunnel: flush open frame: ", err)
-	}
 
-	if stream.Closed() {
-		if err := m.sendCloseFrame(ctx, id); err != nil {
-			m.logger.Debug("tunnel: close stream after reset failed: ", err)
+		if m.failed.Load() {
+			m.forgetStream(id)
+			return nil, fmt.Errorf("%w: tunnel: session is dead", transport.ErrTransportReset)
+		}
+
+		frame := &TunnelFrame{
+			StreamID: id,
+			Type:     FrameOpen,
+			Metadata: metadata,
+		}
+		err := m.enqueueOpenFrame(ctx, frame)
+		if errors.Is(err, errHelloPending) {
+
+			m.forgetStream(id)
+			continue
+		}
+		if err != nil {
+			m.forgetStream(id)
+			return nil, err
+		}
+
+		if err := m.flushOutbound(ctx); err != nil {
+			m.forgetStream(id)
+			stream.abort(err)
+			if isBenignFlushError(err) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("tunnel: flush open frame: %w", err)
+		}
+
+		if m.peerModern.Load() {
+			if err := m.waitOpenAck(ctx, stream, frame); err != nil {
+				return nil, err
+			}
+		}
+
+		if stream.Closed() {
+			if err := m.sendCloseFrame(ctx, id); err != nil {
+				m.logger.Debug("tunnel: close stream after reset failed: ", err)
+			}
+		}
+		return stream, nil
+	}
+}
+
+func (m *TunnelMultiplexer) waitOpenAck(ctx context.Context, stream *TunnelStream, frame *TunnelFrame) error {
+	timeout := m.openAckWindow()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for attempt := 0; ; attempt++ {
+		select {
+		case err := <-stream.ackCh:
+			if err != nil {
+				m.forgetStream(stream.id)
+				return err
+			}
+			return nil
+		case <-ctx.Done():
+			m.forgetStream(stream.id)
+			stream.abort(ctx.Err())
+			return ctx.Err()
+		case <-timer.C:
+			if attempt >= maxOpenRetries {
+				m.forgetStream(stream.id)
+				stream.abort(errOpenAckTimeout)
+				return errOpenAckTimeout
+			}
+			if err := m.enqueueFrame(ctx, frame); err != nil {
+				m.forgetStream(stream.id)
+				stream.abort(err)
+				return err
+			}
+			if err := m.flushOutbound(ctx); err != nil {
+				if isBenignFlushError(err) {
+					m.forgetStream(stream.id)
+					stream.abort(err)
+					return err
+				}
+				m.logger.Debug("tunnel: resend open frame: ", err)
+			}
+			timer.Reset(timeout)
 		}
 	}
-	return stream, nil
+}
+
+func (m *TunnelMultiplexer) forgetStream(id StreamID) {
+	m.mu.Lock()
+	delete(m.streams, id)
+	m.mu.Unlock()
+}
+
+func isBenignFlushError(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errWriterStopped)
 }
 
 func (m *TunnelMultiplexer) AcceptStream(
@@ -446,16 +776,28 @@ func (m *TunnelMultiplexer) AcceptStream(
 
 func (m *TunnelMultiplexer) writeData(id StreamID, data []byte) error {
 	m.mu.Lock()
+	ctx := m.ctx
+	m.mu.Unlock()
+	return m.writeDataCtx(ctx, id, data)
+}
+
+func (m *TunnelMultiplexer) writeDataCtx(ctx context.Context, id StreamID, data []byte) error {
+	m.mu.Lock()
 	_, ok := m.streams[id]
 	closed := m.closed
 	rejected := m.authRejected
-	ctx := m.ctx
+	if ctx == nil {
+		ctx = m.ctx
+	}
 	user := m.sessionUser
 	authorized := m.authorized
 	needHello := m.requiresHelloLocked()
 	m.mu.Unlock()
 	if closed {
 		return io.ErrClosedPipe
+	}
+	if m.failed.Load() {
+		return fmt.Errorf("%w: tunnel: session is dead", transport.ErrTransportReset)
 	}
 	if rejected {
 		return fmt.Errorf("tunnel: session was rejected")
@@ -690,9 +1032,14 @@ func (m *TunnelMultiplexer) writeLoop(ctx context.Context, done chan struct{}) {
 			return nil
 		}
 		if bufEpoch != m.epoch.Load() {
-			m.queuedBytes.Add(-int64(len(buf)))
+			dropped := len(buf)
+			m.queuedBytes.Add(-int64(dropped))
 			buf = buf[:0]
 			bufEpoch = 0
+			if dropped > 0 {
+				m.logger.Warn("tunnel: dropping ", dropped,
+					" bytes of frames from a retired epoch")
+			}
 			return nil
 		}
 		return m.sendBuffer(sendCtx, &buf)
@@ -786,21 +1133,21 @@ func (m *TunnelMultiplexer) receiveLoop() {
 			}
 			if errors.Is(err, io.EOF) {
 				m.logger.Info("tunnel: transport EOF")
-				m.closeAllStreams(io.EOF)
+				m.failSession(io.EOF)
 				return
 			}
 			m.logger.Error("tunnel: receive error: ", err)
-			m.closeAllStreams(err)
+			m.failSession(err)
 			return
 		}
 
 		m.ctr.NetworkRecv.Add(int64(len(data)))
+		m.lastRecv.Store(time.Now().UnixNano())
 
-		frames, err := decoder.Feed(data)
-		if err != nil {
-			m.logger.Warn("tunnel: decode error: ", err)
+		frames, decErr := decoder.Feed(data)
+		if decErr != nil {
+			m.logger.Warn("tunnel: decode error: ", decErr)
 			decoder.Reset()
-			continue
 		}
 
 		for _, f := range frames {
@@ -809,10 +1156,19 @@ func (m *TunnelMultiplexer) receiveLoop() {
 			}
 			m.handleFrame(f)
 		}
+		if decErr != nil {
+			continue
+		}
 	}
 }
 
 func (m *TunnelMultiplexer) handleTransportReset() {
+
+	m.lastRecv.Store(time.Now().UnixNano())
+
+	m.helloMu.Lock()
+	defer m.helloMu.Unlock()
+
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -824,7 +1180,7 @@ func (m *TunnelMultiplexer) handleTransportReset() {
 	m.sessionUser = ""
 	m.sessionExit = ""
 	m.authRejected = false
-	ctx := m.ctx
+	m.resetHelloGateLocked()
 	m.mu.Unlock()
 
 	dropped := m.queuedBytes.Load()
@@ -834,13 +1190,35 @@ func (m *TunnelMultiplexer) handleTransportReset() {
 	if dropped > 0 {
 		m.logger.Debug("tunnel: dropping ", dropped, " bytes of stale outbound data")
 	}
-	if ctx == nil {
-		m.logger.Warn("tunnel: cannot announce session reset: multiplexer not started")
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), closeFlushTimeout)
+	defer cancel()
+	m.sendReset(flushCtx, epoch)
+	if m.hasClientIdentity() {
+		m.sendHelloLocked(flushCtx)
+	} else {
+		m.settleHello(epoch, nil)
+	}
+}
+
+func (m *TunnelMultiplexer) failSession(reason error) {
+	if reason == nil {
+		reason = transport.ErrTransportReset
+	}
+	if !m.failed.CompareAndSwap(false, true) {
 		return
 	}
-	m.sendReset(ctx, epoch)
-	if m.hasClientIdentity() {
-		m.sendHello(ctx)
+	m.closeAllStreams(reason)
+
+	m.mu.Lock()
+	cancel := m.cancel
+	notify := m.cfg.OnSessionError
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if notify != nil {
+		notify(reason)
 	}
 }
 
@@ -873,6 +1251,9 @@ func (m *TunnelMultiplexer) noteRemoteEpoch(epoch uint32) bool {
 	m.logger.Warn("tunnel: remote session epoch changed (", previous, " -> ",
 		epoch, "); closing all streams")
 	m.closeAllStreams(transport.ErrTransportReset)
+	if notify := m.cfg.OnRemoteEpochChange; notify != nil {
+		notify(previous, epoch)
+	}
 	return true
 }
 
@@ -898,6 +1279,7 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 		m.handleHello(f)
 
 	case FrameOpen:
+		m.ensureAuthorizedForStream()
 		m.mu.Lock()
 		if m.closed {
 			m.mu.Unlock()
@@ -914,13 +1296,18 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 			return
 		}
 		if _, exists := m.streams[f.StreamID]; exists {
+			ctx := m.ctx
 			m.mu.Unlock()
+
+			m.sendOpenAck(ctx, f.StreamID)
 			return
 		}
 		stream := newTunnelStream(m, f.StreamID, f.Metadata)
 		m.streams[f.StreamID] = stream
 		ctx := m.ctx
 		m.mu.Unlock()
+
+		m.sendOpenAck(ctx, f.StreamID)
 
 		select {
 		case m.incoming <- stream:
@@ -931,7 +1318,24 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 			stream.deliverEOF(io.EOF)
 		}
 
+	case FrameOpenAck:
+		m.peerModern.Store(true)
+		m.mu.Lock()
+		stream := m.streams[f.StreamID]
+		m.mu.Unlock()
+		if stream != nil {
+			stream.notifyAck(nil)
+		}
+
+	case FramePing:
+		m.peerModern.Store(true)
+		m.sendPong(m.ctx)
+
+	case FramePong:
+		m.peerModern.Store(true)
+
 	case FrameData:
+		m.ensureAuthorizedForStream()
 		m.mu.Lock()
 		stream := m.streams[f.StreamID]
 		user := m.sessionUser
@@ -950,7 +1354,10 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 			}
 			m.ctr.UsefulRecv.Add(int64(len(f.Data)))
 			stream.deliverData(f.Data)
+			return
 		}
+
+		m.closeUnknownStream(f.StreamID)
 
 	case FrameClose:
 		m.mu.Lock()
@@ -963,7 +1370,8 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 
 	case FrameReset:
 
-		m.logger.Debug("tunnel: session reset frame (epoch ", f.Epoch, ")")
+		m.logger.Debug("tunnel: session reset frame (epoch ", f.Epoch, "); closing all streams")
+		m.closeAllStreams(transport.ErrTransportReset)
 
 	case FrameError:
 		var errInfo ErrorFrame
@@ -972,8 +1380,36 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 		}
 		err := fmt.Errorf("tunnel: session error %q: %s", errInfo.Code, errInfo.Message)
 		m.logger.Warn(err)
-		m.closeAllStreams(err)
+		m.failSession(err)
 	}
+}
+
+func (m *TunnelMultiplexer) ensureAuthorizedForStream() {
+	m.mu.Lock()
+	need := !m.closed && !m.authRejected && m.requiresHelloLocked() && !m.authorized
+	m.mu.Unlock()
+	if !need {
+		return
+	}
+	m.authorizeConfiguredIdentity()
+}
+
+func (m *TunnelMultiplexer) authorizeConfiguredIdentity() bool {
+	userID, err := auth.NormalizeUserID(m.cfg.UserID)
+	if err != nil {
+		return false
+	}
+	exitNodeID := strings.TrimSpace(m.cfg.ExitNodeID)
+	if registry := m.cfg.Registry; registry != nil && registry.Active() {
+		if err := registry.Authorize(userID, exitNodeID); err != nil {
+			return false
+		}
+	}
+	if !m.storeHelloIdentity(Hello{UserID: userID, ExitNodeID: exitNodeID}) {
+		return false
+	}
+	m.logger.Info("tunnel: authorized configured user ", userID, " before hello")
+	return true
 }
 
 func (m *TunnelMultiplexer) handleHello(f *TunnelFrame) {
@@ -1050,6 +1486,31 @@ func (m *TunnelMultiplexer) storeHelloIdentity(hello Hello) bool {
 	m.sessionExit = exitNodeID
 	m.authRejected = false
 	return true
+}
+
+func (m *TunnelMultiplexer) closeUnknownStream(id StreamID) {
+	m.mu.Lock()
+	if m.unknownClosed == nil {
+		m.unknownClosed = make(map[StreamID]struct{})
+	}
+	if len(m.unknownClosed) >= maxUnknownCloses {
+		m.unknownClosed = make(map[StreamID]struct{})
+	}
+	_, seen := m.unknownClosed[id]
+	m.unknownClosed[id] = struct{}{}
+	closed := m.closed
+	ctx := m.ctx
+	m.mu.Unlock()
+	if seen || closed || ctx == nil {
+		return
+	}
+	go func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), closeFlushTimeout)
+		defer cancel()
+		if err := m.sendCloseFrame(closeCtx, id); err != nil {
+			m.logger.Debug("tunnel: close unknown stream: ", err)
+		}
+	}()
 }
 
 func (m *TunnelMultiplexer) closeAllStreams(err error) {

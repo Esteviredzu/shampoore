@@ -25,6 +25,8 @@ const (
 	fastThresholdDen = 2
 
 	logEvery = 15
+
+	subflowFailCooldown = 5 * time.Second
 )
 
 type Config struct {
@@ -55,6 +57,7 @@ type subflow struct {
 	recentRate  atomic.Int64
 	active      atomic.Int64
 	totalOpened atomic.Uint64
+	failUntil   atomic.Int64
 
 	lastSentBytes int64
 	lastRecvBytes int64
@@ -226,20 +229,35 @@ func (m *FlowMux) walkLayers() []transport.Layer {
 }
 
 func (m *FlowMux) OpenStream(ctx context.Context, meta map[string]any) (multiplexing.Stream, error) {
-	sf := m.pickSubflow()
-	if sf == nil {
+	if len(m.subflows) == 0 {
 		return nil, fmt.Errorf("flowmux: no subflow")
 	}
-	s, err := sf.mux.OpenStream(ctx, meta)
-	if err != nil {
-		return nil, fmt.Errorf("flowmux: open on %s: %w", sf.name, err)
+	var lastErr error
+	for attempt := 0; attempt < len(m.subflows); attempt++ {
+		sf := m.pickSubflow()
+		if sf == nil {
+			break
+		}
+		s, err := sf.mux.OpenStream(ctx, meta)
+		if err == nil {
+			sf.failUntil.Store(0)
+			sf.active.Add(1)
+			m.logger.Info("flowmux: new stream on ", sf.name,
+				" (active=", sf.active.Load(),
+				" tp=", sf.throughput.Load(), " B/s)")
+			return &wrappedStream{Stream: s, sf: sf}, nil
+		}
+		lastErr = err
+		sf.failUntil.Store(time.Now().Add(subflowFailCooldown).UnixNano())
+		m.logger.Warn("flowmux: open on ", sf.name, " failed, trying another subflow: ", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
-	sf.active.Add(1)
-	sf.totalOpened.Add(1)
-	m.logger.Info("flowmux: new stream on ", sf.name,
-		" (active=", sf.active.Load(),
-		" tp=", sf.throughput.Load(), " B/s)")
-	return &wrappedStream{Stream: s, sf: sf}, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("flowmux: no healthy subflow")
+	}
+	return nil, fmt.Errorf("flowmux: open failed on all subflows: %w", lastErr)
 }
 
 func (m *FlowMux) AcceptStream(ctx context.Context) (multiplexing.Stream, error) {
@@ -322,10 +340,16 @@ func (m *FlowMux) acceptLoop(sf *subflow) {
 }
 
 func (m *FlowMux) pickSubflow() *subflow {
-	n := len(m.subflows)
+	now := time.Now().UnixNano()
+	candidates := m.candidates(now)
+	n := len(candidates)
+	if n == 0 {
+		m.logger.Warn("flowmux: every subflow is in failure cooldown")
+		return nil
+	}
 	if n == 1 {
-		m.subflows[0].totalOpened.Add(1)
-		return m.subflows[0]
+		candidates[0].totalOpened.Add(1)
+		return candidates[0]
 	}
 
 	count := m.pickCount.Add(1)
@@ -335,13 +359,13 @@ func (m *FlowMux) pickSubflow() *subflow {
 
 	firstNs := m.firstOpenAt.Load()
 	if firstNs > 0 && time.Since(time.Unix(0, firstNs)) < probeDuration {
-		sf := m.subflows[(count-1)%uint32(n)]
+		sf := candidates[(count-1)%uint32(n)]
 		sf.totalOpened.Add(1)
 		return sf
 	}
 
 	if count%softProbeEvery == 0 {
-		sf := m.subflows[rand.IntN(n)]
+		sf := candidates[rand.IntN(n)]
 		sf.totalOpened.Add(1)
 		m.logger.Info("flowmux: soft-probe -> ", sf.name,
 			" (tp=", sf.throughput.Load(), " B/s)")
@@ -349,7 +373,7 @@ func (m *FlowMux) pickSubflow() *subflow {
 	}
 
 	var maxTP int64
-	for _, sf := range m.subflows {
+	for _, sf := range candidates {
 		if tp := sf.throughput.Load(); tp > maxTP {
 			maxTP = tp
 		}
@@ -360,13 +384,13 @@ func (m *FlowMux) pickSubflow() *subflow {
 	}
 
 	var pool []*subflow
-	for _, sf := range m.subflows {
+	for _, sf := range candidates {
 		if sf.throughput.Load() >= threshold {
 			pool = append(pool, sf)
 		}
 	}
 	if len(pool) == 0 {
-		pool = m.subflows
+		pool = candidates
 	}
 
 	weights := make([]float64, len(pool))
@@ -391,6 +415,20 @@ func (m *FlowMux) pickSubflow() *subflow {
 	sf := pool[len(pool)-1]
 	sf.totalOpened.Add(1)
 	return sf
+}
+
+func (m *FlowMux) candidates(now int64) []*subflow {
+	alive := make([]*subflow, 0, len(m.subflows))
+	for _, sf := range m.subflows {
+		if sf.failUntil.Load() > now {
+			continue
+		}
+		alive = append(alive, sf)
+	}
+	if len(alive) == 0 {
+		return append([]*subflow(nil), m.subflows...)
+	}
+	return alive
 }
 
 func (m *FlowMux) sampleLoop() {
@@ -432,7 +470,11 @@ func (m *FlowMux) sampleLoop() {
 
 				if bps > 0 {
 					old := sf.throughput.Load()
-					sf.throughput.Store((old*7 + bps*3) / 10)
+					sf.throughput.Store(nextScore(old, bps))
+				} else {
+
+					old := sf.throughput.Load()
+					sf.throughput.Store(nextScore(old, 0))
 				}
 			}
 			sf.lastSentBytes = sentBytes
@@ -516,6 +558,13 @@ func joinStrings(parts []string, sep string) string {
 		out += sep + p
 	}
 	return out
+}
+
+func nextScore(old, bps int64) int64 {
+	if bps <= 0 {
+		return old * 3 / 4
+	}
+	return (old*7 + bps*3) / 10
 }
 
 func (m *FlowMux) Throughputs() map[string]int64 {

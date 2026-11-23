@@ -58,11 +58,12 @@ type ManagedEntry struct {
 	updatedAt  time.Time
 	generation uint64
 
-	rt       *app.Runtime
-	mux      multiplexing.StreamMultiplexer
-	handler  *socks5.RemoteHandler
-	sessions app.SessionServer
-	cancel   context.CancelFunc
+	rt        *app.Runtime
+	mux       multiplexing.StreamMultiplexer
+	telemetry transport.Telemetry
+	handler   *socks5.RemoteHandler
+	sessions  app.SessionServer
+	cancel    context.CancelFunc
 
 	statsMu    sync.Mutex
 	statsAgg   *transport.StatsAggregator
@@ -377,6 +378,10 @@ func (m *Manager) startSessionServer(
 	logger *logging.Logger,
 ) error {
 	sessions := rt.SessionServer
+	var telemetry transport.Telemetry
+	if tel, ok := sessions.(transport.Telemetry); ok {
+		telemetry = tel
+	}
 	sessions.SetSessionHandler(func(sctx context.Context, mux multiplexing.StreamMultiplexer) error {
 		handler := socks5.NewRemoteHandler(sctx, mux, logger, 8000, app.IPv4Only)
 		handler.SetGeoFilter(m.filter, m.blockUnknown)
@@ -417,6 +422,7 @@ func (m *Manager) startSessionServer(
 	}
 	me.rt = rt
 	me.sessions = sessions
+	me.telemetry = telemetry
 	me.cancel = cancel
 	me.statsAgg = transport.NewStatsAggregator()
 	me.mu.Unlock()
@@ -436,6 +442,7 @@ func (m *Manager) stopEntry(me *ManagedEntry) {
 	me.cancel = nil
 	me.handler = nil
 	me.mux = nil
+	me.telemetry = nil
 	me.sessions = nil
 	me.rt = nil
 	me.statsAgg = nil
@@ -558,20 +565,20 @@ func (me *ManagedEntry) Stats() EntryStats {
 func (me *ManagedEntry) refreshStats() EntryStats {
 	me.mu.Lock()
 	mux := me.mux
+	tel := me.telemetry
 	agg := me.statsAgg
 	status := me.status
 	me.mu.Unlock()
 
-	if mux == nil || agg == nil {
-		out := EntryStats{Name: me.Name, Status: status}
-		me.statsMu.Lock()
-		me.cachedStat = out
-		me.statsMu.Unlock()
-		return out
+	if mux != nil {
+		if m, ok := mux.(transport.Telemetry); ok {
+			tel = m
+		} else {
+			tel = nil
+		}
 	}
 
-	tel, ok := mux.(transport.Telemetry)
-	if !ok {
+	if tel == nil || agg == nil {
 		out := EntryStats{Name: me.Name, Status: status}
 		me.statsMu.Lock()
 		me.cachedStat = out

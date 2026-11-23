@@ -33,8 +33,8 @@ func init() {
 			{Key: "bucket", Label: "Bucket Name", Type: app.FieldTypeText, Required: true},
 			{Key: "access_key", Label: "Access Key", Type: app.FieldTypeText, Required: true},
 			{Key: "secret_key", Label: "Secret Key", Type: app.FieldTypePassword, Required: true},
-			{Key: "user_id", Label: "User ID", Type: app.FieldTypeText, Required: false, Hint: "Isolate objects under users/<user_id>/"},
-			{Key: "multiuser", Label: "Multiuser server", Type: app.FieldTypeBool, Required: false, Hint: "Server only: serve every users/<user_id>/ prefix"},
+			{Key: "user_id", Label: "User ID", Type: app.FieldTypeText, Required: false, Hint: "Isolate objects under <tunnel_id>/users/<user_id>/"},
+			{Key: "multiuser", Label: "Multiuser server", Type: app.FieldTypeBool, Required: false, Hint: "Server only: serve every <tunnel_id>/users/<user_id>/ prefix"},
 		},
 		Defaults:  defaults,
 		EncodeURL: encodeURL,
@@ -112,6 +112,7 @@ func build(
 			"mux_flush_ms":        eff.Int("mux_flush_ms", 20),
 			"mux_flush_threshold": eff.Int("mux_flush_threshold", 12000),
 		})
+		srv.SetExitNodeID(s.ExitNodeID)
 		logger.Info("silo: multiuser server ready (endpoint=", cfg.Endpoint,
 			", bucket=", cfg.Bucket, ", users=", len(cfg.Users), ")")
 		return &app.BuildResult{
@@ -156,6 +157,7 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	cfg.AccessKey = q.Get("access_key")
 	cfg.SecretKey = q.Get("secret_key")
 	cfg.EncryptionPassword = q.Get("encryption_password")
+	cfg.TunnelID = q.Get("tunnel_id")
 	cfg.UserID = q.Get("user_id")
 	cfg.Multiuser, _ = strconv.ParseBool(q.Get("multiuser"))
 	return json.Marshal(cfg)
@@ -170,6 +172,9 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	q.Set("bucket", cfg.Bucket)
 	q.Set("access_key", cfg.AccessKey)
 	q.Set("secret_key", cfg.SecretKey)
+	if cfg.TunnelID != "" {
+		q.Set("tunnel_id", cfg.TunnelID)
+	}
 	if cfg.EncryptionPassword != "" {
 		q.Set("encryption_password", cfg.EncryptionPassword)
 	}

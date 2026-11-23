@@ -166,7 +166,14 @@ func resetMobileState(t *testing.T) {
 	healthRetryInitial = time.Second
 	healthFailureCooldown = 5 * time.Second
 	healthNoInternetGrace = 30 * time.Second
+	healthProbeInterval = 30 * time.Second
+	healthReconnectMax = 30 * time.Second
+	healthReconnectMinInterval = 0
 	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error { return nil }
+	internetProbe = func(context.Context, multiplexing.StreamMultiplexer) (bool, error) {
+
+		return false, nil
+	}
 
 	startTUNFD = runtime.StartTUNFD
 }

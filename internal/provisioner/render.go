@@ -131,6 +131,10 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 	}
 
 	var configFiles []File
+	routesByID := make(map[int64]panelstore.Route, len(routes))
+	for _, route := range routes {
+		routesByID[route.ID] = route
+	}
 	for _, route := range routes {
 		if !route.Enabled {
 			continue
@@ -139,7 +143,7 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 		if !ok {
 			return nil, fmt.Errorf("provisioner: route %d references missing entry node %d", route.ID, route.EntryNodeID)
 		}
-		settings, err := exitRouteSettings(node, entry, route)
+		settings, err := exitRouteSettings(node, entry, route, routesByID)
 		if err != nil {
 			return nil, err
 		}
@@ -226,7 +230,22 @@ func configFileName(route panelstore.Route) string {
 	return fmt.Sprintf("route-%d", route.ID)
 }
 
-func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (app.Settings, error) {
+func exitRouteSettings(
+	node, entry panelstore.Node,
+	route panelstore.Route,
+	routesByID map[int64]panelstore.Route,
+) (app.Settings, error) {
+	if route.TransportType == panelstore.TransportMulti {
+		return multiExitSettings(node, entry, route, routesByID)
+	}
+	return singleExitSettings(node, entry, route, route)
+}
+
+func singleExitSettings(
+	node, entry panelstore.Node,
+	route panelstore.Route,
+	namespace panelstore.Route,
+) (app.Settings, error) {
 	tr, ok := entry.EnabledTransport(route.TransportType)
 	if !ok {
 		return app.Settings{}, fmt.Errorf("provisioner: route %d entry node %q has no enabled %s transport", route.ID, entry.Name, route.TransportType)
@@ -236,8 +255,8 @@ func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (app
 		return app.Settings{}, fmt.Errorf("provisioner: unsupported route transport %q", route.TransportType)
 	}
 	settings, err := descriptor.BuildServerConfig(app.RouteParams{
-		RouteID:    route.ID,
-		RouteName:  route.Name,
+		RouteID:    namespace.ID,
+		RouteName:  namespace.Name,
 		ExitNodeID: strconv.FormatInt(node.ID, 10),
 		Domain:     tr.Domain,
 		Secrets:    entry.GeneratedSecrets,
@@ -249,6 +268,60 @@ func exitRouteSettings(node, entry panelstore.Node, route panelstore.Route) (app
 		settings.Name = route.Name
 	}
 	return settings, nil
+}
+
+type multiSubflow struct {
+	Type      string          `json:"type"`
+	Transport json.RawMessage `json:"transport,omitempty"`
+}
+
+type multiSettingsPayload struct {
+	Strategy   string         `json:"strategy"`
+	Transports []multiSubflow `json:"transports"`
+}
+
+func multiExitSettings(
+	node, entry panelstore.Node,
+	route panelstore.Route,
+	routesByID map[int64]panelstore.Route,
+) (app.Settings, error) {
+	if route.MultiStrategy != panelstore.MultiStrategyBond &&
+		route.MultiStrategy != panelstore.MultiStrategyFlowMux {
+		return app.Settings{}, fmt.Errorf("provisioner: route %d: unsupported multi strategy %q",
+			route.ID, route.MultiStrategy)
+	}
+	payload := multiSettingsPayload{Strategy: route.MultiStrategy}
+	for _, id := range route.SubRouteIDs {
+		child, ok := routesByID[id]
+		if !ok {
+			return app.Settings{}, fmt.Errorf("provisioner: multi route %d: sub-route %d not found", route.ID, id)
+		}
+		if child.TransportType == panelstore.TransportMulti {
+			return app.Settings{}, fmt.Errorf("provisioner: multi route %d: nested multi route %d", route.ID, id)
+		}
+		childSettings, err := singleExitSettings(node, entry, child, route)
+		if err != nil {
+			return app.Settings{}, err
+		}
+		payload.Transports = append(payload.Transports, multiSubflow{
+			Type:      childSettings.Type,
+			Transport: childSettings.Transport,
+		})
+	}
+	if len(payload.Transports) == 0 {
+		return app.Settings{}, fmt.Errorf("provisioner: multi route %d has no subflows", route.ID)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return app.Settings{}, err
+	}
+	return app.Settings{
+		Name:               route.Name,
+		Type:               panelstore.TransportMulti,
+		ExitNodeID:         strconv.FormatInt(node.ID, 10),
+		EncryptionPassword: entry.GeneratedSecrets["encryption_password"],
+		Transport:          raw,
+	}, nil
 }
 
 func renderTemplates(pattern string, data any) ([]File, error) {

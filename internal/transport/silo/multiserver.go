@@ -3,6 +3,7 @@ package silo
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,12 +12,32 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type multiSession struct {
 	userID string
 	cancel context.CancelFunc
+
+	mu  sync.Mutex
+	mux multiplexing.StreamMultiplexer
 }
+
+func (s *multiSession) setMux(m multiplexing.StreamMultiplexer) {
+	s.mu.Lock()
+	s.mux = m
+	s.mu.Unlock()
+}
+
+func (s *multiSession) currentMux() multiplexing.StreamMultiplexer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mux
+}
+
+const sessionRetryDelayDefault = time.Second
+
+var sessionRetryDelay = sessionRetryDelayDefault
 
 type MultiServer struct {
 	cfg      Config
@@ -26,10 +47,13 @@ type MultiServer struct {
 	password string
 	muxCfg   tunnel.Config
 
+	exitNodeID string
+
 	syncMu sync.Mutex
 
 	mu          sync.Mutex
 	handler     app.SessionHandler
+	transportIn app.SessionTransportSink
 	sessions    map[string]*multiSession
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -65,6 +89,24 @@ func (m *MultiServer) SetSessionHandler(handler app.SessionHandler) {
 	m.mu.Lock()
 	m.handler = handler
 	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetTransportSink(sink app.SessionTransportSink) {
+	m.mu.Lock()
+	m.transportIn = sink
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetExitNodeID(id string) {
+	m.mu.Lock()
+	m.exitNodeID = strings.TrimSpace(id)
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) transportSink() app.SessionTransportSink {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.transportIn
 }
 
 func (m *MultiServer) Start(ctx context.Context) error {
@@ -182,12 +224,11 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 		cancel()
 		return
 	}
-	handler := m.handler
 	m.sessions[userID] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
 
-	m.logger.Info("silo: starting user session ", userID, " (prefix=", UserPrefix(userID), ")")
+	m.logger.Info("silo: starting user session ", userID, " (prefix=", UserPrefix(m.cfg.TunnelID, userID), ")")
 
 	go func() {
 		defer m.wg.Done()
@@ -200,57 +241,174 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 			cancel()
 		}()
 
-		if sessionCtx.Err() != nil {
-			return
-		}
-
-		cfg := m.cfg
-		cfg.UserID = userID
-		cfg.Multiuser = false
-		if cfg.TunnelID == "" {
-			cfg.TunnelID = "default"
-		}
-
-		pipe, err := newPipeWithStore(&cfg, "server", m.logger, m.store)
-		if err != nil {
-			m.logger.Warn("silo: user ", userID, " pipe: ", err)
-			return
-		}
-		secured, err := wrapEncryption(pipe, m.password, "server", m.logger)
-		if err != nil {
-			m.logger.Warn("silo: user ", userID, " encryption: ", err)
-			return
-		}
-
-		tr := newTransport(secured)
-		muxCfg := m.muxCfg
-		muxCfg.UserID = ""
-		muxCfg.ExitNodeID = ""
-		muxCfg.Registry = m.registry
-		mux := tunnel.New(tr, m.logger, muxCfg)
-
-		if handler == nil {
-			handler = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
-				<-ctx.Done()
-				return ctx.Err()
+		waitRetry := func() bool {
+			select {
+			case <-sessionCtx.Done():
+				return false
+			case <-time.After(sessionRetryDelay):
+				return true
 			}
 		}
 
-		if err := mux.Start(sessionCtx); err != nil {
-			if sessionCtx.Err() == nil {
-				m.logger.Warn("silo: user ", userID, " mux start: ", err)
+		for {
+			if sessionCtx.Err() != nil {
+				return
 			}
-			return
+
+			m.mu.Lock()
+			handler := m.handler
+			exitNodeID := m.exitNodeID
+			m.mu.Unlock()
+
+			cfg := m.cfg
+			cfg.UserID = userID
+			cfg.Multiuser = false
+			if cfg.TunnelID == "" {
+				cfg.TunnelID = "default"
+			}
+
+			pipe, err := newPipeWithStore(&cfg, "server", m.logger, m.store)
+			if err != nil {
+				m.logger.Warn("silo: user ", userID, " pipe: ", err)
+				if !waitRetry() {
+					return
+				}
+				continue
+			}
+			secured, err := wrapEncryption(pipe, m.password, "server", m.logger)
+			if err != nil {
+				m.logger.Warn("silo: user ", userID, " encryption: ", err)
+				if !waitRetry() {
+					return
+				}
+				continue
+			}
+
+			tr := newTransport(secured)
+			if sink := m.transportSink(); sink != nil {
+				release, aggregated := sink(userID, tr)
+				if release == nil {
+
+					m.logger.Debug("silo: user ", userID, " tube was not accepted by the aggregator")
+					if !waitRetry() {
+						return
+					}
+					continue
+				}
+				select {
+				case <-sessionCtx.Done():
+				case <-aggregated:
+				}
+				release()
+				if sessionCtx.Err() != nil {
+					return
+				}
+				if !waitRetry() {
+					return
+				}
+				continue
+			}
+
+			muxCfg := m.muxCfg
+
+			muxCfg.UserID = userID
+			muxCfg.ExitNodeID = exitNodeID
+			muxCfg.Registry = m.registry
+
+			muxCfg.OnRemoteEpochChange = func(uint32, uint32) {
+				pipe.ResetReadHead()
+				go func() {
+					purgeCtx, purgeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer purgeCancel()
+					pipe.PurgeWritePrefix(purgeCtx)
+				}()
+			}
+			mux := tunnel.New(tr, m.logger, muxCfg)
+
+			if handler == nil {
+				handler = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+			}
+
+			if err := mux.Start(sessionCtx); err != nil {
+				if sessionCtx.Err() == nil {
+					m.logger.Warn("silo: user ", userID, " mux start: ", err)
+				}
+				if !waitRetry() {
+					return
+				}
+				continue
+			}
+			session.setMux(mux)
+			if err := handler(sessionCtx, mux); err != nil && sessionCtx.Err() == nil {
+				m.logger.Warn("silo: user ", userID, " session: ", err)
+			}
+			session.setMux(nil)
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := mux.Stop(stopCtx); err != nil {
+				m.logger.Debug("silo: user ", userID, " mux stop: ", err)
+			}
+			stopCancel()
+			if !waitRetry() {
+				return
+			}
 		}
-		if err := handler(sessionCtx, mux); err != nil && sessionCtx.Err() == nil {
-			m.logger.Warn("silo: user ", userID, " session: ", err)
-		}
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := mux.Stop(stopCtx); err != nil {
-			m.logger.Debug("silo: user ", userID, " mux stop: ", err)
-		}
-		stopCancel()
 	}()
+}
+
+func (m *MultiServer) WalkLayers() []transport.Layer {
+	m.mu.Lock()
+	sessions := make([]*multiSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		sessions = append(sessions, session)
+	}
+	m.mu.Unlock()
+
+	var appSent, appRecv, wireSent, wireRecv int64
+	pipes := make([]transport.Layer, 0, len(sessions))
+	for _, session := range sessions {
+		mux := session.currentMux()
+		tel, ok := mux.(transport.Telemetry)
+		if !ok {
+			continue
+		}
+		for _, layer := range tel.WalkLayers() {
+			switch layer.Kind {
+			case "mux":
+				appSent += layer.Snapshot.UsefulSent
+				appRecv += layer.Snapshot.UsefulRecv
+				wireSent += layer.Snapshot.NetworkSent
+				wireRecv += layer.Snapshot.NetworkRecv
+			case "pipe":
+				if layer.Name == "" {
+					layer.Name = session.userID
+				}
+				pipes = append(pipes, layer)
+			}
+		}
+	}
+
+	out := make([]transport.Layer, 0, len(pipes)+1)
+	out = append(out, transport.Layer{
+		Kind: "mux", Type: "silo",
+		Snapshot: transport.Snapshot{
+			UsefulSent:  appSent,
+			UsefulRecv:  appRecv,
+			NetworkSent: wireSent,
+			NetworkRecv: wireRecv,
+			Timestamp:   time.Now(),
+		},
+	})
+	out = append(out, pipes...)
+	return out
+}
+
+func (m *MultiServer) sessionCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
 }
 
 func buildUserRegistry(specs []auth.UserSpec) (*auth.UserRegistry, error) {
@@ -262,3 +420,7 @@ func buildUserRegistry(specs []auth.UserSpec) (*auth.UserRegistry, error) {
 	}
 	return registry, nil
 }
+
+var _ app.SessionServer = (*MultiServer)(nil)
+var _ app.AggregableSession = (*MultiServer)(nil)
+var _ transport.Telemetry = (*MultiServer)(nil)

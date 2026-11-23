@@ -147,6 +147,7 @@ func build(
 			Registry:       registry,
 		}
 		srv := lk.NewMultiServer(cfg, logger, registry, muxCfg, s.EncryptionPassword)
+		srv.SetExitNodeID(s.ExitNodeID)
 		logger.Info("livekit_datachannel: multiuser server ready (signal_url=", cfg.SignalURL,
 			" room_prefix=", cfg.RoomPrefix, " users=", len(cfg.Users), ")")
 		return &app.BuildResult{

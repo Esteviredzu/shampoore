@@ -40,6 +40,13 @@ func (t *siloTransport) MaxMessageSize() int   { return t.pipe.MaxMessageSize() 
 func (t *siloTransport) BytesDelivered() int64 { return t.bytesDelivered.Load() }
 func (t *siloTransport) BytesAcked() int64     { return t.bytesAcked.Load() }
 
+func (t *siloTransport) Authenticated() bool {
+	if a, ok := t.pipe.(interface{ Authenticated() bool }); ok {
+		return a.Authenticated()
+	}
+	return false
+}
+
 func (t *siloTransport) WalkLayers() []transport.Layer {
 	if tw, ok := t.pipe.(transport.Telemetry); ok {
 		return tw.WalkLayers()

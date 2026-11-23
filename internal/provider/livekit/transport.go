@@ -62,6 +62,13 @@ func (t *pipeTransport) MaxMessageSize() int   { return t.pipe.MaxMessageSize() 
 func (t *pipeTransport) BytesDelivered() int64 { return t.bytesDelivered.Load() }
 func (t *pipeTransport) BytesAcked() int64     { return t.bytesSent.Load() }
 
+func (t *pipeTransport) Authenticated() bool {
+	if a, ok := t.pipe.(interface{ Authenticated() bool }); ok {
+		return a.Authenticated()
+	}
+	return false
+}
+
 func (t *pipeTransport) WalkLayers() []transport.Layer {
 	if tw, ok := t.pipe.(transport.Telemetry); ok {
 		return tw.WalkLayers()

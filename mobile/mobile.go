@@ -313,6 +313,14 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 		return nil, err
 	}
 
+	fatalCh := make(chan error, 1)
+	reportFatal := func(err error) {
+		select {
+		case fatalCh <- err:
+		default:
+		}
+	}
+
 	var mux multiplexing.StreamMultiplexer
 	if rt.StreamMux != nil {
 		mux = rt.StreamMux
@@ -323,6 +331,9 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 			FlushInterval:  time.Duration(rt.MuxConfig.FlushMs) * time.Millisecond,
 			UserID:         rt.MuxConfig.UserID,
 			ExitNodeID:     rt.MuxConfig.ExitNodeID,
+			OnSessionError: func(err error) {
+				reportFatal(fmt.Errorf("mobile: tunnel session failed: %w", err))
+			},
 		}
 		mux = tunnel.New(rt.Transport, lg, muxCfg)
 	}
@@ -338,7 +349,6 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 		return nil, err
 	}
 
-	fatalCh := make(chan error, 1)
 	var tunDone <-chan error
 	var detachMux multiplexing.StreamMultiplexer
 	var newHealthCtl *healthController

@@ -17,17 +17,23 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/auth"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 type fakeStore struct {
-	mu      sync.Mutex
-	bucket  string
-	objects map[string][]byte
-	history []string
+	mu       sync.Mutex
+	bucket   string
+	objects  map[string][]byte
+	modified map[string]time.Time
+	history  []string
 }
 
 func newFakeStore(bucket string) *fakeStore {
-	return &fakeStore{bucket: bucket, objects: make(map[string][]byte)}
+	return &fakeStore{
+		bucket:   bucket,
+		objects:  make(map[string][]byte),
+		modified: make(map[string]time.Time),
+	}
 }
 
 func (s *fakeStore) BucketExists(_ context.Context, bucket string) (bool, error) {
@@ -51,6 +57,7 @@ func (s *fakeStore) PutObject(_ context.Context, bucket, object string, reader i
 	}
 	s.mu.Lock()
 	s.objects[object] = append([]byte(nil), data...)
+	s.modified[object] = time.Now()
 	s.history = append(s.history, object)
 	s.mu.Unlock()
 	return minio.UploadInfo{Key: object, Size: int64(len(data))}, nil
@@ -75,8 +82,33 @@ func (s *fakeStore) RemoveObject(_ context.Context, bucket, object string, _ min
 	}
 	s.mu.Lock()
 	delete(s.objects, object)
+	delete(s.modified, object)
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *fakeStore) putObject(key string, data []byte, modified time.Time) {
+	s.mu.Lock()
+	s.objects[key] = append([]byte(nil), data...)
+	s.modified[key] = modified
+	s.mu.Unlock()
+}
+
+func (s *fakeStore) hasObject(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.objects[key]
+	return ok
+}
+
+func (s *fakeStore) object(key string) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), data...), true
 }
 
 func (s *fakeStore) ListObjects(_ context.Context, bucket string, opts minio.ListObjectsOptions) <-chan minio.ObjectInfo {
@@ -96,10 +128,18 @@ func (s *fakeStore) ListObjects(_ context.Context, bucket string, opts minio.Lis
 		}
 		keys = append(keys, key)
 	}
-	s.mu.Unlock()
 	sort.Strings(keys)
+	infos := make([]minio.ObjectInfo, 0, len(keys))
 	for _, key := range keys {
-		ch <- minio.ObjectInfo{Key: key}
+		infos = append(infos, minio.ObjectInfo{
+			Key:          key,
+			Size:         int64(len(s.objects[key])),
+			LastModified: s.modified[key],
+		})
+	}
+	s.mu.Unlock()
+	for _, info := range infos {
+		ch <- info
 	}
 	close(ch)
 	return ch
@@ -167,25 +207,48 @@ func receiveWithTimeout(t *testing.T, pipe *Pipe, timeout time.Duration) []byte 
 func TestBuildPrefixes(t *testing.T) {
 	cases := []struct {
 		name      string
+		tunnelID  string
 		userID    string
 		role      string
 		wantWrite string
 		wantRead  string
 	}{
-		{name: "legacy client", role: "client", wantWrite: "default/c2s/", wantRead: "default/s2c/"},
-		{name: "legacy server", role: "server", wantWrite: "default/s2c/", wantRead: "default/c2s/"},
-		{name: "user client", userID: "alice", role: "client", wantWrite: "users/alice/c2s/", wantRead: "users/alice/s2c/"},
-		{name: "user server", userID: "alice", role: "server", wantWrite: "users/alice/s2c/", wantRead: "users/alice/c2s/"},
+		{name: "legacy client", tunnelID: "default", role: "client", wantWrite: "default/c2s/", wantRead: "default/s2c/"},
+		{name: "legacy server", tunnelID: "default", role: "server", wantWrite: "default/s2c/", wantRead: "default/c2s/"},
+		{name: "empty namespace", role: "client", wantWrite: "default/c2s/", wantRead: "default/s2c/"},
+		{name: "user client", tunnelID: "default", userID: "alice", role: "client", wantWrite: "default/users/alice/c2s/", wantRead: "default/users/alice/s2c/"},
+		{name: "user server", tunnelID: "default", userID: "alice", role: "server", wantWrite: "default/users/alice/s2c/", wantRead: "default/users/alice/c2s/"},
+		{name: "route client", tunnelID: "route-11", userID: "alice", role: "client", wantWrite: "route-11/users/alice/c2s/", wantRead: "route-11/users/alice/s2c/"},
+		{name: "route server", tunnelID: "route-11", userID: "alice", role: "server", wantWrite: "route-11/users/alice/s2c/", wantRead: "route-11/users/alice/c2s/"},
+		{name: "route without user", tunnelID: "route-11", role: "client", wantWrite: "route-11/c2s/", wantRead: "route-11/s2c/"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := DefaultConfig()
+			cfg.TunnelID = tc.tunnelID
 			cfg.UserID = tc.userID
 			write, read := buildPrefixes(&cfg, tc.role)
 			if write != tc.wantWrite || read != tc.wantRead {
 				t.Fatalf("prefixes = %q/%q, want %q/%q", write, read, tc.wantWrite, tc.wantRead)
 			}
 		})
+	}
+}
+
+func TestRouteNamespacesNeverShareC2SPrefix(t *testing.T) {
+	single := C2SPrefix("route-11", "alice")
+	multi := C2SPrefix("route-22", "alice")
+	if single != "route-11/users/alice/c2s/" {
+		t.Fatalf("single prefix = %q", single)
+	}
+	if multi != "route-22/users/alice/c2s/" {
+		t.Fatalf("multi prefix = %q", multi)
+	}
+	if single == multi || strings.HasPrefix(single, multi) || strings.HasPrefix(multi, single) {
+		t.Fatalf("route prefixes overlap: %q vs %q", single, multi)
+	}
+	if got := C2SPrefix("", "alice"); got != "default/users/alice/c2s/" {
+		t.Fatalf("default prefix = %q", got)
 	}
 }
 
@@ -201,6 +264,12 @@ func TestSanitizeUserID(t *testing.T) {
 	}
 	if user, ok := ParseUserFromKey("users/alice/c2s/msg_1"); !ok || user != "alice" {
 		t.Fatalf("unexpected parsed user: %q %v", user, ok)
+	}
+	if user, ok := ParseUserFromKey("route-11/users/alice/c2s/msg_1"); !ok || user != "alice" {
+		t.Fatalf("unexpected parsed namespaced user: %q %v", user, ok)
+	}
+	if _, ok := ParseUserFromKey("route-11/c2s/msg_1"); ok {
+		t.Fatal("key without a users/ scope was parsed as a user")
 	}
 }
 
@@ -236,9 +305,9 @@ func TestTwoUsersShareOneBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitUntil(t, 2*time.Second, "alice upload", func() bool { return store.hasPrefix("users/alice/c2s/") })
-	waitUntil(t, 2*time.Second, "bob upload", func() bool { return store.hasPrefix("users/bob/c2s/") })
-	if store.recorded("users/alice/s2c/") || store.recorded("users/bob/s2c/") {
+	waitUntil(t, 2*time.Second, "alice upload", func() bool { return store.hasPrefix("default/users/alice/c2s/") })
+	waitUntil(t, 2*time.Second, "bob upload", func() bool { return store.hasPrefix("default/users/bob/c2s/") })
+	if store.recorded("default/users/alice/s2c/") || store.recorded("default/users/bob/s2c/") {
 		t.Fatal("client wrote into an s2c prefix")
 	}
 
@@ -277,8 +346,8 @@ func TestTwoUsersShareOneBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitUntil(t, 2*time.Second, "alice reply upload", func() bool { return store.recorded("users/alice/s2c/") })
-	waitUntil(t, 2*time.Second, "bob reply upload", func() bool { return store.recorded("users/bob/s2c/") })
+	waitUntil(t, 2*time.Second, "alice reply upload", func() bool { return store.recorded("default/users/alice/s2c/") })
+	waitUntil(t, 2*time.Second, "bob reply upload", func() bool { return store.recorded("default/users/bob/s2c/") })
 
 	if got := receiveWithTimeout(t, clientAlice, 2*time.Second); string(got) != "reply-alice" {
 		t.Fatalf("alice client received %q", got)
@@ -333,6 +402,59 @@ func TestMultiServerStartsAndStopsPerUser(t *testing.T) {
 		_, alice := server.sessions["alice"]
 		_, bob := server.sessions["bob"]
 		return !alice && bob
+	})
+}
+
+func TestMultiServerRetriesTubeRejectedByAggregator(t *testing.T) {
+	prev := sessionRetryDelay
+	sessionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { sessionRetryDelay = prev })
+
+	store := newFakeStore("shared-bucket")
+	cfg := testSiloConfig("shared-bucket", "")
+	cfg.Multiuser = true
+
+	registry := auth.NewRegistry()
+	if err := registry.Upsert(auth.UserSpec{UserID: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := newMultiServer(cfg, testLogger{}, registry, "", store, app.Values{
+		"mux_flush_ms":        5,
+		"mux_flush_threshold": 12000,
+	})
+
+	var mu sync.Mutex
+	calls := 0
+	server.SetTransportSink(func(_ string, _ transport.Transport) (func(), <-chan struct{}) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+
+			return nil, nil
+		}
+		done := make(chan struct{})
+		close(done)
+		return func() {}, done
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = server.Stop(stopCtx)
+	}()
+
+	waitUntil(t, 2*time.Second, "aggregator retry", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls >= 2
 	})
 }
 
@@ -415,10 +537,10 @@ func TestTwoUsersConcurrentIsolation(t *testing.T) {
 	}
 
 	for _, id := range []string{"alice", "bob"} {
-		if !store.recorded("users/" + id + "/c2s/") {
+		if !store.recorded("default/users/" + id + "/c2s/") {
 			t.Fatalf("no c2s objects for %s", id)
 		}
-		if !store.recorded("users/" + id + "/s2c/") {
+		if !store.recorded("default/users/" + id + "/s2c/") {
 			t.Fatalf("no s2c objects for %s", id)
 		}
 	}

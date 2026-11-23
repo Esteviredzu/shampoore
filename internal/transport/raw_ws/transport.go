@@ -25,12 +25,12 @@ import (
 )
 
 const (
-	maxWSPayload   = 4 * 1024 * 1024
-	maxFrameSize   = 16384
-	writeTimeout   = 10 * time.Second
-	pingInterval   = 30 * time.Second
-	pingDeadline   = 5 * time.Second
-	readIdleTimout = 90 * time.Second
+	maxWSPayload  = 4 * 1024 * 1024
+	maxFrameSize  = 16384
+	writeTimeout  = 10 * time.Second
+	pingInterval  = 5 * time.Second
+	pingDeadline  = 5 * time.Second
+	readIdleLimit = 15 * time.Second
 
 	frameHeaderSize = 12
 	frameVersion    = byte(1)
@@ -45,8 +45,12 @@ const (
 
 	enqueueTimeout = 50 * time.Millisecond
 	sendQueueCap   = 4096
+	sendAckTimeout = 15 * time.Second
 
 	defaultReconnectDelay = 2 * time.Second
+	reconnectMaxDelay     = 30 * time.Second
+	stableSessionLifetime = 15 * time.Second
+	rotateIdleWindow      = 2 * time.Second
 
 	defaultWarmupMinDelay  = 60 * time.Millisecond
 	defaultWarmupMaxDelay  = 250 * time.Millisecond
@@ -54,8 +58,6 @@ const (
 	defaultWarmupBodyLimit = 64 << 10
 	defaultRotationMin     = 15 * time.Minute
 	defaultRotationMax     = 35 * time.Minute
-	defaultRotateGraceMin  = 2 * time.Second
-	defaultRotateGraceMax  = 3 * time.Second
 	defaultDialTimeout     = 10 * time.Second
 
 	chromeAcceptLanguage = "en-US,en;q=0.9"
@@ -68,6 +70,26 @@ var frameMagic = [4]byte{'S', 'W', 'F', 'T'}
 
 const frameFlagBatched byte = 1
 
+var (
+	errSessionClosed = errors.New("raw_ws: session closed")
+	errSendQueueFull = errors.New("raw_ws: send queue full")
+)
+
+type outboundMsg struct {
+	data []byte
+	done chan error
+}
+
+func reportDone(msg outboundMsg, err error) {
+	if msg.done == nil {
+		return
+	}
+	select {
+	case msg.done <- err:
+	default:
+	}
+}
+
 type recvItem struct {
 	data []byte
 	err  error
@@ -79,7 +101,8 @@ type wsTransport struct {
 
 	connMu    sync.Mutex
 	conn      *websocket.Conn
-	sendQueue chan []byte
+	active    *wsSession
+	sendQueue chan outboundMsg
 
 	flushMu sync.Mutex
 
@@ -98,8 +121,15 @@ type wsTransport struct {
 	warmupMaxDelay time.Duration
 	rotationMin    time.Duration
 	rotationMax    time.Duration
-	graceMin       time.Duration
-	graceMax       time.Duration
+	rotateIdle     time.Duration
+
+	pingInterval    time.Duration
+	pingDeadline    time.Duration
+	readIdleTimeout time.Duration
+
+	lastMuxActivity atomic.Int64
+
+	pendingSends atomic.Int32
 
 	stateMu sync.Mutex
 	ctx     context.Context
@@ -107,7 +137,7 @@ type wsTransport struct {
 	started bool
 	wg      sync.WaitGroup
 
-	stopOnce sync.Once
+	warmupDone atomic.Bool
 
 	bytesSent      atomic.Int64
 	bytesDelivered atomic.Int64
@@ -117,16 +147,67 @@ type wsTransport struct {
 
 type wsSession struct {
 	conn   *websocket.Conn
-	queue  chan []byte
+	queue  chan outboundMsg
 	ctx    context.Context
 	cancel context.CancelFunc
 	errCh  chan error
+
+	sendMu   sync.Mutex
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (s *wsSession) markDone() {
+	if s == nil {
+		return
+	}
+	s.doneOnce.Do(func() {
+		close(s.done)
+	})
+}
+
+func (s *wsSession) isDone() bool {
+	if s == nil || s.done == nil {
+		return true
+	}
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *wsSession) enqueue(msg outboundMsg, timeout time.Duration) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.isDone() {
+		return errSessionClosed
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.queue <- msg:
+		return nil
+	case <-s.done:
+		return errSessionClosed
+	case <-timer.C:
+		return errSendQueueFull
+	}
+}
+
+func (s *wsSession) queueLen() int {
+	if s == nil || s.queue == nil {
+		return 0
+	}
+	return len(s.queue)
 }
 
 func (s *wsSession) close() {
 	if s == nil {
 		return
 	}
+	s.markDone()
 	s.cancel()
 	_ = s.conn.Close()
 }
@@ -135,23 +216,26 @@ func newTransport(cfg Config, logger logging.ContextLogger) *wsTransport {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &wsTransport{
-		cfg:            cfg,
-		logger:         logger,
-		recvCh:         make(chan recvItem, 256),
-		batchEnabled:   cfg.Batch,
-		paddingEnabled: cfg.Padding,
-		reconnectDelay: defaultReconnectDelay,
-		profile:        utlsdial.DefaultProfile,
-		warmupPaths:    append([]string(nil), warmupAssetPaths...),
-		warmupMinDelay: defaultWarmupMinDelay,
-		warmupMaxDelay: defaultWarmupMaxDelay,
-		rotationMin:    defaultRotationMin,
-		rotationMax:    defaultRotationMax,
-		graceMin:       defaultRotateGraceMin,
-		graceMax:       defaultRotateGraceMax,
-		ctx:            ctx,
-		cancel:         cancel,
+		cfg:             cfg,
+		logger:          logger,
+		recvCh:          make(chan recvItem, 256),
+		batchEnabled:    cfg.Batch,
+		paddingEnabled:  cfg.Padding,
+		reconnectDelay:  defaultReconnectDelay,
+		profile:         utlsdial.DefaultProfile,
+		warmupPaths:     append([]string(nil), warmupAssetPaths...),
+		warmupMinDelay:  defaultWarmupMinDelay,
+		warmupMaxDelay:  defaultWarmupMaxDelay,
+		rotationMin:     defaultRotationMin,
+		rotationMax:     defaultRotationMax,
+		rotateIdle:      rotateIdleWindow,
+		pingInterval:    pingInterval,
+		pingDeadline:    pingDeadline,
+		readIdleTimeout: readIdleLimit,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
+	t.lastMuxActivity.Store(time.Now().UnixNano())
 	t.warmupClient = &http.Client{
 		Transport: utlsdial.NewHTTPTransport(t.profile),
 		Timeout:   defaultWarmupTimeout,
@@ -193,6 +277,11 @@ func (t *wsTransport) runLoop() {
 	defer t.wg.Done()
 
 	ctx := t.transportCtx()
+	base := t.reconnectDelay
+	if base <= 0 {
+		base = defaultReconnectDelay
+	}
+	delay := base
 	reconnect := false
 
 	for {
@@ -202,34 +291,59 @@ func (t *wsTransport) runLoop() {
 		default:
 		}
 
-		established, err := t.connectAndServe(ctx, reconnect)
+		established, lifetime, err := t.connectAndServe(ctx, reconnect)
 		if established {
 			reconnect = true
+			if lifetime >= stableSessionLifetime {
+				delay = base
+			}
 		}
 		if err != nil && ctx.Err() == nil {
-			delay := t.reconnectDelay
-			if delay <= 0 {
-				delay = defaultReconnectDelay
-			}
-			t.logger.Warn("raw_ws: connection lost, reconnecting in ", delay, ": ", err)
+			wait := nextBackoffDelay(delay)
+			t.logger.Warn("raw_ws: connection lost, reconnecting in ", wait, ": ", err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(delay):
+			case <-time.After(wait):
 			}
+			delay = nextReconnectDelay(delay, base)
 		}
 	}
 }
 
-func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (bool, error) {
+func nextReconnectDelay(current, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultReconnectDelay
+	}
+	if current < base {
+		current = base
+	}
+	next := current * 2
+	if next < current || next > reconnectMaxDelay {
+		next = reconnectMaxDelay
+	}
+	return next
+}
+
+func nextBackoffDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return defaultReconnectDelay
+	}
+
+	jitter := time.Duration(rand.Int64N(int64(delay/4) + 1))
+	return delay + jitter
+}
+
+func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (bool, time.Duration, error) {
 	if err := validateSecureServerURL(t.cfg.ServerURL, t.cfg.AllowInsecureWS); err != nil {
-		return false, err
+		return false, 0, err
 	}
 
 	sess, err := t.dialSession(parent)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
+	started := time.Now()
 
 	t.attachSession(sess)
 	if reconnect {
@@ -246,25 +360,36 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 	for {
 		select {
 		case <-parent.Done():
-			t.closeSession(cur, 0)
-			return true, nil
+			t.closeSession(cur)
+			return true, time.Since(started), nil
 		case err := <-cur.errCh:
-			t.closeSession(cur, 0)
-			return true, err
+			t.closeSession(cur)
+			return true, time.Since(started), err
 		case <-rotate.C:
+
+			if !t.idle() || cur.queueLen() > 0 {
+				rotate.Reset(t.nextRotationDelay())
+				continue
+			}
 			next, derr := t.dialSession(parent)
 			if derr != nil {
 				t.logger.Warn("raw_ws: rotate: ", derr)
 				rotate.Reset(t.nextRotationDelay())
 				continue
 			}
+			if !t.idle() || cur.queueLen() > 0 {
+				next.close()
+				rotate.Reset(t.nextRotationDelay())
+				continue
+			}
 
-			t.attachSession(next)
-			t.runSession(next)
 			old := cur
 			cur = next
+			t.attachSession(next)
+
+			t.closeSession(old)
+			t.runSession(next)
 			t.logger.Info("raw_ws: connection rotated")
-			go t.closeSession(old, t.nextGrace())
 			rotate.Reset(t.nextRotationDelay())
 		}
 	}
@@ -277,7 +402,9 @@ func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
 		return nil, err
 	}
 
-	t.warmup(parent, wsURL)
+	if !t.warmupDone.Swap(true) {
+		t.warmup(parent, wsURL)
+	}
 
 	dialer := t.newDialer()
 	dialer.Subprotocols = relay.AuthProtocols(room, t.cfg.Password, time.Now())
@@ -290,9 +417,10 @@ func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
 	}
 
 	conn.SetReadLimit(maxWSPayload)
-	_ = conn.SetReadDeadline(time.Now().Add(readIdleTimout))
+	idle := t.pingWait()
+	_ = conn.SetReadDeadline(time.Now().Add(idle))
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(readIdleTimout))
+		return conn.SetReadDeadline(time.Now().Add(idle))
 	})
 
 	sessCtx, cancel := context.WithCancel(parent)
@@ -301,11 +429,33 @@ func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
 		ctx:    sessCtx,
 		cancel: cancel,
 		errCh:  make(chan error, 4),
+		done:   make(chan struct{}),
 	}
 	if t.batchEnabled {
-		sess.queue = make(chan []byte, sendQueueCap)
+		sess.queue = make(chan outboundMsg, sendQueueCap)
 	}
 	return sess, nil
+}
+
+func (t *wsTransport) pingWait() time.Duration {
+	if t.readIdleTimeout > 0 {
+		return t.readIdleTimeout
+	}
+	return readIdleLimit
+}
+
+func (t *wsTransport) pingEvery() time.Duration {
+	if t.pingInterval > 0 {
+		return t.pingInterval
+	}
+	return pingInterval
+}
+
+func (t *wsTransport) pingTimeout() time.Duration {
+	if t.pingDeadline > 0 {
+		return t.pingDeadline
+	}
+	return pingDeadline
 }
 
 func (t *wsTransport) newDialer() *websocket.Dialer {
@@ -364,32 +514,66 @@ func (t *wsTransport) warmup(ctx context.Context, wsURL string) {
 }
 
 func (t *wsTransport) runSession(sess *wsSession) {
-	go t.readLoop(sess.ctx, sess.conn, sess.errCh)
+	go t.readLoop(sess.ctx, sess, sess.errCh)
 	go t.pingLoop(sess.ctx, sess.conn, sess.errCh)
 	if sess.queue != nil {
-		go t.sendLoop(sess.ctx, sess.conn, sess.queue, sess.errCh)
+		go t.sendLoop(sess.ctx, sess, sess.errCh)
 	}
 }
 
 func (t *wsTransport) attachSession(sess *wsSession) {
 	t.connMu.Lock()
 	t.conn = sess.conn
+	t.active = sess
 	t.sendQueue = sess.queue
 	t.connMu.Unlock()
+	t.noteActivity()
 }
 
-func (t *wsTransport) closeSession(sess *wsSession, grace time.Duration) {
+func (t *wsTransport) isActive(sess *wsSession) bool {
+	t.connMu.Lock()
+	active := t.active == sess
+	t.connMu.Unlock()
+	return active
+}
+
+func (t *wsTransport) noteActivity() {
+	t.lastMuxActivity.Store(time.Now().UnixNano())
+}
+
+func (t *wsTransport) idle() bool {
+	last := t.lastMuxActivity.Load()
+	if last == 0 {
+		return true
+	}
+	window := t.rotateIdle
+	if window <= 0 {
+		window = rotateIdleWindow
+	}
+	return time.Since(time.Unix(0, last)) >= window
+}
+
+func (t *wsTransport) closeSession(sess *wsSession) {
 	if sess == nil {
 		return
 	}
-	if grace > 0 {
+	sess.close()
+	t.failPending(sess, errSessionClosed)
+	t.detachConn(sess.conn)
+}
+
+func (t *wsTransport) failPending(sess *wsSession, reason error) {
+	if sess == nil || sess.queue == nil {
+		return
+	}
+	for {
 		select {
-		case <-sess.ctx.Done():
-		case <-time.After(grace):
+		case msg := <-sess.queue:
+			reportDone(msg, reason)
+		default:
+			return
 		}
 	}
-	sess.close()
-	t.detachConn(sess.conn)
 }
 
 func (t *wsTransport) nextWarmupPause() time.Duration {
@@ -398,10 +582,6 @@ func (t *wsTransport) nextWarmupPause() time.Duration {
 
 func (t *wsTransport) nextRotationDelay() time.Duration {
 	return randomBetween(t.rotationMin, t.rotationMax, defaultRotationMin, defaultRotationMax)
-}
-
-func (t *wsTransport) nextGrace() time.Duration {
-	return randomBetween(t.graceMin, t.graceMax, defaultRotateGraceMin, defaultRotateGraceMax)
 }
 
 func randomBetween(minD, maxD, defMin, defMax time.Duration) time.Duration {
@@ -447,6 +627,7 @@ func (t *wsTransport) detachConn(conn *websocket.Conn) {
 	t.connMu.Lock()
 	if t.conn == conn {
 		t.conn = nil
+		t.active = nil
 		t.sendQueue = nil
 	}
 	t.connMu.Unlock()
@@ -492,14 +673,18 @@ func (t *wsTransport) NotifyNetworkChanged() {
 }
 
 func (t *wsTransport) Stop(ctx context.Context) error {
-	t.stopOnce.Do(func() {
-		t.stateMu.Lock()
-		cancel := t.cancel
+	t.stateMu.Lock()
+	if !t.started {
 		t.stateMu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-	})
+		return nil
+	}
+	t.started = false
+	cancel := t.cancel
+	t.stateMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 	t.wg.Wait()
 	if t.warmupClient != nil {
 		t.warmupClient.CloseIdleConnections()
@@ -509,6 +694,7 @@ func (t *wsTransport) Stop(ctx context.Context) error {
 }
 
 func (t *wsTransport) Send(ctx context.Context, data []byte) error {
+	t.noteActivity()
 	if !t.batchEnabled {
 		if t.paddingEnabled {
 			frame := encodeFrame([][]byte{data}, false, true)
@@ -521,33 +707,41 @@ func (t *wsTransport) Send(ctx context.Context, data []byte) error {
 	copy(cp, data)
 
 	t.connMu.Lock()
-	queue := t.sendQueue
+	sess := t.active
 	t.connMu.Unlock()
-	if queue == nil {
-
+	if sess == nil || sess.queue == nil {
 		return fmt.Errorf("%w: raw_ws: no active connection", transport.ErrTransportReset)
 	}
 
-	timer := time.NewTimer(enqueueTimeout)
-	defer timer.Stop()
+	msg := outboundMsg{data: cp, done: make(chan error, 1)}
 
+	t.pendingSends.Add(1)
+	defer t.pendingSends.Add(-1)
+
+	if err := sess.enqueue(msg, enqueueTimeout); err != nil {
+		if errors.Is(err, errSendQueueFull) {
+			return err
+		}
+		return fmt.Errorf("%w: raw_ws: %v", transport.ErrTransportReset, err)
+	}
+
+	writeTimeout := time.NewTimer(sendAckTimeout)
+	defer writeTimeout.Stop()
 	select {
-	case queue <- cp:
-	case <-timer.C:
-		return errors.New("raw_ws: send queue full")
+	case err := <-msg.done:
+		if err != nil {
+			return fmt.Errorf("%w: raw_ws: %v", transport.ErrTransportReset, err)
+		}
+		return nil
+	case <-sess.done:
+		return fmt.Errorf("%w: raw_ws: connection lost while sending", transport.ErrTransportReset)
+	case <-writeTimeout.C:
+		return fmt.Errorf("%w: raw_ws: write ack timeout", transport.ErrTransportReset)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-t.transportCtx().Done():
 		return errors.New("raw_ws: transport stopped")
 	}
-
-	t.connMu.Lock()
-	live := t.sendQueue == queue
-	t.connMu.Unlock()
-	if !live {
-		return fmt.Errorf("%w: raw_ws: connection lost while enqueuing", transport.ErrTransportReset)
-	}
-	return nil
 }
 
 func reportErr(errCh chan<- error, err error) {
@@ -560,21 +754,40 @@ func reportErr(errCh chan<- error, err error) {
 	}
 }
 
-func (t *wsTransport) sendLoop(ctx context.Context, conn *websocket.Conn, queue <-chan []byte, errCh chan<- error) {
-	var batch [][]byte
+func (t *wsTransport) sendLoop(ctx context.Context, sess *wsSession, errCh chan<- error) {
+	conn := sess.conn
+	queue := sess.queue
+	var batch []outboundMsg
 	var batchBytes int
+
+	defer func() {
+		for _, msg := range batch {
+			reportDone(msg, errSessionClosed)
+		}
+		t.failPending(sess, errSessionClosed)
+	}()
 
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		frame := encodeFrame(batch, true, t.paddingEnabled)
-		if err := t.sendRawTo(conn, frame); err != nil {
+		payloads := make([][]byte, len(batch))
+		for i := range batch {
+			payloads[i] = batch[i].data
+		}
+		frame := encodeFrame(payloads, true, t.paddingEnabled)
+		err := t.sendRawTo(conn, frame)
 
+		for _, msg := range batch {
+			reportDone(msg, err)
+		}
+		if err != nil {
 			if t.logger != nil {
 				t.logger.Warn("raw_ws: flush batch failed (", len(batch), " msgs / ",
 					batchBytes, " bytes): ", err)
 			}
+			batch = nil
+			batchBytes = 0
 			return err
 		}
 		batch = nil
@@ -594,10 +807,11 @@ func (t *wsTransport) sendLoop(ctx context.Context, conn *websocket.Conn, queue 
 			return
 		case msg := <-queue:
 			batch = append(batch, msg)
-			batchBytes += len(msg)
-			if batchBytes >= maxBatchPayload {
+			batchBytes += len(msg.data)
+
+			if batchBytes >= maxBatchPayload || t.pendingSends.Load() > 0 {
 				if err := flush(); err != nil {
-					reportErr(errCh, err)
+					reportErr(errCh, fmt.Errorf("%w: raw_ws: flush: %v", transport.ErrTransportReset, err))
 					return
 				}
 				if !timer.Stop() {
@@ -610,7 +824,7 @@ func (t *wsTransport) sendLoop(ctx context.Context, conn *websocket.Conn, queue 
 			}
 		case <-timer.C:
 			if err := flush(); err != nil {
-				reportErr(errCh, err)
+				reportErr(errCh, fmt.Errorf("%w: raw_ws: flush: %v", transport.ErrTransportReset, err))
 				return
 			}
 			timer.Reset(t.nextFlushDelay())
@@ -668,6 +882,7 @@ func (t *wsTransport) Receive(ctx context.Context) ([]byte, error) {
 		if item.err != nil {
 			return nil, item.err
 		}
+		t.noteActivity()
 		return item.data, nil
 	}
 }
@@ -682,11 +897,17 @@ func (t *wsTransport) WalkLayers() []transport.Layer {
 	}}
 }
 
-func (t *wsTransport) readLoop(ctx context.Context, conn *websocket.Conn, errCh chan<- error) {
+func (t *wsTransport) readLoop(ctx context.Context, sess *wsSession, errCh chan<- error) {
+	conn := sess.conn
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			reportErr(errCh, err)
+
+			reportErr(errCh, fmt.Errorf("%w: raw_ws: read: %v", transport.ErrTransportReset, err))
+			return
+		}
+
+		if !t.isActive(sess) {
 			return
 		}
 		t.bytesDelivered.Add(int64(len(data)))
@@ -713,7 +934,7 @@ func (t *wsTransport) readLoop(ctx context.Context, conn *websocket.Conn, errCh 
 }
 
 func (t *wsTransport) pingLoop(ctx context.Context, conn *websocket.Conn, errCh chan<- error) {
-	ticker := time.NewTicker(pingInterval)
+	ticker := time.NewTicker(t.pingEvery())
 	defer ticker.Stop()
 
 	for {
@@ -721,8 +942,8 @@ func (t *wsTransport) pingLoop(ctx context.Context, conn *websocket.Conn, errCh 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(pingDeadline)); err != nil {
-				reportErr(errCh, err)
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(t.pingTimeout())); err != nil {
+				reportErr(errCh, fmt.Errorf("%w: raw_ws: ping: %v", transport.ErrTransportReset, err))
 				return
 			}
 		}

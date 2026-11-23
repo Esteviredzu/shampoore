@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -59,7 +60,7 @@ func (s *minioStore) ListObjects(ctx context.Context, bucket string, opts minio.
 
 func newMinioStore(cfg *Config) (objectStore, error) {
 
-	tr := utlsdial.NewHTTPTransport(utlsdial.ProfileChrome)
+	tr := utlsdial.NewHTTP1Transport(utlsdial.ProfileChrome)
 
 	cl, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
@@ -76,23 +77,103 @@ type Pipe struct {
 	cfg    *Config
 	logger logging.ContextLogger
 	store  objectStore
+	role   string
 
 	writePrefix string
 	readPrefix  string
 
+	mu      sync.Mutex
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started bool
 
-	sendCh chan []byte
+	sendCh chan uploadMsg
 	recvCh chan []byte
+
+	wake chan struct{}
 
 	lastKeyMu sync.Mutex
 	lastKey   string
 
+	deferMu       sync.Mutex
+	deferred      map[string]*deferredBatch
+	pendingDelete map[string]struct{}
+
 	ctr transport.Counters
 	wg  sync.WaitGroup
 }
+
+type listedObject struct {
+	key      string
+	size     int64
+	modified time.Time
+}
+
+type deferredBatch struct {
+	firstSeen time.Time
+	attempts  int
+}
+
+var (
+	incompleteBatchGrace    = 30 * time.Second
+	incompleteBatchMaxTries = 20
+)
+
+var (
+	errBatchIncomplete = errors.New("incomplete batch")
+	errBatchCorrupt    = errors.New("corrupt batch")
+)
+
+const maxBatchMessageSize = 64 << 20
+
+func parseBatch(data []byte, maxMessage int) ([][]byte, error) {
+	if len(data) == 0 {
+		return nil, errBatchIncomplete
+	}
+	messages := make([][]byte, 0, 8)
+	offset := 0
+	for offset < len(data) {
+		if offset+4 > len(data) {
+			return nil, errBatchIncomplete
+		}
+		msgLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		offset += 4
+		if msgLen <= 0 {
+			return nil, errBatchCorrupt
+		}
+		if maxMessage > 0 && msgLen > maxMessage {
+			return nil, errBatchCorrupt
+		}
+		if offset+msgLen > len(data) {
+			return nil, errBatchIncomplete
+		}
+		messages = append(messages, data[offset:offset+msgLen])
+		offset += msgLen
+	}
+	if len(messages) == 0 {
+		return nil, errBatchIncomplete
+	}
+	return messages, nil
+}
+
+type uploadMsg struct {
+	data []byte
+	done chan error
+}
+
+func resolveUpload(msg uploadMsg, err error) {
+	if msg.done == nil {
+		return
+	}
+	select {
+	case msg.done <- err:
+	default:
+	}
+}
+
+const stopFlushTimeout = 2 * time.Second
+
+const bucketTimeout = 15 * time.Second
 
 func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
 	store, err := newMinioStore(cfg)
@@ -125,44 +206,137 @@ func ensureBucket(ctx context.Context, store objectStore, bucket string) error {
 }
 
 func newPipeWithStore(cfg *Config, role string, logger logging.ContextLogger, store objectStore) (*Pipe, error) {
-	if err := ensureBucket(context.Background(), store, cfg.Bucket); err != nil {
-		return nil, fmt.Errorf("silo: ensure bucket %q: %w", cfg.Bucket, err)
-	}
-
 	writePrefix, readPrefix := buildPrefixes(cfg, role)
 	return &Pipe{
-		cfg:         cfg,
-		logger:      logger,
-		store:       store,
-		writePrefix: writePrefix,
-		readPrefix:  readPrefix,
-		sendCh:      make(chan []byte, 4096),
-		recvCh:      make(chan []byte, 4096),
+		cfg:           cfg,
+		logger:        logger,
+		store:         store,
+		role:          role,
+		writePrefix:   writePrefix,
+		readPrefix:    readPrefix,
+		sendCh:        make(chan uploadMsg, 4096),
+		recvCh:        make(chan []byte, 4096),
+		wake:          make(chan struct{}, 1),
+		deferred:      make(map[string]*deferredBatch),
+		pendingDelete: make(map[string]struct{}),
 	}, nil
 }
 
+var stoppedContext = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
+func (p *Pipe) pipeContext() context.Context {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ctx == nil {
+		return stoppedContext
+	}
+	return p.ctx
+}
+
 func (p *Pipe) Start(ctx context.Context) error {
+	p.mu.Lock()
 	if p.started {
+		p.mu.Unlock()
 		return nil
 	}
-	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.mu.Unlock()
+
+	bucketCtx, cancelBucket := context.WithTimeout(ctx, bucketTimeout)
+	if err := ensureBucket(bucketCtx, p.store, p.cfg.Bucket); err != nil {
+		cancelBucket()
+		return fmt.Errorf("silo: ensure bucket %q: %w", p.cfg.Bucket, err)
+	}
+	cancelBucket()
+
+	p.mu.Lock()
+	if p.started {
+		p.mu.Unlock()
+		return nil
+	}
+	pipeCtx, cancel := context.WithCancel(ctx)
+	p.ctx, p.cancel = pipeCtx, cancel
 	p.started = true
+	p.mu.Unlock()
+
+	if p.role == "server" {
+
+		purgeCtx, cancelPurge := context.WithTimeout(pipeCtx, 5*time.Second)
+		if err := p.purgeWritePrefix(purgeCtx); err != nil && pipeCtx.Err() == nil {
+			p.logger.Debug("silo: purge stale ", p.writePrefix, ": ", err)
+		}
+		cancelPurge()
+	}
 
 	p.wg.Add(2)
-	go p.receiveLoop()
-	go p.sendLoop()
+	go p.receiveLoop(pipeCtx)
+	go p.sendLoop(pipeCtx)
 
 	p.logger.Info("silo: pipe started (write=", p.writePrefix, ", read=", p.readPrefix, ")")
 	return nil
 }
 
+func (p *Pipe) ResetReadHead() {
+	p.lastKeyMu.Lock()
+	p.lastKey = ""
+	p.lastKeyMu.Unlock()
+
+	p.deferMu.Lock()
+	p.deferred = make(map[string]*deferredBatch)
+	p.deferMu.Unlock()
+
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Pipe) PurgeWritePrefix(ctx context.Context) {
+	if err := p.purgeWritePrefix(ctx); err != nil && ctx.Err() == nil {
+		p.logger.Debug("silo: purge ", p.writePrefix, ": ", err)
+	}
+}
+
+func (p *Pipe) purgeWritePrefix(ctx context.Context) error {
+	objectCh := p.store.ListObjects(ctx, p.cfg.Bucket, minio.ListObjectsOptions{
+		Prefix:    p.writePrefix,
+		Recursive: true,
+	})
+	var keys []string
+	for object := range objectCh {
+		if object.Err != nil {
+			if ctx.Err() == nil {
+				p.logger.Warn("silo: list objects under ", p.writePrefix, ": ", object.Err)
+			}
+			continue
+		}
+		keys = append(keys, object.Key)
+	}
+	for _, key := range keys {
+		if err := p.store.RemoveObject(ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
+			!isMissingObject(err) {
+			p.logger.Warn("silo: purge object ", key, ": ", err)
+		}
+	}
+	return nil
+}
+
 func (p *Pipe) Stop(ctx context.Context) error {
+	p.mu.Lock()
 	if !p.started {
+		p.mu.Unlock()
 		return nil
 	}
-	p.cancel()
-	p.wg.Wait()
 	p.started = false
+	cancel := p.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	p.wg.Wait()
 	return nil
 }
 
@@ -178,21 +352,36 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 	if len(data) == 0 {
 		return nil
 	}
+	pipeCtx := p.pipeContext()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
+	msg := uploadMsg{data: cp, done: make(chan error, 1)}
 	select {
-	case p.sendCh <- cp:
-		return nil
+	case p.sendCh <- msg:
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-pipeCtx.Done():
+		return transport.ErrPipeReset
+	}
+
+	select {
+	case err := <-msg.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-pipeCtx.Done():
+		return transport.ErrPipeReset
 	}
 }
 
 func (p *Pipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
+	pipeCtx := p.pipeContext()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-pipeCtx.Done():
+		return nil, transport.ErrPipeReset
 	case data, ok := <-p.recvCh:
 		if !ok {
 			return nil, io.EOF
@@ -205,7 +394,7 @@ func (p *Pipe) DeleteMessage(ctx context.Context, key string) error {
 	return p.store.RemoveObject(ctx, p.cfg.Bucket, p.writePrefix+key, minio.RemoveObjectOptions{})
 }
 
-func (p *Pipe) sendLoop() {
+func (p *Pipe) sendLoop(ctx context.Context) {
 	defer p.wg.Done()
 
 	minB := p.cfg.MinFileSizeKB * 1024
@@ -215,60 +404,97 @@ func (p *Pipe) sendLoop() {
 	targetSize := rand.Intn(maxB-minB+1) + minB
 
 	buffer := make([]byte, 0, targetSize)
+	var pending []uploadMsg
 	timer := time.NewTimer(flushDur)
 	defer timer.Stop()
 
-	flush := func() {
+	flush := func(sendCtx context.Context) {
 		if len(buffer) == 0 {
+			for _, msg := range pending {
+				resolveUpload(msg, nil)
+			}
+			pending = nil
 			return
 		}
-		p.upload(buffer)
+		err := p.upload(sendCtx, buffer)
+		for _, msg := range pending {
+			resolveUpload(msg, err)
+		}
+		pending = nil
 		buffer = buffer[:0]
 		targetSize = rand.Intn(maxB-minB+1) + minB
 	}
 
+	defer func() {
+		for _, msg := range pending {
+			resolveUpload(msg, transport.ErrPipeReset)
+		}
+	}()
+
 	for {
 		select {
-		case <-p.ctx.Done():
-			flush()
+		case <-ctx.Done():
+
+			flushCtx, cancel := context.WithTimeout(context.Background(), stopFlushTimeout)
+			flush(flushCtx)
+			cancel()
 			return
-		case data := <-p.sendCh:
+		case msg := <-p.sendCh:
+			emptyBuffer := len(buffer) == 0
 			var hdr [4]byte
-			binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(msg.data)))
 			buffer = append(buffer, hdr[:]...)
-			buffer = append(buffer, data...)
+			buffer = append(buffer, msg.data...)
+			pending = append(pending, msg)
+
+			if emptyBuffer {
+
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(flushDur)
+			}
 
 			if len(buffer) >= targetSize {
-				flush()
+				flush(ctx)
 				if !timer.Stop() {
-					<-timer.C
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
 				timer.Reset(flushDur)
 			}
 		case <-timer.C:
-			flush()
+			flush(ctx)
 			timer.Reset(flushDur)
 		}
 	}
 }
 
-func (p *Pipe) upload(buf []byte) {
+func (p *Pipe) upload(ctx context.Context, buf []byte) error {
 	objName := fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), rand.Int63())
 	fullKey := p.writePrefix + objName
 
-	_, err := p.store.PutObject(p.ctx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
+	_, err := p.store.PutObject(ctx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
 		ContentType: "application/octet-stream",
 	})
 	if err != nil {
 		p.logger.Warn("silo: put object failed: ", err)
-		return
+		return fmt.Errorf("silo: put object: %w", err)
 	}
 
 	p.ctr.NetworkSent.Add(int64(len(buf)))
 	p.ctr.MessagesSent.Add(1)
+	return nil
 }
 
 const maxPollBackoff = 500 * time.Millisecond
+
+var idleRescanInterval = 2 * time.Second
 
 func nextPollDelay(cur, base, max time.Duration) time.Duration {
 	if base <= 0 {
@@ -287,7 +513,7 @@ func nextPollDelay(cur, base, max time.Duration) time.Duration {
 	return cur
 }
 
-func (p *Pipe) receiveLoop() {
+func (p *Pipe) receiveLoop(ctx context.Context) {
 	defer p.wg.Done()
 
 	base := time.Duration(p.cfg.PollIntervalMs) * time.Millisecond
@@ -297,23 +523,50 @@ func (p *Pipe) receiveLoop() {
 	delay := base
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
+	lastProgress := time.Now()
+
+	poll := func() {
+		if p.idleHead(lastProgress) {
+			p.ResetReadHead()
+		}
+		if p.pollOnce(ctx) > 0 {
+			delay = base
+			lastProgress = time.Now()
+		} else {
+			delay = nextPollDelay(delay, base, maxPollBackoff)
+		}
+	}
 
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-timer.C:
-			if p.pollOnce() > 0 {
-				delay = base
-			} else {
-				delay = nextPollDelay(delay, base, maxPollBackoff)
+		case <-p.wake:
+			poll()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			timer.Reset(delay)
+		case <-timer.C:
+			poll()
 			timer.Reset(delay)
 		}
 	}
 }
 
-func (p *Pipe) pollOnce() int {
+func (p *Pipe) idleHead(lastProgress time.Time) bool {
+	p.lastKeyMu.Lock()
+	hasHead := p.lastKey != ""
+	p.lastKeyMu.Unlock()
+	return hasHead && time.Since(lastProgress) >= idleRescanInterval
+}
+
+func (p *Pipe) pollOnce(ctx context.Context) int {
+	p.retryPendingDeletes(ctx)
+
 	p.lastKeyMu.Lock()
 	startAfter := p.lastKey
 	p.lastKeyMu.Unlock()
@@ -326,32 +579,53 @@ func (p *Pipe) pollOnce() int {
 		opts.StartAfter = startAfter
 	}
 
-	var keys []string
-	objectCh := p.store.ListObjects(p.ctx, p.cfg.Bucket, opts)
+	var objects []listedObject
+	objectCh := p.store.ListObjects(ctx, p.cfg.Bucket, opts)
 
 	for object := range objectCh {
 		if object.Err != nil {
+			if ctx.Err() == nil {
+				p.logger.Warn("silo: list objects under ", p.readPrefix, ": ", object.Err)
+			}
 			continue
 		}
-		keys = append(keys, object.Key)
+		objects = append(objects, listedObject{
+			key:      object.Key,
+			size:     object.Size,
+			modified: object.LastModified,
+		})
 	}
 
-	if len(keys) == 0 {
+	if len(objects) == 0 {
 		return 0
 	}
 
-	sort.Strings(keys)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].key < objects[j].key })
+
+	keep := make(map[string]struct{}, len(objects))
+	for _, obj := range objects {
+		keep[obj.key] = struct{}{}
+	}
+	p.pruneDeferred(keep)
 
 	delivered := 0
-	for _, key := range keys {
+	for _, obj := range objects {
+		if startAfter != "" && obj.key <= startAfter {
 
-		if !p.processFile(key) {
+			continue
+		}
+		if p.isPendingDelete(obj.key) {
+
+			continue
+		}
+
+		if !p.processFile(ctx, obj) {
 			break
 		}
 
 		p.lastKeyMu.Lock()
-		if key > p.lastKey {
-			p.lastKey = key
+		if obj.key > p.lastKey {
+			p.lastKey = obj.key
 		}
 		p.lastKeyMu.Unlock()
 		delivered++
@@ -367,8 +641,111 @@ func isMissingObject(err error) bool {
 	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
 }
 
-func (p *Pipe) processFile(key string) bool {
-	objReader, err := p.store.GetObject(p.ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
+func (p *Pipe) noteDeferred(key string, modified time.Time) bool {
+	p.deferMu.Lock()
+	defer p.deferMu.Unlock()
+	if p.deferred == nil {
+		p.deferred = make(map[string]*deferredBatch)
+	}
+	state := p.deferred[key]
+	if state == nil {
+		state = &deferredBatch{firstSeen: time.Now()}
+		p.deferred[key] = state
+	}
+	state.attempts++
+	if state.attempts > incompleteBatchMaxTries {
+		return true
+	}
+	since := state.firstSeen
+	if !modified.IsZero() {
+		since = modified
+	}
+	return time.Since(since) > incompleteBatchGrace
+}
+
+func (p *Pipe) clearDeferred(key string) {
+	p.deferMu.Lock()
+	delete(p.deferred, key)
+	p.deferMu.Unlock()
+}
+
+func (p *Pipe) pruneDeferred(keep map[string]struct{}) {
+	p.deferMu.Lock()
+	for key := range p.deferred {
+		if _, ok := keep[key]; !ok {
+			delete(p.deferred, key)
+		}
+	}
+	p.deferMu.Unlock()
+}
+
+func (p *Pipe) deferOrDrop(obj listedObject, reason string) bool {
+	if p.noteDeferred(obj.key, obj.modified) {
+		p.logger.Warn("silo: dropping undeliverable object ", obj.key, " (", reason, ")")
+		return true
+	}
+	p.logger.Debug("silo: deferring object ", obj.key, " (", reason, ")")
+	return false
+}
+
+const maxPendingDeletes = 256
+
+func (p *Pipe) removeObject(ctx context.Context, key string) bool {
+	for attempt := 0; attempt < 2; attempt++ {
+		err := p.store.RemoveObject(ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{})
+		if err == nil || isMissingObject(err) {
+			return true
+		}
+		if attempt == 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(20 * time.Millisecond):
+			}
+			continue
+		}
+		p.logger.Warn("silo: remove object ", key, ": ", err)
+	}
+	return false
+}
+
+func (p *Pipe) scheduleDelete(key string) {
+	p.deferMu.Lock()
+	if p.pendingDelete == nil {
+		p.pendingDelete = make(map[string]struct{})
+	}
+	if len(p.pendingDelete) < maxPendingDeletes {
+		p.pendingDelete[key] = struct{}{}
+	}
+	p.deferMu.Unlock()
+}
+
+func (p *Pipe) isPendingDelete(key string) bool {
+	p.deferMu.Lock()
+	_, ok := p.pendingDelete[key]
+	p.deferMu.Unlock()
+	return ok
+}
+
+func (p *Pipe) retryPendingDeletes(ctx context.Context) {
+	p.deferMu.Lock()
+	keys := make([]string, 0, len(p.pendingDelete))
+	for key := range p.pendingDelete {
+		keys = append(keys, key)
+	}
+	p.deferMu.Unlock()
+	for _, key := range keys {
+		if !p.removeObject(ctx, key) {
+			continue
+		}
+		p.deferMu.Lock()
+		delete(p.pendingDelete, key)
+		p.deferMu.Unlock()
+	}
+}
+
+func (p *Pipe) processFile(ctx context.Context, obj listedObject) bool {
+	key := obj.key
+	objReader, err := p.store.GetObject(ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return isMissingObject(err)
 	}
@@ -378,47 +755,36 @@ func (p *Pipe) processFile(key string) bool {
 		return isMissingObject(err)
 	}
 
-	if len(data) == 0 {
-		if err := p.store.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
-			!isMissingObject(err) {
-			return false
+	if obj.size > 0 && int64(len(data)) != obj.size {
+		if p.deferOrDrop(obj, "size mismatch") {
+			return p.removeObject(ctx, key)
 		}
-		return true
+		return false
+	}
+
+	messages, err := parseBatch(data, maxBatchMessageSize)
+	if err != nil {
+		if p.deferOrDrop(obj, err.Error()) {
+			return p.removeObject(ctx, key)
+		}
+		return false
 	}
 
 	p.ctr.NetworkRecv.Add(int64(len(data)))
-
-	offset := 0
-	malformed := false
-	for offset+4 <= len(data) {
-		msgLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-
-		if msgLen < 0 || offset+msgLen > len(data) {
-			malformed = true
-			break
-		}
-
-		msg := data[offset : offset+msgLen]
-		offset += msgLen
-
+	for _, msg := range messages {
 		p.ctr.UsefulRecv.Add(int64(len(msg)))
 		p.ctr.MessagesRecv.Add(1)
 
 		select {
 		case p.recvCh <- msg:
-		case <-p.ctx.Done():
+		case <-ctx.Done():
 			return false
 		}
 	}
-	if malformed {
-		p.logger.Warn("silo: dropping malformed object ", key)
-	}
+	p.clearDeferred(key)
 
-	if err := p.store.RemoveObject(p.ctx, p.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil &&
-		!isMissingObject(err) {
-		p.logger.Warn("silo: remove delivered object ", key, ": ", err)
-		return false
+	if !p.removeObject(ctx, key) {
+		p.scheduleDelete(key)
 	}
 	return true
 }

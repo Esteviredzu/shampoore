@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"time"
 
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	"github.com/xjasonlyu/tun2socks/v2/proxy"
@@ -23,6 +24,21 @@ var (
 	filter       *geofilter.Filter
 	blockUnknown bool
 )
+
+const (
+	dialTimeout = 30 * time.Second
+	udpTimeout  = 10 * time.Second
+)
+
+func withTimeout(ctx context.Context, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, fallback)
+}
 
 func SetMux(m multiplexing.StreamMultiplexer, ipv4Only bool) {
 	mu.Lock()
@@ -102,7 +118,9 @@ func (p *MuxProxy) DialContext(ctx context.Context, meta *M.Metadata) (net.Conn,
 		return nil, fmt.Errorf("muxproxy: mux not initialized")
 	}
 
-	stream, err := mux.OpenStream(ctx, map[string]any{
+	openCtx, cancel := withTimeout(ctx, dialTimeout)
+	defer cancel()
+	stream, err := mux.OpenStream(openCtx, map[string]any{
 		"host": host,
 		"port": port,
 	})
@@ -145,7 +163,9 @@ func (p *MuxProxy) DialUDP(meta *M.Metadata) (net.PacketConn, error) {
 		return nil, fmt.Errorf("muxproxy: mux not initialized")
 	}
 
-	stream, err := mux.OpenStream(context.Background(), map[string]any{
+	openCtx, cancel := withTimeout(context.Background(), udpTimeout)
+	defer cancel()
+	stream, err := mux.OpenStream(openCtx, map[string]any{
 		"host": host,
 		"port": port,
 		"udp":  true,

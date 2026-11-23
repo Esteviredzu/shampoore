@@ -83,6 +83,8 @@ type MultiServer struct {
 	muxCfg   tunnel.Config
 	password string
 
+	exitNodeID string
+
 	serverTTL time.Duration
 
 	connectRoom roomDialFunc
@@ -90,6 +92,7 @@ type MultiServer struct {
 
 	mu           sync.Mutex
 	handler      app.SessionHandler
+	transportIn  app.SessionTransportSink
 	sessions     map[string]*activeSession
 	starting     map[string]struct{}
 	ctx          context.Context
@@ -97,6 +100,7 @@ type MultiServer struct {
 	started      bool
 	unsubscribe  func()
 	syncInterval time.Duration
+	syncCh       chan struct{}
 	wg           sync.WaitGroup
 	syncMu       sync.Mutex
 }
@@ -120,6 +124,7 @@ func NewMultiServer(
 		sessions:     make(map[string]*activeSession),
 		starting:     make(map[string]struct{}),
 		syncInterval: defaultSyncInterval,
+		syncCh:       make(chan struct{}, 1),
 	}
 	m.connectRoom = connectLiveKitRoom
 	m.deleteRoom = m.deleteRemoteRoom
@@ -136,6 +141,24 @@ func (m *MultiServer) SetSessionHandler(handler app.SessionHandler) {
 	m.mu.Lock()
 	m.handler = handler
 	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetTransportSink(sink app.SessionTransportSink) {
+	m.mu.Lock()
+	m.transportIn = sink
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetExitNodeID(id string) {
+	m.mu.Lock()
+	m.exitNodeID = strings.TrimSpace(id)
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) transportSink() app.SessionTransportSink {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.transportIn
 }
 
 func connectLiveKitRoom(ctx context.Context, url, token string, events roomEvents) (roomSession, error) {
@@ -277,9 +300,21 @@ func (m *MultiServer) reconcileLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-m.syncCh:
+			m.syncUsers()
 		case <-ticker.C:
 			m.syncUsers()
 		}
+	}
+}
+
+func (m *MultiServer) requestSync() {
+	if m.syncCh == nil {
+		return
+	}
+	select {
+	case m.syncCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -351,6 +386,7 @@ func (m *MultiServer) startUserSession(ctx context.Context, userID string) {
 		m.mu.Unlock()
 		return
 	}
+	exitNodeID := m.exitNodeID
 	m.starting[room] = struct{}{}
 	m.wg.Add(1)
 	m.mu.Unlock()
@@ -363,7 +399,7 @@ func (m *MultiServer) startUserSession(ctx context.Context, userID string) {
 			delete(m.starting, room)
 			m.mu.Unlock()
 		}()
-		if _, err := m.openSession(ctx, room, userID, ""); err != nil && ctx.Err() == nil {
+		if _, err := m.openSession(ctx, room, userID, exitNodeID); err != nil && ctx.Err() == nil {
 			m.logger.Warn("livekit: user ", userID, " session: ", err)
 		}
 	}()
@@ -406,9 +442,10 @@ func (m *MultiServer) openSession(
 		OnParticipantLeft: func(identity string) {
 			m.logger.Info("livekit: client ", identity, " left room ", room)
 			session.touch()
+			session.peerLeft()
 		},
 		OnDisconnected: func() {
-			session.close("server room disconnected")
+			session.closeKeepRoom("server room disconnected")
 		},
 	}
 
@@ -424,6 +461,9 @@ func (m *MultiServer) openSession(
 	}
 
 	pipe := newPipe(roomConn.LocalParticipant(), m.cfg.DataTopic, userID)
+	pipe.SetDeadHandler(func() {
+		session.closeKeepRoom("heartbeat timeout")
+	})
 	secured, err := security.WrapPipeWithRole(pipe, m.password, "server", m.logger)
 	if err != nil {
 		_ = pipe.Stop(context.Background())
@@ -432,35 +472,63 @@ func (m *MultiServer) openSession(
 		return nil, fmt.Errorf("livekit: wrap encryption: %w", err)
 	}
 	muxCfg := m.muxCfg
-	muxCfg.UserID = ""
-	muxCfg.ExitNodeID = ""
+
+	muxCfg.UserID = userID
+	muxCfg.ExitNodeID = exitNodeID
 	muxCfg.Registry = m.registry
-	mux := tunnel.New(NewTransport(secured), m.logger, muxCfg)
+
+	tr := NewTransport(secured)
+	var (
+		mux            *tunnel.TunnelMultiplexer
+		release        func()
+		aggregatedDone <-chan struct{}
+	)
+	if sink := m.transportSink(); sink != nil {
+		release, aggregatedDone = sink(userID, tr)
+	}
+	aggregated := release != nil
+	if !aggregated {
+		mux = tunnel.New(tr, m.logger, muxCfg)
+	}
+
+	stopOwned := func() {
+		if mux != nil {
+			_ = mux.Stop(context.Background())
+		}
+		if release != nil {
+			release()
+		}
+	}
 
 	session.mu.Lock()
 	session.roomConn = roomConn
 	session.pipe = pipe
 	session.mux = mux
+	session.aggregated = aggregated
+	session.release = release
+	session.aggregatedDone = aggregatedDone
 	session.lastSent = pipe.BytesSent()
 	session.lastRecv = pipe.BytesRecv()
 	closed := session.closed
 	session.mu.Unlock()
 	if closed {
-		_ = mux.Stop(context.Background())
+		stopOwned()
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
 		return nil, context.Canceled
 	}
 
-	if err := mux.Start(sessionCtx); err != nil {
-		session.close("mux start failed")
-		return nil, fmt.Errorf("livekit: start mux: %w", err)
+	if mux != nil {
+		if err := mux.Start(sessionCtx); err != nil {
+			session.close("mux start failed")
+			return nil, fmt.Errorf("livekit: start mux: %w", err)
+		}
 	}
 
 	session.mu.Lock()
 	if session.closed {
 		session.mu.Unlock()
-		_ = mux.Stop(context.Background())
+		stopOwned()
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
 		return nil, context.Canceled
@@ -475,7 +543,7 @@ func (m *MultiServer) openSession(
 	if _, exists := m.sessions[room]; exists {
 		m.mu.Unlock()
 		session.mu.Unlock()
-		_ = mux.Stop(context.Background())
+		stopOwned()
 		_ = pipe.Stop(context.Background())
 		roomConn.Disconnect()
 		cancel()
@@ -490,7 +558,7 @@ func (m *MultiServer) openSession(
 	go m.runSessionHandler(session, handler)
 
 	m.logger.Info("livekit: session ", room, " ready for user ", userID,
-		" exit=", exitNodeID)
+		" exit=", exitNodeID, " aggregated=", aggregated)
 	return session, nil
 }
 
@@ -498,7 +566,17 @@ func (m *MultiServer) runSessionHandler(session *activeSession, handler app.Sess
 	defer m.wg.Done()
 	session.mu.Lock()
 	mux := session.mux
+	aggregated := session.aggregated
+	aggregatedDone := session.aggregatedDone
 	session.mu.Unlock()
+	if aggregated {
+		select {
+		case <-session.ctx.Done():
+		case <-aggregatedDone:
+		}
+		session.close("aggregated session finished")
+		return
+	}
 	if handler == nil || mux == nil {
 		<-session.ctx.Done()
 		return
@@ -507,7 +585,7 @@ func (m *MultiServer) runSessionHandler(session *activeSession, handler app.Sess
 	if err != nil && session.ctx.Err() == nil {
 		m.logger.Warn("livekit: session ", session.room, " handler: ", err)
 	}
-	session.close("handler finished")
+	session.closeKeepRoom("handler finished")
 }
 
 func (m *MultiServer) removeSession(room string, session *activeSession) {
@@ -574,14 +652,18 @@ type activeSession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu           sync.Mutex
-	closed       bool
-	roomConn     roomSession
-	pipe         *Pipe
-	mux          *tunnel.TunnelMultiplexer
-	lastSent     int64
-	lastRecv     int64
-	lastActivity atomic.Int64
+	mu             sync.Mutex
+	closed         bool
+	roomConn       roomSession
+	pipe           *Pipe
+	mux            *tunnel.TunnelMultiplexer
+	aggregated     bool
+	release        func()
+	aggregatedDone <-chan struct{}
+	releaseOnce    sync.Once
+	lastSent       int64
+	lastRecv       int64
+	lastActivity   atomic.Int64
 }
 
 func (s *activeSession) touch() {
@@ -606,7 +688,24 @@ func (s *activeSession) setRemote(identity string) {
 	}
 }
 
+func (s *activeSession) peerLeft() {
+	s.mu.Lock()
+	pipe := s.pipe
+	s.mu.Unlock()
+	if pipe != nil {
+		pipe.PeerLeft()
+	}
+}
+
 func (s *activeSession) close(reason string) {
+	s.closeWith(reason, true)
+}
+
+func (s *activeSession) closeKeepRoom(reason string) {
+	s.closeWith(reason, false)
+}
+
+func (s *activeSession) closeWith(reason string, deleteRoom bool) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -616,14 +715,19 @@ func (s *activeSession) close(reason string) {
 	mux := s.mux
 	pipe := s.pipe
 	roomConn := s.roomConn
+	release := s.release
 	s.mux = nil
 	s.pipe = nil
 	s.roomConn = nil
+	s.release = nil
 	s.mu.Unlock()
 
 	s.server.logger.Info("livekit: closing session ", s.room, " (", reason, ")")
 	s.cancel()
 
+	if release != nil {
+		s.releaseOnce.Do(release)
+	}
 	if mux != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), sessionStopTimeout)
 		if err := mux.Stop(stopCtx); err != nil {
@@ -639,7 +743,7 @@ func (s *activeSession) close(reason string) {
 	if roomConn != nil {
 		roomConn.Disconnect()
 	}
-	if s.server.deleteRoom != nil {
+	if deleteRoom && s.server.deleteRoom != nil {
 		delCtx, delCancel := context.WithTimeout(context.Background(), roomDeleteTimeout)
 		if err := s.server.deleteRoom(delCtx, s.room); err != nil {
 			s.server.logger.Debug("livekit: delete room ", s.room, ": ", err)
@@ -648,6 +752,8 @@ func (s *activeSession) close(reason string) {
 	}
 	s.server.removeSession(s.room, s)
 	close(s.done)
+
+	s.server.requestSync()
 }
 
 var _ app.SessionServer = (*MultiServer)(nil)

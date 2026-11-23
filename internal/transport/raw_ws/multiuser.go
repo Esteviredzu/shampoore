@@ -14,6 +14,8 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
 )
 
+const sessionRetryDelay = time.Second
+
 func roomForUser(room, userID string) string {
 	room = strings.TrimSpace(room)
 	userID = strings.TrimSpace(userID)
@@ -44,10 +46,13 @@ type MultiServer struct {
 	registry *auth.UserRegistry
 	muxCfg   tunnel.Config
 
+	exitNodeID string
+
 	syncMu sync.Mutex
 
 	mu          sync.Mutex
 	handler     app.SessionHandler
+	transportIn app.SessionTransportSink
 	sessions    map[string]*multiSession
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -79,6 +84,24 @@ func (m *MultiServer) SetSessionHandler(handler app.SessionHandler) {
 	m.mu.Lock()
 	m.handler = handler
 	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetTransportSink(sink app.SessionTransportSink) {
+	m.mu.Lock()
+	m.transportIn = sink
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) SetExitNodeID(id string) {
+	m.mu.Lock()
+	m.exitNodeID = strings.TrimSpace(id)
+	m.mu.Unlock()
+}
+
+func (m *MultiServer) transportSink() app.SessionTransportSink {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.transportIn
 }
 
 func (m *MultiServer) Start(ctx context.Context) error {
@@ -197,6 +220,7 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 		return
 	}
 	handler := m.handler
+	exitNodeID := m.exitNodeID
 	m.sessions[userID] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
@@ -215,44 +239,70 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 			cancel()
 		}()
 
-		if sessionCtx.Err() != nil {
-			return
-		}
-
-		cfg := m.cfg
-		cfg.UserID = userID
-		cfg.Multiuser = false
-		tr := newTransport(cfg, m.logger)
-		if tr == nil {
-			return
-		}
-
-		muxCfg := m.muxCfg
-		muxCfg.UserID = ""
-		muxCfg.ExitNodeID = ""
-		muxCfg.Registry = m.registry
-		mux := tunnel.New(tr, m.logger, muxCfg)
-
-		if handler == nil {
-			handler = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
-				<-ctx.Done()
-				return ctx.Err()
+		for {
+			if sessionCtx.Err() != nil {
+				return
 			}
-		}
 
-		if err := mux.Start(sessionCtx); err != nil {
-			if sessionCtx.Err() == nil {
-				m.logger.Warn("raw_ws: user ", userID, " mux start: ", err)
+			cfg := m.cfg
+			cfg.UserID = userID
+			cfg.Multiuser = false
+			tr := newTransport(cfg, m.logger)
+			if tr == nil {
+				return
 			}
+
+			if sink := m.transportSink(); sink != nil {
+				release, aggregated := sink(userID, tr)
+				if release != nil {
+
+					select {
+					case <-sessionCtx.Done():
+					case <-aggregated:
+					}
+					release()
+					if sessionCtx.Err() != nil {
+						return
+					}
+
+					select {
+					case <-sessionCtx.Done():
+						return
+					case <-time.After(sessionRetryDelay):
+					}
+					continue
+				}
+			}
+
+			muxCfg := m.muxCfg
+
+			muxCfg.UserID = userID
+			muxCfg.ExitNodeID = exitNodeID
+			muxCfg.Registry = m.registry
+			mux := tunnel.New(tr, m.logger, muxCfg)
+
+			if handler == nil {
+				handler = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+			}
+
+			if err := mux.Start(sessionCtx); err != nil {
+				if sessionCtx.Err() == nil {
+					m.logger.Warn("raw_ws: user ", userID, " mux start: ", err)
+				}
+				return
+			}
+			if err := handler(sessionCtx, mux); err != nil && sessionCtx.Err() == nil {
+				m.logger.Warn("raw_ws: user ", userID, " session: ", err)
+			}
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := mux.Stop(stopCtx); err != nil {
+				m.logger.Debug("raw_ws: user ", userID, " mux stop: ", err)
+			}
+			stopCancel()
 			return
 		}
-		if err := handler(sessionCtx, mux); err != nil && sessionCtx.Err() == nil {
-			m.logger.Warn("raw_ws: user ", userID, " session: ", err)
-		}
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := mux.Stop(stopCtx); err != nil {
-			m.logger.Debug("raw_ws: user ", userID, " mux stop: ", err)
-		}
-		stopCancel()
 	}()
 }

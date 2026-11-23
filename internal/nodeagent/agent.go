@@ -209,6 +209,68 @@ func patchUsers(settings *app.Settings, users []auth.UserSpec) (bool, error) {
 	if err := json.Unmarshal(settings.Transport, &raw); err != nil {
 		return false, err
 	}
+	changed, err := patchUsersMap(raw, users)
+	if err != nil || !changed {
+		return changed, err
+	}
+	updated, err := json.Marshal(raw)
+	if err != nil {
+		return false, err
+	}
+	settings.Transport = updated
+	return true, nil
+}
+
+func patchUsersMap(raw map[string]json.RawMessage, users []auth.UserSpec) (bool, error) {
+	if childrenRaw, ok := raw["transports"]; ok {
+		var children []json.RawMessage
+		if err := json.Unmarshal(childrenRaw, &children); err != nil {
+			return false, err
+		}
+		changed := false
+		for i, child := range children {
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(child, &obj); err != nil {
+				return false, err
+			}
+			trRaw, ok := obj["transport"]
+			if !ok {
+				continue
+			}
+			var trObj map[string]json.RawMessage
+			if err := json.Unmarshal(trRaw, &trObj); err != nil {
+				return false, err
+			}
+			childChanged, err := patchUsersMap(trObj, users)
+			if err != nil {
+				return false, err
+			}
+			if !childChanged {
+				continue
+			}
+			updatedTr, err := json.Marshal(trObj)
+			if err != nil {
+				return false, err
+			}
+			obj["transport"] = updatedTr
+			updatedChild, err := json.Marshal(obj)
+			if err != nil {
+				return false, err
+			}
+			children[i] = updatedChild
+			changed = true
+		}
+		if !changed {
+			return false, nil
+		}
+		updatedChildren, err := json.Marshal(children)
+		if err != nil {
+			return false, err
+		}
+		raw["transports"] = updatedChildren
+		return true, nil
+	}
+
 	var multiuser bool
 	if v, ok := raw["multiuser"]; ok {
 		if err := json.Unmarshal(v, &multiuser); err != nil {
@@ -230,11 +292,6 @@ func patchUsers(settings *app.Settings, users []auth.UserSpec) (bool, error) {
 		return false, nil
 	}
 	raw["users"] = newUsers
-	updated, err := json.Marshal(raw)
-	if err != nil {
-		return false, err
-	}
-	settings.Transport = updated
 	return true, nil
 }
 

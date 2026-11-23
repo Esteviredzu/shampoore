@@ -20,9 +20,16 @@ const (
 	remoteResolveTimeout = 10 * time.Second
 
 	remoteProbeExit       = "exit"
+	remoteProbeNet        = "net"
 	remoteProbeReply      = "ok\n"
+	remoteProbeErrPrefix  = "err:"
+	remoteProbeNetTimeout = 3 * time.Second
 	remoteProbeMinSpacing = 100 * time.Millisecond
+
+	remoteProbeNetMinSpacing = time.Second
 )
+
+var remoteProbeNetTarget = "1.1.1.1:443"
 
 func dialTCP(ctx context.Context, target string, ipv4Only bool, upstream string) (net.Conn, error) {
 	if upstream != "" {
@@ -71,8 +78,9 @@ type RemoteHandler struct {
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
 
-	probeMu   sync.Mutex
-	lastProbe time.Time
+	probeMu       sync.Mutex
+	lastExitProbe time.Time
+	lastNetProbe  time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -319,24 +327,57 @@ func (s *RemoteHandler) closeStream(stream multiplexing.Stream) {
 func (s *RemoteHandler) handleProbe(stream multiplexing.Stream, probe string) {
 	defer s.closeStream(stream)
 
-	if probe != remoteProbeExit {
+	if probe != remoteProbeExit && probe != remoteProbeNet {
 		s.logger.Warn("remote: ", stream.ID(), " unknown probe ", probe)
 		return
 	}
 
 	s.probeMu.Lock()
 	now := time.Now()
-	if !s.lastProbe.IsZero() && now.Sub(s.lastProbe) < remoteProbeMinSpacing {
+	if probe == remoteProbeNet {
+		if !s.lastNetProbe.IsZero() && now.Sub(s.lastNetProbe) < remoteProbeNetMinSpacing {
+			s.probeMu.Unlock()
+			s.logger.Debug("remote: ", stream.ID(), " net probe rate limited")
+			return
+		}
+		s.lastNetProbe = now
 		s.probeMu.Unlock()
-		s.logger.Debug("remote: ", stream.ID(), " probe rate limited")
+	} else {
+		if !s.lastExitProbe.IsZero() && now.Sub(s.lastExitProbe) < remoteProbeMinSpacing {
+			s.probeMu.Unlock()
+			s.logger.Debug("remote: ", stream.ID(), " probe rate limited")
+			return
+		}
+		s.lastExitProbe = now
+		s.probeMu.Unlock()
+	}
+
+	if probe == remoteProbeNet {
+		reply := s.probeInternet()
+		if _, err := stream.Write([]byte(reply)); err != nil {
+			s.logger.Warn("remote: ", stream.ID(), " net probe write: ", err)
+		}
 		return
 	}
-	s.lastProbe = now
-	s.probeMu.Unlock()
 
 	if _, err := stream.Write([]byte(remoteProbeReply)); err != nil {
 		s.logger.Warn("remote: ", stream.ID(), " probe write: ", err)
 	}
+}
+
+func (s *RemoteHandler) probeInternet() string {
+	target := strings.TrimSpace(remoteProbeNetTarget)
+	if target == "" {
+		return remoteProbeReply
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, remoteProbeNetTimeout)
+	defer cancel()
+	conn, err := dialTCP(ctx, target, s.ipv4Only, "")
+	if err != nil {
+		return remoteProbeErrPrefix + err.Error() + "\n"
+	}
+	_ = conn.Close()
+	return remoteProbeReply
 }
 
 func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {

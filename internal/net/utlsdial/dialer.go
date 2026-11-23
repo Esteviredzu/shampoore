@@ -37,6 +37,8 @@ const (
 
 var HTTPTransportALPN = []string{"h2", "http/1.1"}
 
+var HTTP1ALPN = []string{"http/1.1"}
+
 var WebSocketALPN = []string{"http/1.1"}
 
 var userAgents = map[Profile]string{
@@ -146,6 +148,32 @@ func NewHTTPTransport(profile Profile) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
+	tr.Protocols = protocols
+	return tr
+}
+
+func NewHTTP1Transport(profile Profile) *http.Transport {
+	profile = NormalizeProfile(profile)
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: keepAlivePeriod,
+			Control:   netdial.Control,
+		}).DialContext,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return DialContext(ctx, network, addr, HostFromAddr(addr), HTTP1ALPN, profile)
+		},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ExpectContinueTimeout: time.Second,
+	}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(false)
 	tr.Protocols = protocols
 	return tr
 }
