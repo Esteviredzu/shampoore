@@ -160,7 +160,19 @@ func TestHealthMuxReportsStreamFailureWithoutData(t *testing.T) {
 	}
 }
 
+func enableExitHealthProbe(t *testing.T) {
+	t.Helper()
+	SetExitHealthProbe(true)
+	t.Cleanup(func() { SetExitHealthProbe(false) })
+}
+
 func startTUNForHealth(t *testing.T) *fakeBundle {
+	t.Helper()
+	enableExitHealthProbe(t)
+	return startTUNClient(t)
+}
+
+func startTUNClient(t *testing.T) *fakeBundle {
 	t.Helper()
 	bundle := &fakeBundle{
 		transport: &fakeTransport{},
@@ -214,6 +226,48 @@ func waitForResetCalls(t *testing.T, calls *atomic.Int32, want int32, timeout ti
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("transport reset calls = %d, want at least %d", calls.Load(), want)
+}
+
+func TestExitHealthProbeDisabledConnectsImmediately(t *testing.T) {
+	resetMobileState(t)
+	SetExitHealthProbe(false)
+
+	healthFailureLimit = 1
+	healthRetryInitial = 5 * time.Millisecond
+	healthReconnectMax = 20 * time.Millisecond
+	healthProbeInterval = 10 * time.Millisecond
+
+	var calls atomic.Int32
+	exitProbe = func(context.Context, multiplexing.StreamMultiplexer) error {
+		calls.Add(1)
+		return errors.New("exit down")
+	}
+
+	bundle := startTUNClient(t)
+	if got := GetState(); got != StateRunning {
+		t.Fatalf("state = %q, want %q with the exit health probe disabled", got, StateRunning)
+	}
+	if !IsConnected() {
+		t.Fatal("client must report connected right after the TUN is up")
+	}
+
+	stateMu.Lock()
+	ctl := healthCtl
+	stateMu.Unlock()
+	if ctl != nil {
+		t.Fatal("health controller was started while the exit health probe is disabled")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("exit health probe ran %d times while disabled, want 0", got)
+	}
+	if got := GetState(); got != StateRunning {
+		t.Fatalf("state = %q, disabled probe must keep the client connected", got)
+	}
+	if got := bundle.transport.resetCalls.Load(); got != 0 {
+		t.Fatalf("disabled health probe reset the transport %d times", got)
+	}
 }
 
 func TestHealthTUNStartsConnectingThenRunning(t *testing.T) {

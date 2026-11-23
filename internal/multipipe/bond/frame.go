@@ -18,8 +18,64 @@ const (
 
 	controlNack byte = 2
 
+	controlPong byte = 3
+
+	controlAck byte = 4
+
 	maxNackSeqs = 32
+
+	maxSackRanges = 64
 )
+
+type sackRange struct {
+	start uint32
+	end   uint32
+}
+
+func encodePingArgs(probeID, txMs uint32) []uint32 {
+	return []uint32{probeID, txMs}
+}
+
+func decodePingArgs(args []uint32) (probeID, txMs uint32, ok bool) {
+	if len(args) < 2 {
+		return 0, 0, false
+	}
+	return args[0], args[1], true
+}
+
+func encodeSackArgs(highestRecv uint32, ranges []sackRange) []uint32 {
+	if len(ranges) > maxSackRanges {
+		ranges = ranges[:maxSackRanges]
+	}
+	args := make([]uint32, 0, 1+2*len(ranges))
+	args = append(args, highestRecv)
+	for _, r := range ranges {
+		args = append(args, r.start, r.end)
+	}
+	return args
+}
+
+func decodeSackArgs(args []uint32) (highestRecv uint32, ranges []sackRange, ok bool) {
+	if len(args) < 1 || (len(args)-1)%2 != 0 {
+		return 0, nil, false
+	}
+	highestRecv = args[0]
+	n := (len(args) - 1) / 2
+	if n > maxSackRanges {
+		n = maxSackRanges
+	}
+	if n > 0 {
+		ranges = make([]sackRange, 0, n)
+		for i := 0; i < n; i++ {
+			s := args[1+2*i]
+			e := args[1+2*i+1]
+			if e >= s {
+				ranges = append(ranges, sackRange{start: s, end: e})
+			}
+		}
+	}
+	return highestRecv, ranges, true
+}
 
 type bondFrame struct {
 	seq        uint32

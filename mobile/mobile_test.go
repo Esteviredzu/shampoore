@@ -175,6 +175,8 @@ func resetMobileState(t *testing.T) {
 		return false, nil
 	}
 
+	SetExitHealthProbe(false)
+
 	startTUNFD = runtime.StartTUNFD
 }
 
@@ -241,6 +243,7 @@ func waitForStateEvent(t *testing.T, l *recordingListener, want string, timeout 
 
 func TestStateMachineStartStopNotifiesListener(t *testing.T) {
 	resetMobileState(t)
+	enableExitHealthProbe(t)
 	installFakeBuilder(t, func() *fakeBundle {
 		return &fakeBundle{
 			transport: &fakeTransport{},

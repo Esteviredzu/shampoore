@@ -15,7 +15,7 @@ cd shampoore
 # Сборка всех бинарников разом
 go build -o bin/ ./cmd/...
 
-# Запуск сервера в CLI-режиме
+# Запуск сервера в CLI-режимеz
 ./bin/shampoore-server -c config.json
 ```
 

@@ -263,8 +263,9 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 		return "shampoore: " + err.Error()
 	}
 
+	probeEnabled := exitHealthProbeOn()
 	next := StateRunning
-	if sess.tunMode {
+	if sess.tunMode && probeEnabled {
 		next = StateConnecting
 	}
 	if !setStateIf(StateStarting, next, "") {
@@ -280,7 +281,7 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 	}
 
 	var healthDone <-chan struct{}
-	if sess.tunMode && sess.healthCtl != nil {
+	if sess.tunMode && probeEnabled && sess.healthCtl != nil {
 		sess.healthCtl.start()
 		healthDone = sess.healthCtl.done
 	}

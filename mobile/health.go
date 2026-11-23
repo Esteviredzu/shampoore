@@ -51,7 +51,23 @@ var (
 
 	exitProbe     = probeExitThroughMux
 	internetProbe = probeInternetThroughMux
+
+	EnableExitHealthProbe bool
+
+	exitHealthProbeEnabled atomic.Bool
 )
+
+func init() {
+	exitHealthProbeEnabled.Store(EnableExitHealthProbe)
+}
+
+func SetExitHealthProbe(enabled bool) {
+	exitHealthProbeEnabled.Store(enabled)
+}
+
+func exitHealthProbeOn() bool {
+	return exitHealthProbeEnabled.Load()
+}
 
 type HealthStatus struct {
 	State               string `json:"state"`
@@ -336,6 +352,11 @@ func (c *healthController) run() {
 			timerC = nil
 		}
 
+		if !exitHealthProbeOn() {
+			log.Printf("mobile: exit health probe disabled, stopping background probes")
+			return
+		}
+
 		err, canceled := c.probeOnce()
 		if canceled {
 			return
@@ -381,7 +402,7 @@ func (c *healthController) run() {
 
 		c.recordProbeFailure(failures, err)
 
-		if failures >= c.failureLimit {
+		if failures >= c.failureLimit && exitHealthProbeOn() {
 			c.requestReconnect()
 		}
 		arm(backoff)
@@ -488,15 +509,17 @@ func (c *healthController) recordProbeFailure(failures int, probeErr error) {
 		downgraded bool
 		listener   StateListener
 	)
-	if failures >= c.failureLimit {
-		healthError = true
+	if failures < c.failureLimit || !exitHealthProbeOn() {
+		stateMu.Unlock()
+		return
+	}
+	healthError = true
 
-		if state == StateRunning {
-			state = StateConnecting
-			stateMessage = ""
-			downgraded = true
-			listener = stateListener
-		}
+	if state == StateRunning {
+		state = StateConnecting
+		stateMessage = ""
+		downgraded = true
+		listener = stateListener
 	}
 	stateMu.Unlock()
 

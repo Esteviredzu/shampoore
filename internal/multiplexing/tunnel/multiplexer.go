@@ -108,6 +108,11 @@ type TunnelMultiplexer struct {
 	peerModern atomic.Bool
 	lastRecv   atomic.Int64
 
+	lastPingSentNs atomic.Int64
+	srttNs         atomic.Int64
+	rttvarNs       atomic.Int64
+	resetCount     atomic.Uint64
+
 	remoteEpoch    uint32
 	remoteEpochSet bool
 	retiredEpochs  map[uint32]struct{}
@@ -418,7 +423,47 @@ func (m *TunnelMultiplexer) sendControl(ctx context.Context, f *TunnelFrame) {
 	}
 }
 
+type HealthSnapshot struct {
+	SRTT        time.Duration
+	RTTVAR      time.Duration
+	QueuedBytes int64
+	Resets      uint64
+}
+
+func (m *TunnelMultiplexer) Health() HealthSnapshot {
+	return HealthSnapshot{
+		SRTT:        time.Duration(m.srttNs.Load()),
+		RTTVAR:      time.Duration(m.rttvarNs.Load()),
+		QueuedBytes: m.queuedBytes.Load(),
+		Resets:      m.resetCount.Load(),
+	}
+}
+
+func (m *TunnelMultiplexer) recordPingRTT(rtt time.Duration) {
+	if rtt < 500*time.Microsecond {
+		rtt = 500 * time.Microsecond
+	}
+	if rtt > 30*time.Second {
+		rtt = 30 * time.Second
+	}
+	rNs := int64(rtt)
+	oldSRTT := m.srttNs.Load()
+	if oldSRTT <= 0 {
+		m.srttNs.Store(rNs)
+		m.rttvarNs.Store(rNs / 2)
+		return
+	}
+	diff := oldSRTT - rNs
+	if diff < 0 {
+		diff = -diff
+	}
+	oldVar := m.rttvarNs.Load()
+	m.rttvarNs.Store((3*oldVar + diff) / 4)
+	m.srttNs.Store((7*oldSRTT + rNs) / 8)
+}
+
 func (m *TunnelMultiplexer) sendPing(ctx context.Context) {
+	m.lastPingSentNs.Store(time.Now().UnixNano())
 	m.sendControl(ctx, &TunnelFrame{Type: FramePing})
 }
 
@@ -1163,7 +1208,7 @@ func (m *TunnelMultiplexer) receiveLoop() {
 }
 
 func (m *TunnelMultiplexer) handleTransportReset() {
-
+	m.resetCount.Add(1)
 	m.lastRecv.Store(time.Now().UnixNano())
 
 	m.helloMu.Lock()
@@ -1208,6 +1253,7 @@ func (m *TunnelMultiplexer) failSession(reason error) {
 	if !m.failed.CompareAndSwap(false, true) {
 		return
 	}
+	m.resetCount.Add(1)
 	m.closeAllStreams(reason)
 
 	m.mu.Lock()
@@ -1333,6 +1379,11 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 
 	case FramePong:
 		m.peerModern.Store(true)
+		if sentNs := m.lastPingSentNs.Swap(0); sentNs > 0 {
+			if rtt := time.Since(time.Unix(0, sentNs)); rtt > 0 {
+				m.recordPingRTT(rtt)
+			}
+		}
 
 	case FrameData:
 		m.ensureAuthorizedForStream()
@@ -1369,7 +1420,7 @@ func (m *TunnelMultiplexer) handleFrame(f *TunnelFrame) {
 		}
 
 	case FrameReset:
-
+		m.resetCount.Add(1)
 		m.logger.Debug("tunnel: session reset frame (epoch ", f.Epoch, "); closing all streams")
 		m.closeAllStreams(transport.ErrTransportReset)
 
