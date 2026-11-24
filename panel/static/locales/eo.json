@@ -13,10 +13,14 @@
     "rules": "Geo-reguloj"
   },
   "time": {
+    "justNow": "ĵus nun",
     "secAgo": "sek antaŭe",
     "minAgo": "min antaŭe",
     "hourAgo": "h antaŭe",
-    "dayAgo": "t antaŭe"
+    "dayAgo": "t antaŭe",
+    "hoursAgo": "{hours} h antaŭe",
+    "hoursMinutesAgo": "{hours} h {minutes} min antaŭe",
+    "daysAgo": "{days} t antaŭe"
   },
   "dashboard": {
     "relays": "Relay",
@@ -59,9 +63,6 @@
     "deployDone": "Deploy finiĝis",
     "connecting": "Konektiĝas al la nodo…",
     "deleteTitle": "Forigi servilon",
-    "deleteBody": "Forigi «{name}»? La panelo povas unue purigi Docker kaj /opt/shampoore.",
-    "deleteClean": "Purigi kaj forigi",
-    "deleteForce": "VPS jam malaperis — forigi tamen",
     "cleaning": "Purigas la servilon…",
     "deploySucceeded": "Deploy sukcesis",
     "deployFailed": "Deploy malsukcesis",
@@ -119,7 +120,30 @@
     "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
     "decoyRepoHint": "Indiku publikan GitHub-deponejon kun index.html, style.css kaj app.js. Se la kampo estas malplena, maskoservilo ne estas deplojita.",
     "secretsHint": "Sekretoj estas konservitaj en la panela datumbazo kaj senditaj al la servilo dum deplojo. Uzu 🎲 por generi valoron.",
-    "regenerate": "Generi hazardan valoron"
+    "regenerate": "Generi hazardan valoron",
+    "metricsCpu": "CPU",
+    "metricsRam": "RAM",
+    "metricsDisk": "Disko",
+    "resources": "Rimedoj",
+    "server": "Servilo",
+    "roles": "Roloj",
+    "updatedAt": "Ĝisdatigita",
+    "actions": "Agoj",
+    "metricsPending": "Neniuj metrikoj ankoraŭ",
+    "lastSeen": "Ĝisdatigita {time}",
+    "neverSeen": "Ankoraŭ neniuj telemetrioj",
+    "redeployAll": "Re-deploi ĉiujn",
+    "redeployAllQueued": "En vico: {count}",
+    "redeployAllDone": "Re-deplojo finiĝis",
+    "redeployAllEmpty": "Neniuj deplojitaj serviloj",
+    "queued": "En vico",
+    "cleanupContainers": "Docker-ujoj kaj volumoj",
+    "cleanupFiles": "Dosierujo /opt/shampoore kaj agentaj datumoj",
+    "cleanupSystemd": "Systemd-unuoj kaj shampoore-binarioj",
+    "deleteConfirmBody": "Ĉu forigi «{name}»? La panelo haltigos ujojn, forigos volumojn, /opt/shampoore kaj systemd-unuojn, poste forigos la rikordon el la datumbazo.",
+    "deleteForceOption": "La servilo neatingeblas — forigi nur la datumbazan rikordon",
+    "deleteForceHint": "Aktivigu, se la VPS jam forviŝiĝis aŭ SSH ne disponeblas. Nenio estos forigita sur la servilo.",
+    "deleteConfirmAction": "Purigi kaj forigi"
   },
   "roles": {
     "title": "Rolo de la servilo",
@@ -175,7 +199,7 @@
     "routes": "Itineroj",
     "active": "Aktiva",
     "inactive": "Malaktiva",
-    "never": "Neniam",
+    "never": "Senlima",
     "allRoutes": "Ĉiuj itineroj",
     "qr": "QR-kodo",
     "copy": "Kopii ligilon",
@@ -203,7 +227,24 @@
     "copyJson": "Kopii JSON",
     "downloadJson": "Elŝuti .json",
     "bundleCopied": "JSON kopiita",
-    "bundleEmpty": "Ĉi tiu uzanto ankoraŭ ne havas itinerojn."
+    "bundleEmpty": "Ĉi tiu uzanto ankoraŭ ne havas itinerojn.",
+    "edit": "Redakti",
+    "routesOrder": "Itineroj kaj abona ordo",
+    "routesAvailable": "Disponeblaj itineroj",
+    "routesSelected": "Ordo en la abono",
+    "noRoutesSelected": "Neniuj itineroj elektitaj — la uzanto ricevos ĉiujn itinerojn.",
+    "allRoutesSelected": "Ĉiuj itineroj jam elektiĝis.",
+    "orderHint": "Trenu itinerojn aŭ uzu ▲▼. Abonaj ligiloj sekvas ĉi tiun ordon.",
+    "moveUp": "Supren",
+    "moveDown": "Malsupren",
+    "dragHint": "Trenu por ŝanĝi la ordon",
+    "date": "Dato",
+    "expiryDate": "Finiĝa dato",
+    "nameRequired": "Indiku uzantnomon",
+    "dateRequired": "Elektu finiĝan daton",
+    "limitRequired": "Indiku trafikan limon",
+    "daysLeft": "restas {days} tagoj",
+    "copyLink": "Kopii shampoore:// ligilon"
   },
   "server": {
     "checking": "Kontrolas…",
@@ -261,7 +302,6 @@
     "remove": "Forigi",
     "refresh": "Ĝisdatigi",
     "menu": "Menuo",
-    "backup": "Sekurkopio",
     "logout": "Elsaluti"
   },
   "dialog": {
@@ -278,6 +318,7 @@
     "encryptionHint": "Laŭvola. Komuna sekreto por XChaCha20-Poly1305.",
     "transport": "Transporto",
     "advanced": "Pliaj parametroj",
+    "advancedOptions": "Pliaj opcioj",
     "advancedHint": "Aldonaj transportaj parametroj. Malplena = defaŭltoj.",
     "advancedEmpty": "Neniuj parametroj.",
     "addPair": "Aldoni parametron",
@@ -321,11 +362,6 @@
   },
   "confirm": {
     "deleteConfig": "Forigi ĉi tiun agordon? Ne estas malfaro."
-  },
-  "stats": {
-    "cpu": "CPU-uzado",
-    "ram": "RAM-uzado",
-    "uptime": "Sistema funkciada tempo"
   },
   "rules": {
     "title": "Geo-reguloj",
@@ -371,7 +407,11 @@
     "exitNodesHint": "Defaŭlte la regulo aplikiĝas al ĉiuj Elaj serviloj.",
     "noExitNodes": "Neniu Ela servilo disponeblas",
     "exitNodesRequired": "Elektu almenaŭ unu Elan servilon",
-    "exitNodesSaved": "Elaj serviloj ligitaj kaj konservitaj"
+    "exitNodesSaved": "Elaj serviloj ligitaj kaj konservitaj",
+    "subtitle": "GeoIP-reguloj kaj CIDR-listoj por Elaj serviloj.",
+    "loading": "Ŝargas regulojn…",
+    "manualHint": "Ĉi tiu regulo estis aldonita mane; ĝisdatigu la CIDR-liston laŭbezone.",
+    "applyShort": "Apliki"
   },
   "update": {
     "current": "Versio",
@@ -389,5 +429,12 @@
     "waiting": "Atendante la panelon…",
     "done": "Ĝisdatigo instalita. Reŝargado…",
     "failed": "La panelo ne revenis ĝustatempe"
+  },
+  "live": {
+    "on": "Viva",
+    "paused": "Paŭzita",
+    "pause": "Paŭzigi ĝisdatigojn",
+    "resume": "Daŭrigi ĝisdatigojn",
+    "hint": "Datumoj ĝisdatiĝas ĉiujn kelkajn sekundojn."
   }
 }

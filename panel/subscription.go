@@ -59,8 +59,8 @@ func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app
 	}
 
 	out := make([]app.Settings, 0, len(routes))
-	for _, route := range routes {
-		if !route.Enabled || !user.RouteAllowed(route.ID) {
+	for _, route := range orderedRoutesForUser(routes, user) {
+		if !route.Enabled {
 			continue
 		}
 		if route.TransportType != "" {
@@ -81,6 +81,23 @@ func (a *API) subscriptionSettings(r *http.Request, user panelstore.User) ([]app
 		}
 	}
 	return out, nil
+}
+
+func orderedRoutesForUser(routes []panelstore.Route, user panelstore.User) []panelstore.Route {
+	if len(user.AllowedRouteIDs) == 0 {
+		return routes
+	}
+	byID := make(map[int64]panelstore.Route, len(routes))
+	for _, route := range routes {
+		byID[route.ID] = route
+	}
+	out := make([]panelstore.Route, 0, len(user.AllowedRouteIDs))
+	for _, id := range user.AllowedRouteIDs {
+		if route, ok := byID[id]; ok {
+			out = append(out, route)
+		}
+	}
+	return out
 }
 
 func singleRouteSettings(route panelstore.Route, byID map[int64]panelstore.Node, user panelstore.User) (app.Settings, bool) {

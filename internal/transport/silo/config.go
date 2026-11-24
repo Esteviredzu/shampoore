@@ -16,6 +16,8 @@ type Config struct {
 	UseSSL    bool   `json:"use_ssl"`
 	TunnelID  string `json:"tunnel_id"`
 
+	UTLSProfile string `json:"utls_profile,omitempty"`
+
 	UserID string `json:"user_id,omitempty"`
 
 	Multiuser bool            `json:"multiuser,omitempty"`

@@ -2,6 +2,7 @@ package all
 
 import (
 	_ "github.com/Esteviredzu/shampoore/internal/multipipe"
+	_ "github.com/Esteviredzu/shampoore/internal/transport/jellyfin"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/livekit_datachannel"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/raw_ws"
 	_ "github.com/Esteviredzu/shampoore/internal/transport/silo"

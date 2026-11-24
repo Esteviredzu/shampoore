@@ -55,7 +55,7 @@ func main() {
 	blockUnknown := flag.Bool("block-unknown", false,
 		"block traffic that does not match any enabled rule")
 	socksListen := flag.String("socks-listen", "",
-		"optional local SOCKS5 listen address for exit-node chaining (e.g. :1080)")
+		"optional local SOCKS5 listen address (always loopback; empty = disabled)")
 
 	var configFiles stringList
 	flag.Var(&configFiles, "c",
@@ -135,11 +135,11 @@ func main() {
 		}
 	}
 
-	if *socksListen != "" {
-		socks := socks5.NewLocalServer(*socksListen, nil, logger, app.IPv4Only)
+	if listen := socks5.NormalizeListen(*socksListen); listen != "" {
+		socks := socks5.NewLocalServer(listen, nil, logger, app.IPv4Only)
 		socks.SetGeoFilter(filter, *blockUnknown)
 		go func() {
-			logger.Info("server: direct SOCKS5 listening on ", *socksListen)
+			logger.Info("server: direct SOCKS5 listening on ", listen)
 			if err := socks.ListenAndServe(ctx); err != nil {
 				logger.Warn("server: socks5: ", err)
 			}

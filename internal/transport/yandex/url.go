@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strings"
 )
 
 func decodeURL(q url.Values) (json.RawMessage, error) {
@@ -14,7 +15,11 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	if !isValidHash(hash) {
 		return nil, errors.New("yandex: invalid hash")
 	}
-	return json.Marshal(map[string]any{"hash": hash})
+	out := map[string]any{"hash": hash}
+	if profile := strings.TrimSpace(q.Get("utls_profile")); profile != "" {
+		out["utls_profile"] = profile
+	}
+	return json.Marshal(out)
 }
 
 func encodeURL(raw json.RawMessage, q url.Values) error {
@@ -26,6 +31,9 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if cfg.Hash != "" {
 		q.Set("hash", cfg.Hash)
+	}
+	if cfg.UTLSProfile != "" {
+		q.Set("utls_profile", cfg.UTLSProfile)
 	}
 	return nil
 }

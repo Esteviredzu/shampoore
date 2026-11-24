@@ -6,7 +6,7 @@ const state = {
 const fleet = {
   active: 'dashboard',
   nodes: [], routes: [], users: [], settings: null, caddy: null,
-  domainDraft: null, livePolling: false,
+  domainDraft: null, livePolling: false, livePaused: false,
   version: '', update: null, updateChecking: false, updating: false,
   loading: { dashboard: false, nodes: false, routes: false, users: false, configs: false }
 };
@@ -15,8 +15,8 @@ const fleet = {
    is open or while focus is inside a form control. */
 let modalOpen = false;
 
-const SYSTEM_STATS_INTERVAL = 5000;
-const FLEET_POLL_INTERVAL = 15000;
+const LIVE_POLL_INTERVAL = 3000;
+const RELATIVE_TIME_INTERVAL = 1000;
 
 function isEditableFocus() {
   const el = document.activeElement;
@@ -30,7 +30,48 @@ function canAutoRefresh() {
   // modalOpen can be reset asynchronously by the close animation; also check
   // that the modal root is really visible so the flag can never get stuck.
   const modalVisible = modalOpen && !(root && root.classList.contains('hidden'));
-  return !modalVisible && !document.hidden && !isEditableFocus();
+  return !modalVisible && !document.hidden && !isEditableFocus() && !fleet.livePaused;
+}
+
+function restoreLiveState() {
+  fleet.livePaused = localStorage.getItem('shampoore_live') === 'off';
+  updateLiveUI();
+}
+
+function updateLiveUI() {
+  const btn = document.getElementById('btn-live');
+  const label = document.getElementById('live-label');
+  const icon = document.getElementById('live-icon');
+  if (!btn) return;
+  btn.classList.toggle('is-paused', fleet.livePaused);
+  btn.setAttribute('aria-pressed', fleet.livePaused ? 'false' : 'true');
+  btn.title = t(fleet.livePaused ? 'live.resume' : 'live.pause');
+  btn.dataset.langTitle = fleet.livePaused ? 'live.resume' : 'live.pause';
+  if (label) {
+    label.dataset.lang = fleet.livePaused ? 'live.paused' : 'live.on';
+    label.textContent = t(fleet.livePaused ? 'live.paused' : 'live.on');
+  }
+  if (icon) icon.textContent = fleet.livePaused ? 'play_arrow' : 'pause';
+}
+
+function toggleLive() {
+  fleet.livePaused = !fleet.livePaused;
+  localStorage.setItem('shampoore_live', fleet.livePaused ? 'off' : 'on');
+  updateLiveUI();
+  if (!fleet.livePaused) pollFleetLive();
+}
+
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (!sidebar) return;
+  const open = sidebar.classList.toggle('open');
+  if (backdrop) backdrop.classList.toggle('hidden', !open);
+}
+
+function closeSidebar() {
+  document.getElementById('sidebar')?.classList.remove('open');
+  document.getElementById('sidebar-backdrop')?.classList.add('hidden');
 }
 
 (async function boot() {
@@ -58,27 +99,28 @@ function canAutoRefresh() {
   });
 
   document.getElementById('btn-add').addEventListener('click', openAddDialog);
-  document.getElementById('btn-rules').addEventListener('click', openRulesDialog);
   document.getElementById('btn-refresh').addEventListener('click', () => load());
-  document.getElementById('btn-backup').addEventListener('click', () => {
-    window.location.href = '/api/backup';
-  });
   document.getElementById('btn-logout').addEventListener('click', logout);
+  document.getElementById('btn-live').addEventListener('click', toggleLive);
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (backdrop) backdrop.addEventListener('click', closeSidebar);
+  restoreLiveState();
   document.getElementById('search').addEventListener('input', e => { state.search = e.target.value.toLowerCase(); render(); });
   const menu = document.getElementById('btn-menu');
-  if (menu) menu.addEventListener('click', () => document.getElementById('sidebar').classList.toggle('open'));
+  if (menu) menu.addEventListener('click', toggleSidebar);
   setupFleetTabs();
 
   await load();
-  await loadSystemStats();
   await loadPanelVersion();
   await loadPanel('dashboard');
   checkForUpdates({ silent: true }).catch(() => {});
-  // No periodic full re-render: data is refreshed on load, on tab switch,
-  // after user actions and via the manual refresh buttons. Only light polls
-  // that update isolated status/traffic widgets are kept.
-  setInterval(() => { if (canAutoRefresh()) loadSystemStats(); }, SYSTEM_STATS_INTERVAL);
-  setInterval(pollFleetLive, FLEET_POLL_INTERVAL);
+  // Live mode is on by default: the first poll starts right after the initial
+  // render and then repeats every few seconds. A separate one-second timer
+  // keeps the relative "Updated" labels fresh even between polls.
+  pollFleetLive();
+  setInterval(pollFleetLive, LIVE_POLL_INTERVAL);
+  setInterval(refreshRelativeTimes, RELATIVE_TIME_INTERVAL);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollFleetLive(); });
 })();
 
 function formatBytes(bytes) {
@@ -88,53 +130,6 @@ function formatBytes(bytes) {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   const val = bytes / Math.pow(k, i);
   return (val >= 10 ? Math.round(val) : parseFloat(val.toFixed(1))) + sizes[i];
-}
-
-function getColorClass(percent) {
-  if (percent < 60) return 'good';
-  if (percent < 85) return 'warn';
-  return 'danger';
-}
-
-async function loadSystemStats() {
-  try {
-    const s = await api('/api/system/stats');
-    const el = document.getElementById('sys-stats');
-    
-    const cpuPercent = Math.round(s.cpu_usage);
-    const cpuClass = getColorClass(cpuPercent);
-
-    const ramPercent = Math.round((s.mem_used / s.mem_total) * 100);
-    const ramClass = getColorClass(ramPercent);
-    const ramUsedStr = formatBytes(s.mem_used);
-    const ramTotalStr = formatBytes(s.mem_total);
-
-    const d = Math.floor(s.uptime / 86400);
-    const h = Math.floor((s.uptime % 86400) / 3600);
-    const m = Math.floor((s.uptime % 3600) / 60);
-    let upStr = '';
-    if (d > 0) upStr += `${d}d `;
-    if (h > 0 || d > 0) upStr += `${h}h `;
-    upStr += `${m}m`;
-
-    el.innerHTML = `
-      <span class="stat-item cpu ${cpuClass}" title="${esc(t('stats.cpu'))}: ${cpuPercent}%">
-        <span class="material-symbols-rounded">speed</span>
-        <span class="stat-value">${cpuPercent}%</span>
-      </span>
-      <span class="stat-item ram ${ramClass}" title="${esc(t('stats.ram'))}: ${ramPercent}% (${ramUsedStr} / ${ramTotalStr})">
-        <span class="material-symbols-rounded">memory</span>
-        <span class="stat-value">${ramUsedStr}</span> <span class="stat-total">/ ${ramTotalStr}</span>
-      </span>
-      <span class="stat-item uptime" title="${esc(t('stats.uptime'))}">
-        <span class="material-symbols-rounded">schedule</span>
-        <span class="stat-value">${upStr}</span>
-      </span>
-    `;
-    el.style.display = 'flex';
-  } catch (e) {
-    document.getElementById('sys-stats').style.display = 'none';
-  }
 }
 
 async function loadPanelVersion() {
@@ -288,6 +283,7 @@ window.changeLanguage = async (lang) => {
   await loadLang(lang);
   applyLang();
   setUpdateBadge(fleet.update);
+  updateLiveUI();
   // Re-render the active view right away from cached data, so switching the
   // language does not wait for any background refresh.
   rerenderActivePanel();
@@ -301,6 +297,9 @@ window.changeSort = (sort) => {
 
 async function api(path, opts = {}) {
   opts.credentials = 'same-origin';
+  // Always revalidate: the panel counters and node telemetry change every
+  // heartbeat, and a cached /api/nodes answer freezes the Live widgets.
+  if (opts.cache === undefined) opts.cache = 'no-store';
   opts.headers = Object.assign({ 'Accept': 'application/json' }, opts.headers || {});
   const res = await fetch(path, opts);
   if (res.status === 401) {
@@ -532,13 +531,6 @@ function openConfigDialog(editName = null, initialData = null) {
     }
 
     const schema = getSchema(selectedKind);
-    
-    // Custom Select HTML
-    let optionsHtml = state.templates.map(t => `
-      <div class="custom-select-option ${t.kind === selectedKind ? 'selected' : ''}" onclick="window.selectTransport('${t.kind}')">
-        ${esc(t.display_name)}
-      </div>
-    `).join('');
 
     let html = `
       <div class="form-group">
@@ -548,15 +540,9 @@ function openConfigDialog(editName = null, initialData = null) {
         </div>
         <div class="field">
           <label>${t('dialog.type')}</label>
-          <div class="custom-select-wrapper" id="transport-select-wrapper">
-            <div class="custom-select-trigger" onclick="document.getElementById('transport-options').classList.toggle('hidden')">
-              <span id="current-transport-label">${esc(schema ? schema.display_name : selectedKind)}</span>
-              <span class="material-symbols-rounded">arrow_drop_down</span>
-            </div>
-            <div class="custom-select-options hidden" id="transport-options">
-              ${optionsHtml}
-            </div>
-          </div>
+          <select id="f-type" onchange="window.selectTransport(this.value)">
+            ${state.templates.map(item => `<option value="${escAttr(item.kind)}" ${item.kind === selectedKind ? 'selected' : ''}>${esc(item.display_name)}</option>`).join('')}
+          </select>
         </div>
         <div class="field">
           <label>${t('dialog.encryption')}</label>
@@ -605,21 +591,19 @@ function openConfigDialog(editName = null, initialData = null) {
         </div>
       `;
     } else if (schema && schema.fields) {
+      const basicFields = schema.fields.filter(f => !f.advanced);
+      const advancedFields = schema.fields.filter(f => f.advanced);
       html += `
         <div class="field">
           <label>${t('dialog.transportParams')}</label>
-          ${schema.fields.map(f => `
-            <div class="field" style="margin-bottom:8px;">
-              <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
-              <input type="${f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text'}" 
-                     class="input" 
-                     style="height:40px;" 
-                     value="${escAttr(String(fieldValues[f.key] || ''))}"
-                     placeholder="${escAttr(f.placeholder || '')}"
-                     oninput="window.updateField('${escAttr(f.key)}', this.value)">
-              ${f.hint ? `<span class="hint" style="font-size:11px; margin-top:4px;">${esc(f.hint)}</span>` : ''}
-            </div>
-          `).join('')}
+          ${basicFields.map(renderField).join('')}
+          ${advancedFields.length ? `
+            <details style="margin-top:8px;">
+              <summary style="cursor:pointer; font-weight:500;">${t('dialog.advancedOptions')}</summary>
+              <div style="margin-top:8px;">
+                ${advancedFields.map(renderField).join('')}
+              </div>
+            </details>` : ''}
         </div>
       `;
     }
@@ -648,18 +632,61 @@ function openConfigDialog(editName = null, initialData = null) {
     }
   }
 
+  function renderField(f) {
+    const value = String(fieldValues[f.key] ?? '');
+    const hasOptions = Array.isArray(f.options) && f.options.length > 0;
+    const control = hasOptions
+      ? `<select class="input" style="height:40px;" onchange="window.updateField('${escAttr(f.key)}', this.value)">
+           <option value="">${escAttr(f.placeholder || 'default')}</option>
+           ${f.options.map(opt => `<option value="${escAttr(opt)}" ${value === opt ? 'selected' : ''}>${esc(opt)}</option>`).join('')}
+         </select>`
+      : `<input type="${f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text'}"
+                class="input"
+                style="height:40px;"
+                value="${escAttr(value)}"
+                placeholder="${escAttr(f.placeholder || '')}"
+                oninput="window.updateField('${escAttr(f.key)}', this.value)">`;
+    return `
+      <div class="field" style="margin-bottom:8px;">
+        <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
+        ${control}
+        ${f.hint ? `<span class="hint" style="font-size:11px; margin-top:4px;">${esc(f.hint)}</span>` : ''}
+      </div>
+    `;
+  }
+
   function renderSubflowFields(idx, subflow) {
     const subSchema = getSchema(subflow.type);
     if (!subSchema) return '';
-    return subSchema.fields.map(f => `
-      <div class="field" style="margin-bottom:8px;">
-        <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
-        <input type="text" class="input" style="height:40px;" 
-               value="${escAttr(String((subflow.transport && subflow.transport[f.key]) || ''))}"
-               placeholder="${escAttr(f.placeholder || '')}"
-               oninput="window.updateSubflowField(${idx}, '${escAttr(f.key)}', this.value)">
-      </div>
-    `).join('');
+    const fields = subSchema.fields || [];
+    const transport = subflow.transport || {};
+    const render = (f) => {
+      const value = String(transport[f.key] ?? '');
+      const hasOptions = Array.isArray(f.options) && f.options.length > 0;
+      const control = hasOptions
+        ? `<select class="input" style="height:40px;" onchange="window.updateSubflowField(${idx}, '${escAttr(f.key)}', this.value)">
+             <option value="">${escAttr(f.placeholder || 'default')}</option>
+             ${f.options.map(opt => `<option value="${escAttr(opt)}" ${value === opt ? 'selected' : ''}>${esc(opt)}</option>`).join('')}
+           </select>`
+        : `<input type="text" class="input" style="height:40px;"
+                  value="${escAttr(value)}"
+                  placeholder="${escAttr(f.placeholder || '')}"
+                  oninput="window.updateSubflowField(${idx}, '${escAttr(f.key)}', this.value)">`;
+      return `
+        <div class="field" style="margin-bottom:8px;">
+          <label>${esc(f.label)} ${f.required ? '*' : ''}</label>
+          ${control}
+          ${f.hint ? `<span class="hint" style="font-size:11px; margin-top:4px;">${esc(f.hint)}</span>` : ''}
+        </div>
+      `;
+    };
+    const basicFields = fields.filter(f => !f.advanced);
+    const advancedFields = fields.filter(f => f.advanced);
+    return basicFields.map(render).join('') + (advancedFields.length ? `
+      <details style="margin-top:8px;">
+        <summary style="cursor:pointer; font-weight:500;">${t('dialog.advancedOptions')}</summary>
+        <div style="margin-top:8px;">${advancedFields.map(render).join('')}</div>
+      </details>` : '');
   }
 
   function renderKV(k, v, i) {
@@ -675,7 +702,6 @@ function openConfigDialog(editName = null, initialData = null) {
   window.selectTransport = (kind) => {
     selectedKind = kind;
     fieldValues = {}; // Reset fields
-    document.getElementById('transport-options').classList.add('hidden');
     renderBody();
   };
 
@@ -787,11 +813,21 @@ function openConfigDialog(editName = null, initialData = null) {
   renderBody();
 }
 
+let activeModalKeyHandler = null;
+let modalCloseTimer = null;
+
 function openModal({ title, body = '', actions = [], tabs = [] }) {
   const root = document.getElementById('modal-root');
+  if (modalCloseTimer) {
+    clearTimeout(modalCloseTimer);
+    modalCloseTimer = null;
+  }
   modalOpen = true;
   root.classList.remove('hidden');
-  
+  document.body.classList.add('modal-open');
+  root.setAttribute('role', 'dialog');
+  root.setAttribute('aria-modal', 'true');
+
   const tabsHTML = tabs.length ? `<div class="modal__tabs">${tabs.map((t,i) => `<button class="tab ${i===0?'active':''}" data-tab="${t.id}">${t.label}</button>`).join('')}</div>` : '';
   const actionsHTML = actions.map((a,i) => `<button class="btn btn--${a.kind}" data-act="${i}">${a.label}</button>`).join('');
 
@@ -799,7 +835,7 @@ function openModal({ title, body = '', actions = [], tabs = [] }) {
     <div class="modal">
       <div class="modal__header">
         <h2>${esc(title)}</h2>
-        <button class="icon-btn" onclick="closeModal()"><span class="material-symbols-rounded">close</span></button>
+        <button class="icon-btn" type="button" data-modal-close aria-label="${esc(t('actions.close'))}"><span class="material-symbols-rounded">close</span></button>
       </div>
       ${tabsHTML}
       <div class="modal__body">${body}</div>
@@ -813,17 +849,40 @@ function openModal({ title, body = '', actions = [], tabs = [] }) {
   }));
 
   root.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', actions[el.dataset.act].onClick));
-  requestAnimationFrame(() => root.classList.add('show'));
+  root.querySelectorAll('[data-modal-close]').forEach(el => el.addEventListener('click', closeModal));
+  root.onclick = event => { if (event.target === root) closeModal(); };
+  if (activeModalKeyHandler) document.removeEventListener('keydown', activeModalKeyHandler);
+  activeModalKeyHandler = event => {
+    if (event.key === 'Escape' && modalOpen) {
+      event.preventDefault();
+      closeModal();
+    }
+  };
+  document.addEventListener('keydown', activeModalKeyHandler);
+  requestAnimationFrame(() => {
+    root.classList.add('show');
+    const focusable = root.querySelector('.modal__body input, .modal__body select, .modal__body textarea, .modal__footer .btn--filled');
+    if (focusable) focusable.focus({ preventScroll: true });
+  });
 
-  const dialogObj = { setBody: h => root.querySelector('.modal__body').innerHTML = h, onTabChange: null };
+  const dialogObj = { setBody: h => root.querySelector('.modal__body').innerHTML = h, onTabChange: null, setFocus: id => document.getElementById(id)?.focus() };
   return dialogObj;
 }
 
 function closeModal() {
   const root = document.getElementById('modal-root');
   modalOpen = false;
+  document.body.classList.remove('modal-open');
   root.classList.remove('show');
-  setTimeout(() => { root.classList.add('hidden'); root.innerHTML = ''; }, 200);
+  root.removeAttribute('role');
+  root.removeAttribute('aria-modal');
+  root.onclick = null;
+  if (activeModalKeyHandler) {
+    document.removeEventListener('keydown', activeModalKeyHandler);
+    activeModalKeyHandler = null;
+  }
+  if (modalCloseTimer) clearTimeout(modalCloseTimer);
+  modalCloseTimer = setTimeout(() => { root.classList.add('hidden'); root.innerHTML = ''; modalCloseTimer = null; }, 200);
 }
 
 function toast(msg, type = 'info') {
@@ -841,325 +900,294 @@ async function copyToClipboard(text) {
     const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
   }
 }
-async function openRulesDialog() {
-  let rules = [];
-  let sources = [];
-  let exits = [];
-  const sourceByName = new Map();
+const geoState = { rules: [], sources: [], exits: [], loaded: false };
 
-  function syncSources(list) {
-    sources = list || [];
-    sourceByName.clear();
-    sources.forEach(src => sourceByName.set(src.name, src));
-  }
+function jsonArg(value) { return escAttr(JSON.stringify(value)); }
 
+async function loadGeoRules(silent = false) {
   try {
-    const [nextRules, nextSources] = await Promise.all([api('/api/rules'), api('/api/georules')]);
-    rules = nextRules || [];
-    syncSources(nextSources);
+    const [rules, sources, nodes] = await Promise.all([
+      api('/api/rules'), api('/api/georules'), api('/api/nodes')
+    ]);
+    geoState.rules = rules || [];
+    geoState.sources = sources || [];
+    geoState.exits = (nodes || []).filter(node => node.is_exit);
+    geoState.loaded = true;
+    renderGeoRules();
   } catch (e) {
-    toast(e.message, 'error');
+    if (!silent) toast(e.message, 'error');
   }
-  try {
-    const nextNodes = await api('/api/nodes');
-    exits = (nextNodes || []).filter(node => node.is_exit);
-  } catch {
-    exits = [];
-  }
+}
 
-  function geoMetaRow(icon, label, value) {
-    return `<span><span class="material-symbols-rounded">${icon}</span>${esc(label)}: ${esc(value)}</span>`;
-  }
+function geoSourceFor(name) {
+  return geoState.sources.find(source => source.name === name);
+}
 
-  function exitNodeChecks(selectedIDs, attrName, ruleName) {
-    if (!exits.length) {
-      return `<div class="hint">${esc(t('rules.noExitNodes'))}</div>`;
-    }
-    const selected = new Set((selectedIDs || []).map(Number));
-    const visibleSelected = exits.filter(node => selected.has(Number(node.id)));
-    const all = selected.size === 0 || visibleSelected.length === 0;
-    return `<div class="exit-node-grid">${exits.map(node => `
-      <label class="check-row">
-        <input type="checkbox" ${attrName}="${escAttr(node.id)}" ${ruleName ? `data-rule-name="${escAttr(ruleName)}"` : ''} ${all || selected.has(Number(node.id)) ? 'checked' : ''}>
-        <span>${esc(node.name)}</span>
-      </label>`).join('')}</div>`;
+function geoExitGrid(selectedIDs, ruleName) {
+  if (!geoState.exits.length) {
+    return `<div class="hint">${esc(t('rules.noExitNodes'))}</div>`;
   }
+  const selected = new Set((selectedIDs || []).map(Number));
+  const all = selected.size === 0;
+  const nameLiteral = JSON.stringify(ruleName || '');
+  return `<div class="exit-node-grid">${geoState.exits.map(node => `
+    <label class="check-row">
+      <input type="checkbox" data-rule-node="${escAttr(node.id)}" data-rule-name="${escAttr(ruleName || '')}"
+        ${all || selected.has(Number(node.id)) ? 'checked' : ''}
+        onchange="saveGeoRuleNodes(${escAttr(nameLiteral)}, this)">
+      <span>${esc(node.name)}</span>
+    </label>`).join('')}</div>`;
+}
 
-  function exitNodesBlock(selectedIDs, attrName, ruleName) {
-    return `<div class="geo-rule__nodes">
-      <div class="geo-rule__nodes-label">${esc(t('rules.exitNodes'))}</div>
-      ${exitNodeChecks(selectedIDs, attrName, ruleName)}
-      <span class="hint">${esc(t('rules.exitNodesHint'))}</span>
-    </div>`;
+function geoSourceMeta(source) {
+  const meta = [
+    ['link', t('rules.source'), geoSourceHost(source.url) || source.url],
+    ['schedule', t('rules.lastUpdated'), geoUpdatedLabel(source)],
+    ['autorenew', t('rules.interval'), geoIntervalLabel(source.update_interval_minutes)]
+  ].map(([icon, label, value]) => `<span><span class="material-symbols-rounded">${icon}</span>${esc(label)}: ${esc(value)}</span>`).join('');
+  const error = source.last_error
+    ? `<div class="card__warn"><span class="material-symbols-rounded">warning</span>${esc(source.last_error)}</div>` : '';
+  return `<div class="geo-rule__meta">${meta}</div>${error}`;
+}
+
+
+function renderGeoRules() {
+  const root = document.getElementById('georules-list');
+  if (!root) return;
+  if (!geoState.loaded) {
+    root.innerHTML = `<div class="empty"><span class="material-symbols-rounded">hourglass_top</span><p>${esc(t('rules.loading'))}</p></div>`;
+    return;
   }
-
-  function renderGeoSource(source) {
-    const meta = [
-      geoMetaRow('link', t('rules.source'), geoSourceHost(source.url) || source.url),
-      geoMetaRow('schedule', t('rules.lastUpdated'), geoUpdatedLabel(source)),
-      geoMetaRow('autorenew', t('rules.interval'), geoIntervalLabel(source.update_interval_minutes))
-    ].join('');
-    const error = source.last_error
-      ? `<div class="card__warn"><span class="material-symbols-rounded">warning</span>${esc(source.last_error)}</div>`
-      : '';
-    return `
-      <div class="geo-rule__meta">${meta}</div>
-      ${error}
-      <div class="geo-rule__actions">
-        <button class="btn btn--tonal btn--compact geo-rule__refresh" type="button" onclick="window.refreshGeoRule(${escAttr(JSON.stringify(source.name))})">
-          <span class="material-symbols-rounded">refresh</span>${esc(t('rules.refreshNow'))}
-        </button>
-      </div>`;
+  if (!geoState.rules.length) {
+    root.innerHTML = emptyState('public', t('rules.empty'), t('rules.addManual'), 'openAddGeoRuleModal()');
+    return;
   }
-
-  function renderRulesBody() {
-    let html = `
-      <div class="geo-toolbar">
-        <span class="hint">${esc(t('rules.hint'))}</span>
-        <div class="geo-toolbar__actions">
-          <button class="btn btn--tonal btn--compact" type="button" onclick="window.openAddGeoRuleByURLDialog()">
-            <span class="material-symbols-rounded">link</span>${esc(t('rules.addByUrl'))}
-          </button>
-          <button class="btn btn--filled btn--compact" type="button" onclick="window.openAddRuleDialog()">
-            <span class="material-symbols-rounded">add</span>${esc(t('rules.addManual'))}
+  root.innerHTML = geoState.rules.map(rule => {
+    const source = geoSourceFor(rule.name);
+    const nameArg = jsonArg(rule.name);
+    return `<article class="geo-rule">
+      <div class="geo-rule__main">
+        <div>
+          <div class="geo-rule__name">${esc(rule.name)}</div>
+          <div class="hint">${esc(t('rules.cidrCount').replace('{count}', (rule.cidrs || []).length))}</div>
+        </div>
+        <div class="geo-rule__actions">
+          <label class="switch">
+            <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="toggleGeoRule(${nameArg}, this.checked)">
+            <span class="slider"></span>
+          </label>
+          ${source ? `<button class="btn btn--tonal btn--compact" type="button" onclick="refreshGeoRuleSource(${nameArg})">
+            <span class="material-symbols-rounded">refresh</span>${esc(t('rules.refreshNow'))}</button>` : ''}
+          <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="deleteGeoRule(${nameArg})">
+            <span class="material-symbols-rounded">delete</span>
           </button>
         </div>
       </div>
-      <div class="geo-list">`;
+      <div class="geo-rule__nodes">
+        <div class="geo-rule__nodes-label">${esc(t('rules.exitNodes'))}</div>
+        ${geoExitGrid(rule.exit_node_ids || [], rule.name)}
+        <span class="hint">${esc(t('rules.exitNodesHint'))}</span>
+      </div>
+      ${source ? geoSourceMeta(source) : `<div class="hint">${esc(t('rules.manualHint'))}</div>`}
+    </article>`;
+  }).join('');
+}
 
-    if (!rules.length) {
-      html += `<div class="empty"><span class="material-symbols-rounded">public</span><p>${esc(t('rules.empty'))}</p></div>`;
-    } else {
-      rules.forEach(rule => {
-        const nameArg = escAttr(JSON.stringify(rule.name));
-        const source = sourceByName.get(rule.name);
-        html += `
-          <div class="geo-rule">
-            <div class="geo-rule__main">
-              <div>
-                <div class="geo-rule__name">${esc(rule.name)}</div>
-                <div class="hint">${esc(t('rules.cidrCount').replace('{count}', (rule.cidrs || []).length))}</div>
-              </div>
-              <div class="geo-rule__actions">
-                <label class="switch">
-                  <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="window.toggleRule(${nameArg}, this.checked)">
-                  <span class="slider"></span>
-                </label>
-                <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="window.delRule(${nameArg})">
-                  <span class="material-symbols-rounded">delete</span>
-                </button>
-              </div>
-            </div>
-            ${exitNodesBlock(rule.exit_node_ids || [], 'data-rule-node', rule.name)}
-            ${source ? renderGeoSource(source) : ''}
-          </div>`;
-      });
-    }
-    html += '</div>';
-    dialog.setBody(html);
-    bindGeoRuleNodeChecks();
+async function saveGeoRuleNodes(name, checkbox) {
+  if (!name) return;
+  const card = checkbox.closest('.geo-rule');
+  const checks = card ? Array.from(card.querySelectorAll('input[data-rule-node]')) : [checkbox];
+  const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.ruleNode));
+  if (!selected.length) {
+    checkbox.checked = true;
+    toast(t('rules.exitNodesRequired'), 'error');
+    return;
   }
-
-  const dialog = openModal({
-    title: t('rules.title'),
-    actions: [
-      { label: t('rules.apply'), kind: 'filled', onClick: async () => {
-          try {
-            const res = await api('/api/rules/apply', { method: 'POST' });
-            toast(res.restarted ? t('rules.applied') : t('rules.appliedOffline'));
-            closeModal();
-          } catch (e) { toast(e.message, 'error'); }
-        }
-      },
-      { label: t('actions.close'), kind: 'text', onClick: closeModal }
-    ]
-  });
-
-  function bindGeoRuleNodeChecks() {
-    document.querySelectorAll('.modal__body input[data-rule-node]').forEach(cb => {
-      cb.addEventListener('change', () => saveGeoRuleNodes(cb.dataset.ruleName, cb));
+  const payload = selected.length === geoState.exits.length ? [] : selected;
+  try {
+    await api(`/api/georules/${encodeURIComponent(name)}/nodes`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exit_node_ids: payload })
     });
+    const rule = geoState.rules.find(item => item.name === name);
+    if (rule) rule.exit_node_ids = payload;
+    toast(t('rules.exitNodesSaved'), 'success');
+  } catch (e) {
+    checkbox.checked = !checkbox.checked;
+    toast(e.message, 'error');
   }
+}
 
-  async function saveGeoRuleNodes(name, checkbox) {
-    if (!name) return;
-    const card = checkbox.closest('.geo-rule');
-    const checks = card ? Array.from(card.querySelectorAll('input[data-rule-node]')) : [checkbox];
-    const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.ruleNode));
+async function toggleGeoRule(name, enabled) {
+  try {
+    await api(`/api/rules/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
+    toast(enabled ? t('rules.enabledToast') : t('rules.disabledToast'));
+    await loadGeoRules(true);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteGeoRule(name) {
+  if (!confirm(t('rules.confirmDelete').replace('{name}', name))) return;
+  try {
+    await api(`/api/rules/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(t('rules.deleted'));
+    await loadGeoRules(true);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function refreshGeoRuleSource(name) {
+  try {
+    await api(`/api/georules/${encodeURIComponent(name)}/refresh`, { method: 'POST' });
+    toast(t('rules.refreshed'), 'success');
+    await loadGeoRules(true);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function applyGeoRules() {
+  try {
+    const res = await api('/api/rules/apply', { method: 'POST' });
+    toast(res.restarted ? t('rules.applied') : t('rules.appliedOffline'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function bindDraftExitChecks(onChange) {
+  const root = document.querySelector('.modal__body');
+  if (!root) return;
+  const checks = Array.from(root.querySelectorAll('input[data-draft-node]'));
+  checks.forEach(cb => cb.addEventListener('change', () => {
+    const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.draftNode));
     if (!selected.length) {
-      checkbox.checked = true;
+      cb.checked = true;
       toast(t('rules.exitNodesRequired'), 'error');
       return;
     }
-    const payload = selected.length === exits.length ? [] : selected;
-    try {
-      await api(`/api/georules/${encodeURIComponent(name)}/nodes`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exit_node_ids: payload })
-      });
-      const rule = rules.find(item => item.name === name);
-      if (rule) rule.exit_node_ids = payload;
-      toast(t('rules.exitNodesSaved'), 'success');
-    } catch (e) {
-      checkbox.checked = !checkbox.checked;
-      toast(e.message, 'error');
-    }
-  }
-
-  async function reloadRules() {
-    try {
-      const [nextRules, nextSources] = await Promise.all([api('/api/rules'), api('/api/georules')]);
-      rules = nextRules || [];
-      syncSources(nextSources);
-    } catch (e) { toast(e.message, 'error'); }
-    try {
-      const nextNodes = await api('/api/nodes');
-      exits = (nextNodes || []).filter(node => node.is_exit);
-    } catch {
-      exits = [];
-    }
-    renderRulesBody();
-  }
-
-  window.toggleRule = async (name, enabled) => {
-    try {
-      await api(`/api/rules/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
-      toast(enabled ? t('rules.enabledToast') : t('rules.disabledToast'));
-      await reloadRules();
-    } catch (e) { toast(e.message, 'error'); }
-  };
-
-  window.delRule = async (name) => {
-    if (!confirm(t('rules.confirmDelete').replace('{name}', name))) return;
-    try {
-      await api(`/api/rules/${encodeURIComponent(name)}`, { method: 'DELETE' });
-      toast(t('rules.deleted'));
-      await reloadRules();
-    } catch (e) { toast(e.message, 'error'); }
-  };
-
-  window.refreshGeoRule = async (name) => {
-    try {
-      await api(`/api/georules/${encodeURIComponent(name)}/refresh`, { method: 'POST' });
-      toast(t('rules.refreshed'), 'success');
-      await reloadRules();
-    } catch (e) { toast(e.message, 'error'); }
-  };
-
-  window.openAddRuleDialog = () => {
-    let rName = '';
-    let rCidrs = '';
-    let exitIDs = [];
-    const addDlg = openModal({
-      title: t('rules.newTitle'),
-      actions: [
-        { label: t('actions.cancel'), kind: 'text', onClick: openRulesDialog },
-        { label: t('actions.create'), kind: 'filled', onClick: async () => {
-            if (!rName.trim()) return toast(t('rules.nameRequired'), 'error');
-            const cidrs = rCidrs.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-            try {
-              await api('/api/rules', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: rName, cidrs, exit_node_ids: exitIDs })
-              });
-              toast(t('rules.created'), 'success');
-              openRulesDialog();
-            } catch (e) { toast(e.message, 'error'); }
-          }
-        }
-      ]
-    });
-    addDlg.setBody(`
-      <div class="form-group">
-        <div class="field">
-          <label>${esc(t('rules.name'))}</label>
-          <input type="text" id="r-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(rName)}">
-        </div>
-        <div class="field">
-          <label>${esc(t('rules.cidrs'))}</label>
-          <textarea id="r-cidrs" placeholder="${escAttr(t('rules.cidrsPlaceholder'))}">${esc(rCidrs)}</textarea>
-        </div>
-        ${exitNodesBlock(exitIDs, 'data-draft-node')}
-      </div>
-    `);
-    document.getElementById('r-name').addEventListener('input', e => { rName = e.target.value; });
-    document.getElementById('r-cidrs').addEventListener('input', e => { rCidrs = e.target.value; });
-    bindDraftExitChecks(value => { exitIDs = value; });
-  };
-
-  window.openAddGeoRuleByURLDialog = () => {
-    let name = '';
-    let url = '';
-    let interval = 0;
-    let exitIDs = [];
-    const importDlg = openModal({
-      title: t('rules.importTitle'),
-      actions: [
-        { label: t('actions.cancel'), kind: 'text', onClick: openRulesDialog },
-        { label: t('rules.import'), kind: 'filled', onClick: async () => {
-            if (!name.trim()) return toast(t('rules.nameRequired'), 'error');
-            if (!url.trim()) return toast(t('rules.urlRequired'), 'error');
-            try {
-              const res = await api('/api/georules/import-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: name.trim(), url: url.trim(), update_interval_minutes: interval, exit_node_ids: exitIDs })
-              });
-              toast(t('rules.imported').replace('{count}', res.rules || 0), 'success');
-              openRulesDialog();
-            } catch (e) { toast(e.message, 'error'); }
-          }
-        }
-      ]
-    });
-    importDlg.setBody(`
-      <div class="form-group">
-        <div class="field">
-          <label>${esc(t('rules.name'))}</label>
-          <input type="text" id="gr-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(name)}">
-        </div>
-        <div class="field">
-          <label>${esc(t('rules.url'))}</label>
-          <input type="url" id="gr-url" placeholder="${escAttr(t('rules.urlPlaceholder'))}" value="${escAttr(url)}" spellcheck="false" autocomplete="off">
-          <span class="hint">${esc(t('rules.urlHint'))}</span>
-        </div>
-        <div class="field">
-          <label>${esc(t('rules.updateInterval'))}</label>
-          <select id="gr-interval">
-            <option value="0" selected>${esc(t('rules.intervalManual'))}</option>
-            <option value="60">${esc(t('rules.intervalHourly'))}</option>
-            <option value="360">${esc(t('rules.interval6h'))}</option>
-            <option value="1440">${esc(t('rules.interval24h'))}</option>
-          </select>
-        </div>
-        ${exitNodesBlock(exitIDs, 'data-draft-node')}
-      </div>
-    `);
-    document.getElementById('gr-name').addEventListener('input', e => { name = e.target.value; });
-    document.getElementById('gr-url').addEventListener('input', e => { url = e.target.value; });
-    document.getElementById('gr-interval').addEventListener('change', e => { interval = Number(e.target.value) || 0; });
-    bindDraftExitChecks(value => { exitIDs = value; });
-  };
-
-  function bindDraftExitChecks(onChange) {
-    const root = document.querySelector('.modal__body');
-    if (!root) return;
-    const checks = Array.from(root.querySelectorAll('input[data-draft-node]'));
-    checks.forEach(cb => cb.addEventListener('change', () => {
-      const selected = checks.filter(item => item.checked).map(item => Number(item.dataset.draftNode));
-      if (!selected.length) {
-        cb.checked = true;
-        toast(t('rules.exitNodesRequired'), 'error');
-        return;
-      }
-      onChange(selected.length === exits.length ? [] : selected);
-    }));
-  }
-
-  renderRulesBody();
+    onChange(selected.length === geoState.exits.length ? [] : selected);
+  }));
 }
+
+function draftExitGrid(exitIDs) {
+  if (!geoState.exits.length) return `<div class="hint">${esc(t('rules.noExitNodes'))}</div>`;
+  const selected = new Set((exitIDs || []).map(Number));
+  const all = selected.size === 0;
+  return `<div class="exit-node-grid">${geoState.exits.map(node => `
+    <label class="check-row">
+      <input type="checkbox" data-draft-node="${escAttr(node.id)}" ${all || selected.has(Number(node.id)) ? 'checked' : ''}>
+      <span>${esc(node.name)}</span>
+    </label>`).join('')}</div>`;
+}
+
+function openAddGeoRuleModal() {
+  let name = '';
+  let cidrs = '';
+  let exitIDs = [];
+  const dialog = openModal({
+    title: t('rules.newTitle'),
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: t('actions.create'), kind: 'filled', onClick: async () => {
+          if (!name.trim()) return toast(t('rules.nameRequired'), 'error');
+          try {
+            await api('/api/rules', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: name.trim(),
+                cidrs: cidrs.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+                exit_node_ids: exitIDs
+              })
+            });
+            toast(t('rules.created'), 'success');
+            closeModal();
+            await loadGeoRules(true);
+          } catch (e) { toast(e.message, 'error'); }
+        }
+      }
+    ]
+  });
+  dialog.setBody(`
+    <div class="form-group">
+      <div class="field">
+        <label>${esc(t('rules.name'))}</label>
+        <input type="text" id="r-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(name)}">
+      </div>
+      <div class="field">
+        <label>${esc(t('rules.cidrs'))}</label>
+        <textarea id="r-cidrs" placeholder="${escAttr(t('rules.cidrsPlaceholder'))}">${esc(cidrs)}</textarea>
+      </div>
+      <div class="field">
+        <label>${esc(t('rules.exitNodes'))}</label>
+        ${draftExitGrid(exitIDs)}
+        <span class="hint">${esc(t('rules.exitNodesHint'))}</span>
+      </div>
+    </div>`);
+  document.getElementById('r-name').addEventListener('input', e => { name = e.target.value; });
+  document.getElementById('r-cidrs').addEventListener('input', e => { cidrs = e.target.value; });
+  bindDraftExitChecks(value => { exitIDs = value; });
+}
+
+function openImportGeoRuleModal() {
+  let name = '';
+  let url = '';
+  let interval = 0;
+  let exitIDs = [];
+  const dialog = openModal({
+    title: t('rules.importTitle'),
+    actions: [
+      { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
+      { label: t('rules.import'), kind: 'filled', onClick: async () => {
+          if (!name.trim()) return toast(t('rules.nameRequired'), 'error');
+          if (!url.trim()) return toast(t('rules.urlRequired'), 'error');
+          try {
+            const res = await api('/api/georules/import-url', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: name.trim(), url: url.trim(),
+                update_interval_minutes: interval, exit_node_ids: exitIDs
+              })
+            });
+            toast(t('rules.imported').replace('{count}', res.rules || 0), 'success');
+            closeModal();
+            await loadGeoRules(true);
+          } catch (e) { toast(e.message, 'error'); }
+        }
+      }
+    ]
+  });
+  dialog.setBody(`
+    <div class="form-group">
+      <div class="field">
+        <label>${esc(t('rules.name'))}</label>
+        <input type="text" id="gr-name" placeholder="${escAttr(t('rules.namePlaceholder'))}" value="${escAttr(name)}">
+      </div>
+      <div class="field">
+        <label>${esc(t('rules.url'))}</label>
+        <input type="url" id="gr-url" placeholder="${escAttr(t('rules.urlPlaceholder'))}" value="${escAttr(url)}" spellcheck="false" autocomplete="off">
+        <span class="hint">${esc(t('rules.urlHint'))}</span>
+      </div>
+      <div class="field">
+        <label>${esc(t('rules.updateInterval'))}</label>
+        <select id="gr-interval">
+          <option value="0" selected>${esc(t('rules.intervalManual'))}</option>
+          <option value="60">${esc(t('rules.intervalHourly'))}</option>
+          <option value="360">${esc(t('rules.interval6h'))}</option>
+          <option value="1440">${esc(t('rules.interval24h'))}</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>${esc(t('rules.exitNodes'))}</label>
+        ${draftExitGrid(exitIDs)}
+        <span class="hint">${esc(t('rules.exitNodesHint'))}</span>
+      </div>
+    </div>`);
+  document.getElementById('gr-name').addEventListener('input', e => { name = e.target.value; });
+  document.getElementById('gr-url').addEventListener('input', e => { url = e.target.value; });
+  document.getElementById('gr-interval').addEventListener('change', e => { interval = Number(e.target.value) || 0; });
+  bindDraftExitChecks(value => { exitIDs = value; });
+}
+
+
 
 function geoIntervalLabel(minutes) {
   const value = Number(minutes) || 0;
@@ -1317,6 +1345,7 @@ const PANEL_META = {
   nodes: { title: 'nodes.title', subtitle: 'nodes.subtitle' },
   routes: { title: 'routes.title', subtitle: 'routes.subtitle' },
   users: { title: 'users.title', subtitle: 'users.subtitle' },
+  georules: { title: 'rules.title', subtitle: 'rules.subtitle' },
   configs: { title: 'config.title', subtitle: 'config.subtitle' }
 };
 
@@ -1326,12 +1355,16 @@ function setupFleetTabs() {
   });
   const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
   bind('btn-dashboard-refresh', () => loadPanel('dashboard'));
-  bind('btn-refresh-nodes', () => loadPanel('nodes'));
   bind('btn-refresh-routes', () => loadPanel('routes'));
   bind('btn-refresh-users', () => loadPanel('users'));
+  bind('btn-refresh-georules', () => loadPanel('georules', false, true));
+  bind('btn-redeploy-all', fleetRedeployAll);
+  bind('btn-apply-georules', applyGeoRules);
+  bind('btn-add-georule', openAddGeoRuleModal);
+  bind('btn-add-georule-url', openImportGeoRuleModal);
   bind('btn-add-node', () => openNodeModal(null, 'relay'));
   bind('btn-add-route', () => fleetAddRoute());
-  bind('btn-add-user', () => openUserModal());
+  bind('btn-add-user', () => openUserModal(null));
   bind('btn-check-updates', onUpdateButton);
 }
 
@@ -1349,7 +1382,7 @@ function switchPanel(name) {
   const subtitle = document.getElementById('page-subtitle');
   if (title) { title.dataset.lang = meta.title; title.textContent = t(meta.title); }
   if (subtitle) { subtitle.dataset.lang = meta.subtitle; subtitle.textContent = t(meta.subtitle); }
-  document.getElementById('sidebar')?.classList.remove('open');
+  closeSidebar();
   if (name === 'configs') load();
   else loadPanel(name);
 }
@@ -1395,6 +1428,8 @@ async function loadPanel(name, silent = false, force = false) {
       fleet.nodes = nodes || [];
       fleet.settings = settings;
       renderUsers();
+    } else if (name === 'georules') {
+      await loadGeoRules(silent);
     }
     applyLang();
   } catch (e) {
@@ -1412,6 +1447,7 @@ function rerenderActivePanel() {
   else if (fleet.active === 'nodes') renderNodes();
   else if (fleet.active === 'routes') renderRoutes();
   else if (fleet.active === 'users') renderUsers();
+  else if (fleet.active === 'georules') renderGeoRules();
 }
 
 /* Fetch fresh data for the visible page and redraw it. Every create, update
@@ -1427,9 +1463,10 @@ async function loadActiveView() {
   await loadPanel(name, false, true);
 }
 
-/* Light background poll: only node statuses (Servers, Dashboard) and user
-   traffic (Users) are refreshed, and only the affected chips/cells are
-   touched. Lists and forms are never rebuilt here. */
+/* Smart background poll: statuses, CPU/RAM/Disk meters and user traffic are
+   refreshed every few seconds while the tab is visible and no form is being
+   edited. Both /api/nodes and /api/users are requested with cache: 'no-store'
+   so the browser can never serve a stale snapshot. */
 async function pollFleetLive() {
   if (!canAutoRefresh()) return;
   const active = fleet.active;
@@ -1437,15 +1474,24 @@ async function pollFleetLive() {
   if (fleet.loading[active] || fleet.livePolling) return;
   fleet.livePolling = true;
   try {
-    if (active === 'nodes' || active === 'dashboard') {
-      const nodes = (await api('/api/nodes')) || [];
-      if (fleet.active !== active || !canAutoRefresh()) return;
-      applyNodeLiveStatus(nodes);
-    } else {
-      const users = (await api('/api/users')) || [];
-      if (fleet.active !== 'users' || !canAutoRefresh()) return;
-      applyUserLiveStatus(users);
+    const [nodes, users] = await Promise.all([
+      api('/api/nodes', { cache: 'no-store' }),
+      api('/api/users', { cache: 'no-store' })
+    ]);
+    if (fleet.active !== active || !canAutoRefresh()) return;
+    const previousIds = (fleet.nodes || []).map(n => String(n.id)).sort().join(',');
+    const previousUserIds = (fleet.users || []).map(u => String(u.id)).sort().join(',');
+    applyNodeLiveStatus(nodes || []);
+    const nextIds = (fleet.nodes || []).map(n => String(n.id)).sort().join(',');
+    // A node added or removed elsewhere must appear without a manual refresh.
+    if (previousIds !== nextIds) {
+      if (active === 'nodes') renderNodes();
+      else if (active === 'dashboard') renderDashboard();
     }
+    applyUserLiveStatus(users || []);
+    const nextUserIds = (fleet.users || []).map(u => String(u.id)).sort().join(',');
+    if (previousUserIds !== nextUserIds && active === 'users') renderUsers();
+    if (active === 'dashboard') applyDashboardStats();
   } catch (e) {
     // Background refresh stays silent, the manual refresh button reports errors.
   } finally {
@@ -1453,16 +1499,114 @@ async function pollFleetLive() {
   }
 }
 
+/* Recompute the relative "Updated" labels once a second, so "just now" turns
+   into "1 min ago" even while no poll is in flight or Live is paused. */
+function refreshRelativeTimes() {
+  const nodes = fleet.nodes || [];
+  if (nodes.length) {
+    const byId = new Map(nodes.map(n => [String(n.id), n]));
+    document.querySelectorAll('[data-node-last-seen]').forEach(el => {
+      const node = byId.get(el.dataset.nodeLastSeen);
+      if (node) el.textContent = nodeLastSeenText(node);
+    });
+  }
+  refreshNodeTimes();
+}
+
+function clampPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(100, Math.round(n));
+}
+
+function percentOf(used, total) {
+  if (!total) return 0;
+  return clampPercent(used / total * 100);
+}
+
+function meterClass(percent) {
+  if (percent < 60) return 'good';
+  if (percent < 85) return 'warn';
+  return 'danger';
+}
+
+function metricPair(used, total) {
+  if (!total) return '—';
+  return `${formatBytes(used)} / ${formatBytes(total)}`;
+}
+
+function nodeMetricValues(node) {
+  const cpu = clampPercent(node.cpu_percent);
+  const ram = percentOf(node.mem_used_bytes, node.mem_total_bytes);
+  const disk = percentOf(node.disk_used_bytes, node.disk_total_bytes);
+  return {
+    cpu: { percent: cpu, value: cpu + '%' },
+    ram: { percent: ram, value: metricPair(node.mem_used_bytes, node.mem_total_bytes) },
+    disk: { percent: disk, value: metricPair(node.disk_used_bytes, node.disk_total_bytes) }
+  };
+}
+
+// Host telemetry is considered present once the agent has reported memory or
+// disk totals; CPU alone may legitimately be 0%.
+function nodeHasMetrics(node) {
+  return !!(node && (Number(node.mem_total_bytes) > 0 || Number(node.disk_total_bytes) > 0));
+}
+
+function nodeMetricsRows(node) {
+  const values = nodeMetricValues(node);
+  const row = (key, label) => `
+    <div class="metric" data-node-metric="${key}">
+      <span class="metric__label">${esc(label)}</span>
+      <span class="meter meter--${meterClass(values[key].percent)}"><span class="meter__fill" style="width:${values[key].percent}%"></span></span>
+      <span class="metric__value">${esc(values[key].value)}</span>
+    </div>`;
+  return `${row('cpu', t('nodes.metricsCpu'))}
+    ${row('ram', t('nodes.metricsRam'))}
+    ${row('disk', t('nodes.metricsDisk'))}`;
+}
+
+function nodeMetricsHTML(node) {
+  if (!nodeHasMetrics(node)) {
+    return `<div class="node-metrics node-metrics--empty" data-node-metrics="${escAttr(node.id)}"><span class="metric__placeholder">${esc(t('nodes.metricsPending'))}</span></div>`;
+  }
+  return `<div class="node-metrics" data-node-metrics="${escAttr(node.id)}">${nodeMetricsRows(node)}</div>`;
+}
+
+function nodeLastSeenText(node) {
+  if (!node || !node.last_seen) return t('nodes.neverSeen');
+  const rel = relativeTime(node.last_seen);
+  return rel ? t('nodes.lastSeen').replace('{time}', rel) : t('nodes.neverSeen');
+}
+
+/* Deployment/config-update time for the dashboard "Updated" column. The
+   heartbeat's last_seen is deliberately not used: it changes every 5s and
+   would keep the column stuck at "just now". */
+function nodeDeployedText(node) {
+  if (!node || !node.updated_at) return t('nodes.neverSeen');
+  return formatRelativeTime(node.updated_at) || t('nodes.neverSeen');
+}
+
+/* Keep every [data-time-iso] label fresh. The ISO value is synced from the
+   latest node snapshot so a deploy/config update is picked up by the poll. */
+function refreshNodeTimes() {
+  const byId = new Map((fleet.nodes || []).map(n => [String(n.id), n]));
+  document.querySelectorAll('[data-node-updated]').forEach(el => {
+    const node = byId.get(el.dataset.nodeUpdated);
+    if (node && node.updated_at) el.dataset.timeIso = node.updated_at;
+  });
+  document.querySelectorAll('[data-time-iso]').forEach(el => {
+    el.textContent = formatRelativeTime(el.dataset.timeIso) || t('nodes.neverSeen');
+  });
+}
+
 function applyNodeLiveStatus(nodes) {
   const byId = new Map((nodes || []).map(n => [String(n.id), n]));
-  fleet.nodes = (fleet.nodes || []).map(node => {
-    const live = byId.get(String(node.id));
-    if (!live) return node;
-    return Object.assign({}, node, {
-      status: live.status,
-      updated_at: live.updated_at,
-      last_error: live.last_error
-    });
+  const existing = new Map((fleet.nodes || []).map(n => [String(n.id), n]));
+  fleet.nodes = (nodes || []).map(live => {
+    const base = existing.get(String(live.id)) || {};
+    // The API returns the full node record (name, roles, transports, SSH host
+    // and telemetry), so a node created elsewhere is complete after a poll.
+    return Object.assign({}, base, live);
   });
   document.querySelectorAll('[data-node-status]').forEach(el => {
     const live = byId.get(el.dataset.nodeStatus);
@@ -1470,26 +1614,62 @@ function applyNodeLiveStatus(nodes) {
     el.className = `status-chip status-chip--${statusClass(live.status)}`;
     el.textContent = nodeStatusText(live);
   });
+  document.querySelectorAll('[data-node-last-seen]').forEach(el => {
+    const live = byId.get(el.dataset.nodeLastSeen);
+    if (!live) return;
+    el.textContent = nodeLastSeenText(live);
+  });
+  document.querySelectorAll('[data-node-metrics]').forEach(root => {
+    const live = byId.get(root.dataset.nodeMetrics);
+    if (!live || !nodeHasMetrics(live)) return;
+    // The first heartbeat with telemetry replaces the "no metrics yet"
+    // placeholder with real gauges; later heartbeats only move the bars.
+    if (!root.querySelector('.meter')) {
+      root.classList.remove('node-metrics--empty');
+      root.innerHTML = nodeMetricsRows(live);
+    }
+    const values = nodeMetricValues(live);
+    root.querySelectorAll('[data-node-metric]').forEach(el => {
+      const value = values[el.dataset.nodeMetric];
+      if (!value) return;
+      const meter = el.querySelector('.meter');
+      if (meter) {
+        meter.classList.remove('meter--good', 'meter--warn', 'meter--danger');
+        meter.classList.add('meter--' + meterClass(value.percent));
+      }
+      const fill = el.querySelector('.meter__fill');
+      if (fill) fill.style.width = value.percent + '%';
+      const valueEl = el.querySelector('.metric__value');
+      if (valueEl) valueEl.textContent = value.value;
+    });
+  });
+  refreshNodeTimes();
+}
+
+function userTrafficHTML(user) {
+  const used = userUsedBytes(user);
+  const limit = user.traffic_limit_bytes || 0;
+  const percent = limit > 0 ? percentOf(used, limit) : 0;
+  const label = limit > 0 ? `${formatBytes(used)} / ${formatBytes(limit)}` : formatBytes(used);
+  return `<div class="user-quota">
+    <div class="user-quota__line">
+      <span data-user-traffic-label>${esc(label)}</span>
+      ${limit > 0 ? `<span data-user-traffic-percent>${percent}%</span>` : ''}
+    </div>
+    <span class="meter meter--${limit > 0 ? meterClass(percent) : 'muted'}"><span class="meter__fill" data-user-traffic-bar style="width:${percent}%"></span></span>
+  </div>`;
 }
 
 function applyUserLiveStatus(users) {
-  const byId = new Map((users || []).map(u => [String(u.id), u]));
-  fleet.users = (fleet.users || []).map(user => {
-    const live = byId.get(String(user.id));
-    if (!live) return user;
-    return Object.assign({}, user, {
-      enabled: live.enabled,
-      expires_at: live.expires_at,
-      traffic_limit_bytes: live.traffic_limit_bytes,
-      used_upload_bytes: live.used_upload_bytes,
-      used_download_bytes: live.used_download_bytes
-    });
-  });
+  const existing = new Map((fleet.users || []).map(u => [String(u.id), u]));
+  fleet.users = (users || []).map(live => Object.assign({}, existing.get(String(live.id)) || {}, live));
 
   const statusEls = new Map();
   document.querySelectorAll('[data-user-status]').forEach(el => statusEls.set(el.dataset.userStatus, el));
   const trafficEls = new Map();
   document.querySelectorAll('[data-user-traffic]').forEach(el => trafficEls.set(el.dataset.userTraffic, el));
+  const expiryEls = new Map();
+  document.querySelectorAll('[data-user-expiry]').forEach(el => expiryEls.set(el.dataset.userExpiry, el));
 
   fleet.users.forEach(user => {
     const id = String(user.id);
@@ -1501,27 +1681,67 @@ function applyUserLiveStatus(users) {
       statusEl.textContent = active ? t('users.active') : t('users.inactive');
     }
 
+    const expiryEl = expiryEls.get(id);
+    if (expiryEl) expiryEl.textContent = formatExpiry(user.expires_at);
+
     const trafficEl = trafficEls.get(id);
-    if (trafficEl) {
-      const used = userUsedBytes(user);
-      const limit = user.traffic_limit_bytes || 0;
-      const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
-      trafficEl.innerHTML = `${formatBytes(used)}${limit > 0 ? ` / ${formatBytes(limit)}<div class="hint">${percent}%</div>` : ''}`;
-    }
+    if (trafficEl) trafficEl.innerHTML = userTrafficHTML(user);
   });
+
+  if (fleet.active === 'dashboard') applyDashboardStats();
+}
+
+function applyDashboardStats() {
+  const nodes = fleet.nodes || [];
+  const users = fleet.users || [];
+  const routes = fleet.routes || [];
+  const relays = nodes.filter(n => n.is_relay).length;
+  const exits = nodes.filter(n => n.is_exit).length;
+  const activeUsers = users.filter(userActive).length;
+  const enabledRoutes = routes.filter(r => r.enabled).length;
+  const traffic = users.reduce((sum, user) => sum + userUsedBytes(user), 0);
+  const set = (key, value) => document.querySelectorAll(`[data-stat="${key}"]`).forEach(el => { el.textContent = value; });
+  set('servers', String(nodes.length));
+  set('servers-hint', t('dashboard.serversHint').replace('{relays}', relays).replace('{exits}', exits));
+  set('routes', String(routes.length));
+  set('routes-hint', t('dashboard.routesHint').replace('{active}', enabledRoutes).replace('{total}', routes.length));
+  set('users', String(users.length));
+  set('users-hint', t('dashboard.usersHint').replace('{active}', activeUsers).replace('{total}', users.length));
+  set('traffic', formatBytes(traffic));
+}
+
+/* Go marshals time.Time as RFC3339Nano (e.g. 2026-01-02T03:04:05.123456789Z).
+   Trim nanoseconds to milliseconds and keep the timezone suffix (Z or ±hh:mm),
+   so the browser parses the exact instant without losing the UTC offset. */
+function parseISOTime(value) {
+  if (!value) return NaN;
+  const text = String(value).trim()
+    .replace(/\.(\d{3})\d+(?=Z|[+-]\d{2}:?\d{2}$)/, '.$1');
+  const ts = Date.parse(text);
+  return Number.isFinite(ts) ? ts : NaN;
+}
+
+/* Precise relative time used by the "Updated" columns:
+   < 60s -> "just now"; 1..59 min -> "N min ago"; >= 1h -> "1 h 20 min ago". */
+function formatRelativeTime(isoString) {
+  if (!isoString) return '';
+  const then = parseISOTime(isoString);
+  if (!Number.isFinite(then) || new Date(then).getUTCFullYear() < 1970) return '';
+  const sec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (sec < 60) return t('time.justNow');
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} ${t('time.minAgo')}`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) {
+    const restMin = min % 60;
+    if (restMin === 0) return t('time.hoursAgo').replace('{hours}', hours);
+    return t('time.hoursMinutesAgo').replace('{hours}', hours).replace('{minutes}', restMin);
+  }
+  return t('time.daysAgo').replace('{days}', Math.floor(hours / 24));
 }
 
 function relativeTime(value) {
-  if (!value) return '';
-  const then = new Date(value).getTime();
-  if (!Number.isFinite(then)) return '';
-  const sec = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (sec < 60) return sec + ' ' + t('time.secAgo');
-  const min = Math.round(sec / 60);
-  if (min < 60) return min + ' ' + t('time.minAgo');
-  const hours = Math.round(min / 60);
-  if (hours < 24) return hours + ' ' + t('time.hourAgo');
-  return Math.round(hours / 24) + ' ' + t('time.dayAgo');
+  return formatRelativeTime(value);
 }
 
 function nodeStatusText(node) {
@@ -1529,10 +1749,7 @@ function nodeStatusText(node) {
   if (status === 'deploying') return t('nodes.statusDeploying');
   if (status === 'stopped') return t('nodes.statusStopped');
   if (status === 'error') return t('nodes.statusError');
-  if (status === 'deployed' || status === 'online') {
-    const rel = relativeTime(node.updated_at);
-    return rel ? `${t('nodes.statusOnline')} · ${t('nodes.updated')} ${rel}` : t('nodes.statusOnline');
-  }
+  if (status === 'deployed' || status === 'online') return t('nodes.statusOnline');
   return t('nodes.statusNew');
 }
 
@@ -1599,15 +1816,6 @@ function renderDashboard() {
     domainStatus.textContent = t(publicURL ? 'dashboard.domainReady' : 'dashboard.domainMissing');
   }
 
-  const domainMessage = document.getElementById('dashboard-domain-message');
-  if (domainMessage) {
-    const caddyMessage = fleet.caddy && fleet.caddy.message
-      ? fleet.caddy.message
-      : (publicURL ? t('dashboard.caddyOk') : t('dashboard.caddyPending'));
-    const overrideNote = settings.public_url_override ? ' ' + t('dashboard.urlOverride') : '';
-    domainMessage.textContent = (publicURL ? publicURL + ' — ' : '') + caddyMessage + overrideNote;
-  }
-
   const hasDomain = !!(settings.public_domain || '').trim();
   const subscriptionsToggle = document.getElementById('subscriptions-enabled');
   if (subscriptionsToggle) {
@@ -1622,22 +1830,22 @@ function renderDashboard() {
     stats.innerHTML = `
       <div class="stat-card">
         <span class="stat-card__label">${esc(t('dashboard.servers'))}</span>
-        <strong>${nodes.length}</strong>
-        <span class="stat-card__hint">${esc(t('dashboard.serversHint').replace('{relays}', relays.length).replace('{exits}', exits.length))}</span>
+        <strong data-stat="servers">${nodes.length}</strong>
+        <span class="stat-card__hint" data-stat="servers-hint">${esc(t('dashboard.serversHint').replace('{relays}', relays.length).replace('{exits}', exits.length))}</span>
       </div>
       <div class="stat-card">
         <span class="stat-card__label">${esc(t('dashboard.routes'))}</span>
-        <strong>${routes.length}</strong>
-        <span class="stat-card__hint">${esc(t('dashboard.routesHint').replace('{active}', enabledRoutes).replace('{total}', routes.length))}</span>
+        <strong data-stat="routes">${routes.length}</strong>
+        <span class="stat-card__hint" data-stat="routes-hint">${esc(t('dashboard.routesHint').replace('{active}', enabledRoutes).replace('{total}', routes.length))}</span>
       </div>
       <div class="stat-card">
         <span class="stat-card__label">${esc(t('dashboard.users'))}</span>
-        <strong>${users.length}</strong>
-        <span class="stat-card__hint">${esc(t('dashboard.usersHint').replace('{active}', activeUsers).replace('{total}', users.length))}</span>
+        <strong data-stat="users">${users.length}</strong>
+        <span class="stat-card__hint" data-stat="users-hint">${esc(t('dashboard.usersHint').replace('{active}', activeUsers).replace('{total}', users.length))}</span>
       </div>
       <div class="stat-card">
         <span class="stat-card__label">${esc(t('dashboard.traffic'))}</span>
-        <strong>${formatBytes(traffic)}</strong>
+        <strong data-stat="traffic">${formatBytes(traffic)}</strong>
         <span class="stat-card__hint">${esc(t('dashboard.trafficHint'))}</span>
       </div>`;
   }
@@ -1648,22 +1856,42 @@ function renderDashboard() {
       list.innerHTML = emptyState('dns', t('nodes.empty'), t('nodes.add'), "openNodeModal(null,'relay')");
     } else {
       const rows = nodes.map(node => {
+        const host = (node.ssh_host || '—') + (node.ssh_port && node.ssh_port !== 22 ? `:${node.ssh_port}` : '');
         const transports = (node.transports || [])
           .filter(tr => tr.enabled && tr.domain)
           .map(tr => transportLabel(tr.type))
           .join(', ');
-        const exitOnly = node.is_exit && !node.is_relay;
-        let sub = transports;
-        if (!sub && !exitOnly) sub = t('nodes.noTransports');
-        return `<tr>
-          <td><strong>${esc(node.name)}</strong><div class="table-sub">${esc(sub)}</div></td>
+        return `<tr data-node-row="${escAttr(node.id)}">
+          <td>
+            <strong>${esc(node.name)}</strong>
+            <div class="table-sub">${esc(host)}</div>
+            ${transports ? `<div class="table-sub">${esc(transports)}</div>` : ''}
+          </td>
           <td><span class="role-chip">${esc(nodeRoles(node))}</span></td>
-          <td><span class="card__subtitle">${esc(node.ssh_user || 'root')}@${esc(node.ssh_host || '—')}</span></td>
-          <td><span class="status-chip status-chip--${esc(statusClass(node.status))}" data-node-status="${escAttr(node.id)}">${esc(nodeStatusText(node))}</span></td>
+          <td>
+            <span class="status-chip status-chip--${esc(statusClass(node.status))}" data-node-status="${escAttr(node.id)}">${esc(nodeStatusText(node))}</span>
+            ${node.last_error ? `<div class="table-sub">${esc(node.last_error)}</div>` : ''}
+          </td>
+          <td>${nodeMetricsHTML(node)}</td>
+          <td><span class="table-sub" data-node-updated="${escAttr(node.id)}" data-time-iso="${escAttr(node.updated_at || '')}">${esc(nodeDeployedText(node))}</span></td>
+          <td>
+            <div class="table-actions">
+              <button class="icon-btn" type="button" title="${esc(t('nodes.deploy'))}" onclick="fleetDeployNode(${node.id})"><span class="material-symbols-rounded">rocket_launch</span></button>
+              <button class="icon-btn" type="button" title="${esc(t('actions.edit'))}" onclick="fleetEditNode(${node.id})"><span class="material-symbols-rounded">edit</span></button>
+              <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteNode(${node.id})"><span class="material-symbols-rounded">delete</span></button>
+            </div>
+          </td>
         </tr>`;
       }).join('');
       list.innerHTML = `<div class="table-wrap"><table class="data-table">
-        <thead><tr><th>${esc(t('nodes.name'))}</th><th>${esc(t('roles.title'))}</th><th>${esc(t('nodes.host'))}</th><th>${esc(t('users.status'))}</th></tr></thead>
+        <thead><tr>
+          <th>${esc(t('nodes.server'))}</th>
+          <th>${esc(t('nodes.roles'))}</th>
+          <th>${esc(t('users.status'))}</th>
+          <th>${esc(t('nodes.resources'))}</th>
+          <th>${esc(t('nodes.updatedAt'))}</th>
+          <th>${esc(t('nodes.actions'))}</th>
+        </tr></thead>
         <tbody>${rows}</tbody>
       </table></div>`;
     }
@@ -1774,8 +2002,10 @@ function renderNodes() {
         </div>
         <div class="node-card__meta">
           <span class="role-chip">${esc(nodeRoles(node))}</span>
+          <span class="meta-chip"><span class="material-symbols-rounded">sensors</span><span data-node-last-seen="${escAttr(node.id)}">${esc(nodeLastSeenText(node))}</span></span>
         </div>
         ${exitOnly ? '' : `<div class="transport-list">${transports}</div>`}
+        ${nodeMetricsHTML(node)}
         ${node.last_error ? `<div class="card__error">${esc(node.last_error)}</div>` : ''}
         <div class="node-card__footer">
           <label class="switch-wrapper" title="${esc(t('nodes.toggleServices'))}">
@@ -1827,15 +2057,25 @@ async function fleetToggleNodeServices(id, running) {
 async function fleetDeleteNode(id) {
   const node = fleet.nodes.find(n => n.id === id);
   const name = node ? node.name : String(id);
+  let force = false;
   const dialog = openModal({
     title: t('nodes.deleteTitle'),
-    body: `<p>${esc(t('nodes.deleteBody').replace('{name}', name))}</p>`,
+    body: `
+      <p>${esc(t('nodes.deleteConfirmBody').replace('{name}', name))}</p>
+      <ul class="cleanup-list">
+        <li><span class="material-symbols-rounded">inventory_2</span>${esc(t('nodes.cleanupContainers'))}</li>
+        <li><span class="material-symbols-rounded">folder_delete</span>${esc(t('nodes.cleanupFiles'))}</li>
+        <li><span class="material-symbols-rounded">settings_suggest</span>${esc(t('nodes.cleanupSystemd'))}</li>
+      </ul>
+      <label class="check-row"><input type="checkbox" id="n-force"> ${esc(t('nodes.deleteForceOption'))}</label>
+      <div class="hint">${esc(t('nodes.deleteForceHint'))}</div>`,
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
-      { label: t('nodes.deleteClean'), kind: 'danger', onClick: () => removeNode(dialog, id, false) },
-      { label: t('nodes.deleteForce'), kind: 'text', onClick: () => removeNode(dialog, id, true) }
+      { label: t('nodes.deleteConfirmAction'), kind: 'danger', onClick: () => removeNode(dialog, id, force) }
     ]
   });
+  const forceEl = document.getElementById('n-force');
+  if (forceEl) forceEl.addEventListener('change', e => { force = e.target.checked; });
 }
 
 async function removeNode(dialog, id, force) {
@@ -1851,6 +2091,59 @@ async function removeNode(dialog, id, force) {
     else dialog.setBody(`<div class="deploy-log"><div class="deploy-step is-error">${esc(e.message)}</div></div>`);
     toast(e.message, 'error');
   }
+}
+
+async function fleetRedeployAll() {
+  try {
+    const res = await api('/api/nodes/redeploy-all', { method: 'POST' });
+    const queued = res.queued || [];
+    if (!queued.length) {
+      toast(t('nodes.redeployAllEmpty'));
+      return;
+    }
+    toast(t('nodes.redeployAllQueued').replace('{count}', queued.length), 'success');
+    const ids = new Set(queued.map(item => String(item.id)));
+    const names = new Map(queued.map(item => [String(item.id), item.name]));
+    const previous = new Map();
+    const dialog = openModal({
+      title: t('nodes.redeployAll'),
+      body: `<div class="deploy-log" id="redeploy-all-log">${queued.map(item =>
+        `<div class="deploy-step" data-redeploy-step="${escAttr(item.id)}"><div class="deploy-step__name">${esc(item.name)}</div><div class="deploy-step__cmd">${esc(t('nodes.queued'))}</div></div>`
+      ).join('')}</div>`
+    });
+    const started = Date.now();
+    const poll = async () => {
+      if (!document.getElementById('redeploy-all-log')) return;
+      try {
+        const nodes = (await api('/api/nodes')) || [];
+        const targets = nodes.filter(node => ids.has(String(node.id)));
+        targets.forEach(node => {
+          const id = String(node.id);
+          const was = previous.get(id);
+          if (was && was !== node.status && (node.status === 'deployed' || node.status === 'error')) {
+            toast(`${names.get(id) || id}: ${nodeStatusText(node)}`, node.status === 'error' ? 'error' : 'success');
+          }
+          previous.set(id, node.status);
+          const step = document.querySelector(`[data-redeploy-step="${escAttr(id)}"]`);
+          if (!step) return;
+          step.className = `deploy-step ${node.status === 'error' ? 'is-error' : node.status === 'deployed' ? 'is-ok' : ''}`;
+          step.innerHTML = `<div class="deploy-step__name">${esc(names.get(id) || node.name)}</div>
+            <div class="deploy-step__cmd">${esc(nodeStatusText(node))}</div>`;
+        });
+        const busy = targets.some(node => node.status === 'deploying');
+        if (!busy && Date.now() - started > 1500) {
+          await loadActiveView();
+          toast(t('nodes.redeployAllDone'), 'success');
+          return;
+        }
+      } catch (e) {
+        // keep polling; the panel may be briefly unavailable
+      }
+      setTimeout(poll, 2000);
+    };
+    setTimeout(poll, 800);
+    return dialog;
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 async function fleetDeployNode(id) {
@@ -1900,7 +2193,7 @@ function emptyNodeDraft(role) {
   const draft = {
     name: '', ssh_host: '', ssh_port: 22, ssh_user: 'root',
     ssh_private_key: '', ssh_password: '', authMode: 'key',
-    is_relay: relay, is_exit: exit, socks_port: 1080,
+    is_relay: relay, is_exit: exit,
     secrets: {},
     transports: relay && defaultKind ? [{ type: defaultKind, domain: '', decoy_repo_url: '', enabled: true }] : []
   };
@@ -1921,7 +2214,6 @@ function nodeDraftFrom(node) {
     ssh_password: node.ssh_password || '',
     is_relay: !!node.is_relay,
     is_exit: !!node.is_exit,
-    socks_port: node.socks_port || 1080,
     secrets: Object.assign({}, node.secrets || node.generated_secrets || {}),
     transports: (node.transports || []).map(tr => ({ type: tr.type, domain: tr.domain || '', decoy_repo_url: tr.decoy_repo_url || '', enabled: !!tr.enabled }))
   });
@@ -2116,7 +2408,6 @@ function openNodeModal(node, role) {
       if (!enabled.length) return toast(t('nodes.transportRequired'), 'error');
       if (enabled.some(tr => !tr.domain.trim())) return toast(t('nodes.domainRequired'), 'error');
     }
-    if (draft.is_exit && !draft.socks_port) draft.socks_port = 1080;
     const payload = {
       name,
       ssh_host: host,
@@ -2126,7 +2417,6 @@ function openNodeModal(node, role) {
       ssh_password: draft.ssh_password,
       is_relay: draft.is_relay,
       is_exit: draft.is_exit,
-      socks_port: draft.socks_port,
       transports: draft.is_relay ? draft.transports.map(tr => {
         const item = { type: tr.type, domain: tr.domain, enabled: tr.enabled };
         const decoyURL = String(tr.decoy_repo_url || '').trim();
@@ -2250,9 +2540,11 @@ function renderRoutes() {
           <span class="slider"></span>
         </label>
       </td>
-      <td class="table-actions">
-        <button class="icon-btn" type="button" title="${esc(t('actions.edit'))}" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
-        <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
+      <td>
+        <div class="table-actions">
+          <button class="icon-btn" type="button" title="${esc(t('actions.edit'))}" onclick="fleetEditRoute(${route.id})"><span class="material-symbols-rounded">edit</span></button>
+          <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteRoute(${route.id})"><span class="material-symbols-rounded">delete</span></button>
+        </div>
       </td>
     </tr>`;
   }).join('');
@@ -2558,37 +2850,53 @@ function renderUsers() {
   const root = document.getElementById('users-list');
   if (!root) return;
   if (!fleet.users.length) {
-    root.innerHTML = emptyState('group', t('users.empty'), t('users.add'), 'openUserModal()');
+    root.innerHTML = emptyState('group', t('users.empty'), t('users.add'), 'openUserModal(null)');
     return;
   }
   const canNetwork = networkSubscriptionsEnabled();
   const rows = fleet.users.map(user => {
-    const used = userUsedBytes(user);
-    const limit = user.traffic_limit_bytes || 0;
-    const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
     const active = userActive(user);
     const subActions = canNetwork
       ? `<button class="icon-btn" type="button" title="${esc(t('users.qr'))}" onclick="openSubscriptionDialog('${escAttr(user.id)}')"><span class="material-symbols-rounded">qr_code_2</span></button>
         <button class="icon-btn" type="button" title="${esc(t('users.copy'))}" onclick="fleetCopySubscription('${escAttr(user.id)}')"><span class="material-symbols-rounded">content_copy</span></button>`
       : `<button class="icon-btn" type="button" title="${esc(t('users.offline'))}" onclick="openSubscriptionDialog('${escAttr(user.id)}')"><span class="material-symbols-rounded">description</span></button>`;
+    const routeChips = (user.allowed_route_ids && user.allowed_route_ids.length)
+      ? user.allowed_route_ids.map(id => {
+          const route = (fleet.routes || []).find(r => r.id === id);
+          return `<span class="chip">${esc(route ? route.name : '#' + id)}</span>`;
+        }).join('')
+      : `<span class="chip chip--stopped">${esc(t('users.allRoutes'))}</span>`;
     return `<tr data-user-id="${escAttr(user.id)}">
       <td><strong>${esc(user.name || user.id)}</strong><div class="table-sub">${esc(user.id)}</div></td>
-      <td><span class="status-chip ${active ? 'status-chip--online' : 'status-chip--error'}" data-user-status="${escAttr(user.id)}">${esc(active ? t('users.active') : t('users.inactive'))}</span></td>
-      <td>${esc(formatExpiry(user.expires_at))}</td>
-      <td data-user-traffic="${escAttr(user.id)}">${formatBytes(used)}${limit > 0 ? ` / ${formatBytes(limit)}<div class="hint">${percent}%</div>` : ''}</td>
-      <td>${esc(routeNames(user.allowed_route_ids))}</td>
-      <td class="table-actions">
-        ${subActions}
-        <button class="icon-btn" type="button" title="${esc(t('users.resetTraffic'))}" onclick="fleetResetUserTraffic('${escAttr(user.id)}')"><span class="material-symbols-rounded">restart_alt</span></button>
-        <button class="icon-btn" type="button" title="${esc(t('actions.enable'))}" onclick="fleetToggleUser('${escAttr(user.id)}', ${active ? 'false' : 'true'})"><span class="material-symbols-rounded">${active ? 'toggle_on' : 'toggle_off'}</span></button>
-        <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteUser('${escAttr(user.id)}')"><span class="material-symbols-rounded">delete</span></button>
+      <td>
+        <span class="status-chip ${active ? 'status-chip--online' : 'status-chip--error'}" data-user-status="${escAttr(user.id)}">${esc(active ? t('users.active') : t('users.inactive'))}</span>
+        <div class="table-sub" data-user-expiry="${escAttr(user.id)}">${esc(formatExpiry(user.expires_at))}${expiryLeft(user.expires_at)}</div>
+      </td>
+      <td data-user-traffic="${escAttr(user.id)}">${userTrafficHTML(user)}</td>
+      <td><div class="chip-row">${routeChips}</div></td>
+      <td>
+        <div class="table-actions">
+          ${subActions}
+          <button class="icon-btn" type="button" title="${esc(t('users.edit'))}" onclick="openUserModal('${escAttr(user.id)}')"><span class="material-symbols-rounded">edit</span></button>
+          <button class="icon-btn" type="button" title="${esc(t('users.resetTraffic'))}" onclick="fleetResetUserTraffic('${escAttr(user.id)}')"><span class="material-symbols-rounded">restart_alt</span></button>
+          <button class="icon-btn" type="button" title="${esc(t('actions.enable'))}" onclick="fleetToggleUser('${escAttr(user.id)}', ${active ? 'false' : 'true'})"><span class="material-symbols-rounded">${active ? 'toggle_on' : 'toggle_off'}</span></button>
+          <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.delete'))}" onclick="fleetDeleteUser('${escAttr(user.id)}')"><span class="material-symbols-rounded">delete</span></button>
+        </div>
       </td>
     </tr>`;
   }).join('');
   root.innerHTML = `<div class="table-wrap"><table class="data-table">
-    <thead><tr><th>${esc(t('users.name'))}</th><th>${esc(t('users.status'))}</th><th>${esc(t('users.expires'))}</th><th>${esc(t('users.traffic'))}</th><th>${esc(t('users.routes'))}</th><th></th></tr></thead>
+    <thead><tr><th>${esc(t('users.name'))}</th><th>${esc(t('users.status'))}</th><th>${esc(t('users.traffic'))}</th><th>${esc(t('users.routes'))}</th><th>${esc(t('nodes.actions'))}</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
+}
+
+function expiryLeft(value) {
+  const ts = expiryTime(value);
+  if (!ts) return '';
+  const days = Math.ceil((ts - Date.now()) / 86400000);
+  if (days < 0) return '';
+  return ` · ${t('users.daysLeft').replace('{days}', days)}`;
 }
 
 function networkSubscriptionURL(user) {
@@ -2608,6 +2916,18 @@ async function fleetCopySubscription(id) {
 async function fetchUserBundle(user) {
   const res = await api(`/api/users/${encodeURIComponent(user.id)}/bundle`);
   return JSON.stringify(res, null, 2);
+}
+
+async function copyOfflineLink(id) {
+  const user = fleet.users.find(u => u.id === id);
+  if (!user) return;
+  try {
+    const bundle = await api(`/api/users/${encodeURIComponent(user.id)}/bundle`);
+    const link = Array.isArray(bundle.links) ? bundle.links[0] : '';
+    if (!link) return toast(t('users.bundleEmpty'), 'error');
+    await copyToClipboard(link);
+    toast(t('toast.copied'), 'success');
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 function bundleFileName(user) {
@@ -2696,6 +3016,9 @@ function openSubscriptionDialog(id) {
       <textarea class="sub-json" id="user-bundle" readonly spellcheck="false"></textarea>
       <p class="hint hidden" id="user-bundle-empty">${esc(t('users.bundleEmpty'))}</p>
       <div class="sub-section__actions">
+        <button class="btn btn--tonal btn--compact" type="button" onclick="copyOfflineLink('${escAttr(user.id)}')">
+          <span class="material-symbols-rounded">link</span>${esc(t('users.copyLink'))}
+        </button>
         <button class="btn btn--tonal btn--compact" type="button" onclick="copyUserBundle('${escAttr(user.id)}')">
           <span class="material-symbols-rounded">content_copy</span>${esc(t('users.copyJson'))}
         </button>
@@ -2735,16 +3058,9 @@ async function fleetToggleUser(id, enabled) {
   if (!user) return;
   try {
     await api(`/api/users/${encodeURIComponent(id)}`, {
-      method: 'PUT',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: user.name,
-        sub_token: user.sub_token,
-        enabled: enabled,
-        expires_at: expiryTime(user.expires_at) ? user.expires_at : null,
-        traffic_limit_bytes: user.traffic_limit_bytes || 0,
-        allowed_route_ids: user.allowed_route_ids || []
-      })
+      body: JSON.stringify({ enabled })
     });
     toast(enabled ? t('users.enabledToast') : t('users.disabledToast'), 'success');
     await loadActiveView();
@@ -2761,68 +3077,246 @@ async function fleetDeleteUser(id) {
   } catch (e) { toast(e.message, 'error'); }
 }
 
-function openUserModal() {
-  const draft = { name: '', enabled: true, expiryMode: 'never', days: 30, trafficMode: 'unlimited', gb: 100, routeIDs: [] };
-  const routeOptions = fleet.routes.length
-    ? fleet.routes.map(route => `<label class="check-row"><input type="checkbox" data-route-id="${route.id}"
-          onchange="fleetUserToggleRoute(${route.id}, this.checked)"> ${esc(route.name)} <span class="hint">(${esc(transportLabel(route.transport_type))})</span></label>`).join('')
-    : `<div class="hint">${esc(t('users.noRoutes'))}</div>`;
+function openUserModal(userId = null) {
+  const editing = userId ? (fleet.users || []).find(u => String(u.id) === String(userId)) : null;
+  const expires = editing ? expiryTime(editing.expires_at) : null;
+  const limitGB = editing && editing.traffic_limit_bytes > 0
+    ? Math.round(editing.traffic_limit_bytes / 1024 / 1024 / 1024 * 10) / 10 : 0;
+  // The create path must never read from a (missing) user record: start from a
+  // clean draft so the full form renders and POST /api/users gets sane values.
+  const draft = editing ? {
+    id: editing.id,
+    name: editing.name || '',
+    enabled: !!editing.enabled,
+    expiryMode: expires ? 'date' : 'never',
+    expiryDate: expires ? new Date(expires).toISOString().slice(0, 10) : '',
+    trafficMode: limitGB > 0 ? 'limited' : 'unlimited',
+    gb: limitGB || 100,
+    routeIDs: Array.isArray(editing.allowed_route_ids) ? editing.allowed_route_ids.slice() : []
+  } : {
+    id: '',
+    name: '',
+    enabled: true,
+    expiryMode: 'never',
+    expiryDate: '',
+    trafficMode: 'unlimited',
+    gb: 100,
+    routeIDs: []
+  };
+  fleet.userDraft = draft;
 
-  openModal({
-    title: t('users.add'),
+  const dialog = openModal({
+    title: editing ? `${t('users.edit')}: ${editing.name || editing.id}` : t('users.add'),
     actions: [
       { label: t('actions.cancel'), kind: 'text', onClick: closeModal },
-      { label: t('actions.create'), kind: 'filled', onClick: submitUser }
-    ],
-    body: `
-      <div class="form-group">
-        <div class="field"><label>${esc(t('users.name'))}</label><input type="text" id="u-name" placeholder="Alice"></div>
-        <label class="check-row"><input type="checkbox" id="u-enabled" checked> ${esc(t('users.enabled'))}</label>
-        <div class="form-row">
-          <div class="field"><label>${esc(t('users.expiry'))}</label><select id="u-expiry-mode"><option value="never" selected>${esc(t('users.never'))}</option><option value="days">${esc(t('users.inDays'))}</option></select></div>
-          <div class="field field--small"><label>${esc(t('users.days'))}</label><input type="number" id="u-days" value="30" min="1" disabled></div>
-        </div>
-        <div class="form-row">
-          <div class="field"><label>${esc(t('users.trafficLimit'))}</label><select id="u-traffic-mode"><option value="unlimited" selected>${esc(t('users.unlimited'))}</option><option value="limited">${esc(t('users.limited'))}</option></select></div>
-          <div class="field field--small"><label>GB</label><input type="number" id="u-gb" value="100" min="1" disabled></div>
-        </div>
-        <div class="field"><label>${esc(t('users.routes'))}</label><div class="check-list">${routeOptions}</div></div>
-      </div>`
+      { label: editing ? t('actions.save') : t('actions.create'), kind: 'filled', onClick: submitUser }
+    ]
   });
 
-  fleet.userDraft = draft;
-  const nameEl = document.getElementById('u-name');
-  const enabledEl = document.getElementById('u-enabled');
-  const expiryEl = document.getElementById('u-expiry-mode');
-  const daysEl = document.getElementById('u-days');
-  const trafficEl = document.getElementById('u-traffic-mode');
-  const gbEl = document.getElementById('u-gb');
-  nameEl.addEventListener('input', e => { draft.name = e.target.value; });
-  enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
-  expiryEl.addEventListener('change', e => { draft.expiryMode = e.target.value; daysEl.disabled = draft.expiryMode === 'never'; });
-  daysEl.addEventListener('input', e => { draft.days = Number(e.target.value) || 0; });
-  trafficEl.addEventListener('change', e => { draft.trafficMode = e.target.value; gbEl.disabled = draft.trafficMode === 'unlimited'; });
-  gbEl.addEventListener('input', e => { draft.gb = Number(e.target.value) || 0; });
+  function renderBody() {
+    dialog.setBody(`
+      <div class="form-group">
+        <div class="field"><label>${esc(t('users.name'))}</label>
+          <input type="text" id="u-name" placeholder="Alice" value="${escAttr(draft.name)}"></div>
+        <label class="switch-wrapper">
+          <span class="switch"><input type="checkbox" id="u-enabled" ${draft.enabled ? 'checked' : ''}><span class="slider"></span></span>
+          <span>${esc(t('users.enabled'))}</span>
+        </label>
+        <div class="form-row">
+          <div class="field"><label>${esc(t('users.expiry'))}</label>
+            <select id="u-expiry-mode">
+              <option value="never" ${draft.expiryMode === 'never' ? 'selected' : ''}>${esc(t('users.never'))}</option>
+              <option value="date" ${draft.expiryMode === 'date' ? 'selected' : ''}>${esc(t('users.expiryDate'))}</option>
+            </select>
+          </div>
+          <div class="field"><label>${esc(t('users.date'))}</label>
+            <input type="date" id="u-expiry-date" value="${escAttr(draft.expiryDate)}" ${draft.expiryMode === 'date' ? '' : 'disabled'}></div>
+        </div>
+        <div class="form-row">
+          <div class="field"><label>${esc(t('users.trafficLimit'))}</label>
+            <select id="u-traffic-mode">
+              <option value="unlimited" ${draft.trafficMode === 'unlimited' ? 'selected' : ''}>${esc(t('users.unlimited'))}</option>
+              <option value="limited" ${draft.trafficMode === 'limited' ? 'selected' : ''}>${esc(t('users.limited'))}</option>
+            </select>
+          </div>
+          <div class="field"><label>GB</label>
+            <input type="number" id="u-gb" value="${escAttr(draft.gb)}" min="1" ${draft.trafficMode === 'limited' ? '' : 'disabled'}></div>
+        </div>
+        <div class="field">
+          <label>${esc(t('users.routesOrder'))}</label>
+          <div id="u-routes"></div>
+          <span class="hint">${esc(t('users.orderHint'))}</span>
+        </div>
+        ${editing && networkSubscriptionsEnabled() ? `<div class="sub-section">
+          <div class="sub-section__title"><span class="material-symbols-rounded">qr_code_2</span>${esc(t('users.subscription'))}</div>
+          <div class="qr-card"><div class="qr-box" id="user-edit-qr"></div>
+            <div class="qr-card__info"><div class="sub-link">${esc(editing.subscription_url || '')}</div></div>
+          </div>
+          <div class="sub-section__actions">
+            <button class="btn btn--tonal btn--compact" type="button" onclick="fleetCopySubscription('${escAttr(editing.id)}')">
+              <span class="material-symbols-rounded">content_copy</span>${esc(t('users.copy'))}
+            </button>
+          </div>
+        </div>` : ''}
+      </div>`);
+    bindFields();
+    renderUserRoutes();
+    if (editing && networkSubscriptionsEnabled()) {
+      renderQR(document.getElementById('user-edit-qr'), editing.subscription_url || '');
+    }
+  }
+
+  function bindFields() {
+    const nameEl = document.getElementById('u-name');
+    const enabledEl = document.getElementById('u-enabled');
+    const expiryEl = document.getElementById('u-expiry-mode');
+    const dateEl = document.getElementById('u-expiry-date');
+    const trafficEl = document.getElementById('u-traffic-mode');
+    const gbEl = document.getElementById('u-gb');
+    if (nameEl) nameEl.addEventListener('input', e => { draft.name = e.target.value; });
+    if (enabledEl) enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
+    if (expiryEl) expiryEl.addEventListener('change', e => {
+      draft.expiryMode = e.target.value;
+      if (dateEl) dateEl.disabled = draft.expiryMode !== 'date';
+    });
+    if (dateEl) dateEl.addEventListener('change', e => { draft.expiryDate = e.target.value; });
+    if (trafficEl) trafficEl.addEventListener('change', e => {
+      draft.trafficMode = e.target.value;
+      if (gbEl) gbEl.disabled = draft.trafficMode !== 'limited';
+    });
+    if (gbEl) gbEl.addEventListener('input', e => { draft.gb = Number(e.target.value) || 0; });
+  }
 
   async function submitUser() {
-    const payload = { name: draft.name.trim(), enabled: draft.enabled, allowed_route_ids: draft.routeIDs };
-    if (draft.expiryMode === 'days' && draft.days > 0) payload.expires_at = new Date(Date.now() + draft.days * 86400000).toISOString();
-    if (draft.trafficMode === 'limited' && draft.gb > 0) payload.traffic_limit_bytes = Math.round(draft.gb * 1024 * 1024 * 1024);
+    if (!draft.name.trim()) return toast(t('users.nameRequired'), 'error');
+    if (draft.expiryMode === 'date' && !draft.expiryDate) return toast(t('users.dateRequired'), 'error');
+    if (draft.trafficMode === 'limited' && !(draft.gb > 0)) return toast(t('users.limitRequired'), 'error');
+    const payload = {
+      name: draft.name.trim(),
+      enabled: draft.enabled,
+      allowed_route_ids: draft.routeIDs
+    };
+    payload.expires_at = draft.expiryMode === 'date'
+      ? new Date(draft.expiryDate + 'T23:59:59Z').toISOString()
+      : null;
+    payload.traffic_limit_bytes = draft.trafficMode === 'limited'
+      ? Math.round(draft.gb * 1024 * 1024 * 1024) : 0;
     try {
-      const created = await api('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      toast(t('toast.created'), 'success');
-      closeModal();
-      await loadActiveView();
-      if (!fleet.users.some(u => String(u.id) === String(created.id))) fleet.users.unshift(created);
-      openSubscriptionDialog(created.id);
+      if (editing) {
+        await api(`/api/users/${encodeURIComponent(editing.id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        toast(t('toast.saved'), 'success');
+        closeModal();
+        await loadActiveView();
+      } else {
+        const created = await api('/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        toast(t('toast.created'), 'success');
+        closeModal();
+        await loadActiveView();
+        openSubscriptionDialog(created.id);
+      }
     } catch (e) { toast(e.message, 'error'); }
   }
+
+  renderBody();
+}
+
+let userDragRouteID = null;
+
+function renderUserRoutes() {
+  const root = document.getElementById('u-routes');
+  const draft = fleet.userDraft;
+  if (!root || !draft) return;
+  const routes = fleet.routes || [];
+  const selected = draft.routeIDs
+    .map(id => routes.find(route => route.id === id))
+    .filter(Boolean);
+  const available = routes.filter(route => !draft.routeIDs.includes(route.id));
+  const selectedHTML = selected.length ? selected.map((route, index) => `
+    <div class="route-order__item" draggable="true" data-route-id="${escAttr(route.id)}"
+         ondragstart="fleetUserDragStart(event, ${route.id})"
+         ondragover="fleetUserDragOver(event)"
+         ondrop="fleetUserDrop(event, ${route.id})">
+      <span class="drag-handle material-symbols-rounded" title="${esc(t('users.dragHint'))}">drag_indicator</span>
+      <span class="route-order__name">${esc(route.name)}</span>
+      <span class="route-order__actions">
+        <button class="icon-btn" type="button" title="${esc(t('users.moveUp'))}" ${index === 0 ? 'disabled' : ''}
+          onclick="fleetUserMoveRoute(${route.id}, -1)"><span class="material-symbols-rounded">arrow_upward</span></button>
+        <button class="icon-btn" type="button" title="${esc(t('users.moveDown'))}" ${index === selected.length - 1 ? 'disabled' : ''}
+          onclick="fleetUserMoveRoute(${route.id}, 1)"><span class="material-symbols-rounded">arrow_downward</span></button>
+        <button class="icon-btn icon-btn--danger" type="button" title="${esc(t('actions.remove'))}"
+          onclick="fleetUserToggleRoute(${route.id}, false)"><span class="material-symbols-rounded">close</span></button>
+      </span>
+    </div>`).join('')
+    : `<div class="hint">${esc(t('users.noRoutesSelected'))}</div>`;
+  const availableHTML = available.length ? available.map(route => `
+    <label class="check-row route-picker__item">
+      <input type="checkbox" onchange="fleetUserToggleRoute(${route.id}, this.checked)">
+      <span>${esc(route.name)} <span class="hint">(${esc(transportLabel(route.transport_type))})</span></span>
+    </label>`).join('')
+    : `<div class="hint">${esc(t('users.allRoutesSelected'))}</div>`;
+  root.innerHTML = `<div class="route-editor">
+    <div class="route-editor__col">
+      <div class="route-editor__title">${esc(t('users.routesAvailable'))}</div>
+      <div class="check-list route-picker">${availableHTML}</div>
+    </div>
+    <div class="route-editor__col">
+      <div class="route-editor__title">${esc(t('users.routesSelected'))}</div>
+      <div class="route-order">${selectedHTML}</div>
+    </div>
+  </div>`;
 }
 
 function fleetUserToggleRoute(id, checked) {
   const draft = fleet.userDraft;
   if (!draft) return;
-  const set = new Set(draft.routeIDs);
-  if (checked) set.add(id); else set.delete(id);
-  draft.routeIDs = Array.from(set).sort((a, b) => a - b);
+  const ids = draft.routeIDs.filter(routeID => routeID !== id);
+  if (checked) ids.push(id);
+  draft.routeIDs = ids;
+  renderUserRoutes();
+}
+
+function fleetUserMoveRoute(id, direction) {
+  const draft = fleet.userDraft;
+  if (!draft) return;
+  const ids = draft.routeIDs;
+  const index = ids.indexOf(id);
+  const next = index + direction;
+  if (index < 0 || next < 0 || next >= ids.length) return;
+  [ids[index], ids[next]] = [ids[next], ids[index]];
+  renderUserRoutes();
+}
+
+function fleetUserDragStart(event, id) {
+  userDragRouteID = id;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(id));
+  }
+  event.currentTarget?.classList.add('dragging');
+}
+
+function fleetUserDragOver(event) {
+  event.preventDefault();
+}
+
+function fleetUserDrop(event, targetID) {
+  event.preventDefault();
+  const draft = fleet.userDraft;
+  const source = Number(userDragRouteID);
+  userDragRouteID = null;
+  if (!draft || !source || source === targetID) return;
+  const ids = draft.routeIDs.filter(id => id !== source);
+  const index = ids.indexOf(targetID);
+  if (index < 0) return;
+  ids.splice(index, 0, source);
+  draft.routeIDs = ids;
+  renderUserRoutes();
 }

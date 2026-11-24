@@ -91,8 +91,12 @@ func (p *Provisioner) render(ctx context.Context, node panelstore.Node) (RenderR
 		return RenderResult{}, fmt.Errorf("provisioner: node %q has no role", node.Name)
 	}
 	panelURL, err := p.panelURL(ctx)
-	if err != nil && node.IsExit {
-		return RenderResult{}, err
+	if err != nil {
+		if node.IsExit {
+			return RenderResult{}, err
+		}
+
+		p.logf("provisioner: node %d: relay node-agent disabled: %v", node.ID, err)
 	}
 	localRelay := node.IsRelay && IsLocalHost(node.SSHHost, p.opts.LocalHosts)
 	if node.IsRelay && !node.IsExit {
@@ -216,10 +220,17 @@ func (p *Provisioner) binaryFiles(node panelstore.Node) ([]File, error) {
 		names = append(names, "shampoore-relay")
 	}
 	if node.IsExit {
-		names = append(names, "shampoore-server", "shampoore-node-agent")
+		names = append(names, "shampoore-server")
 	}
+
+	names = append(names, "shampoore-node-agent")
+	seen := make(map[string]struct{}, len(names))
 	files := make([]File, 0, len(names))
 	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
 		path, err := findBinary(name, p.opts.LocalBinDir)
 		if err != nil {
 			return nil, err
@@ -525,8 +536,28 @@ func (p *Provisioner) CleanupNode(ctx context.Context, node panelstore.Node) (*C
 		sudo = "sudo -n "
 	}
 
-	if out, err := remote.Run(ctx, sudo+"test -f /opt/shampoore/docker-compose.yml"); err == nil {
-		_ = out
+	stopUnits := sudo + "sh -c 'systemctl disable --now shampoore-server shampoore-relay shampoore-node-agent >/dev/null 2>&1 || true'"
+	out, err := remote.Run(ctx, stopUnits)
+	addStep(Step{Name: "stop systemd units", Command: stopUnits, Output: out, Error: errString(err)})
+
+	removeUnits := sudo + "sh -c 'rm -rf /etc/systemd/system/shampoore*.service /etc/systemd/system/shampoore*.service.d /etc/shampoore'"
+	out, err = remote.Run(ctx, removeUnits)
+	addStep(Step{Name: "remove systemd units", Command: removeUnits, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "remove systemd units", Command: removeUnits}, err)
+	}
+	reloadUnits := sudo + "systemctl daemon-reload"
+	out, err = remote.Run(ctx, reloadUnits)
+	addStep(Step{Name: "reload systemd", Command: reloadUnits, Output: out, Error: errString(err)})
+
+	removeBins := sudo + "sh -c 'rm -f /usr/local/bin/shampoore-* /usr/bin/shampoore-*'"
+	out, err = remote.Run(ctx, removeBins)
+	addStep(Step{Name: "remove binaries", Command: removeBins, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "remove binaries", Command: removeBins}, err)
+	}
+
+	if _, statErr := remote.Run(ctx, sudo+"test -f /opt/shampoore/docker-compose.yml"); statErr == nil {
 		compose := ""
 		if out, err := remote.Run(ctx, sudo+"docker compose version"); err == nil {
 			compose = sudo + "docker compose"
@@ -536,7 +567,7 @@ func (p *Provisioner) CleanupNode(ctx context.Context, node panelstore.Node) (*C
 			addStep(Step{Name: "detect compose", Command: sudo + "docker-compose version", Output: strings.TrimSpace(out)})
 		}
 		if compose != "" {
-			downCmd := compose + " -f /opt/shampoore/docker-compose.yml down -v --remove-orphans"
+			downCmd := compose + " -p shampoore -f /opt/shampoore/docker-compose.yml down -v --remove-orphans"
 			out, err := remote.Run(ctx, downCmd)
 			addStep(Step{Name: "compose down", Command: downCmd, Output: out, Error: errString(err)})
 			if err != nil {
@@ -545,8 +576,21 @@ func (p *Provisioner) CleanupNode(ctx context.Context, node panelstore.Node) (*C
 		}
 	}
 
-	rmCmd := sudo + "rm -rf /opt/shampoore"
-	out, err := remote.Run(ctx, rmCmd)
+	removeContainers := sudo + `sh -c 'command -v docker >/dev/null 2>&1 || exit 0; ids=$(docker ps -aq --filter label=com.docker.compose.project=shampoore); [ -z "$ids" ] || docker rm -f $ids'`
+	out, err = remote.Run(ctx, removeContainers)
+	addStep(Step{Name: "remove containers", Command: removeContainers, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "remove containers", Command: removeContainers}, err)
+	}
+	removeVolumes := sudo + `sh -c 'command -v docker >/dev/null 2>&1 || exit 0; ids=$(docker volume ls -q --filter label=com.docker.compose.project=shampoore); [ -z "$ids" ] || docker volume rm $ids'`
+	out, err = remote.Run(ctx, removeVolumes)
+	addStep(Step{Name: "remove volumes", Command: removeVolumes, Output: out, Error: errString(err)})
+	if err != nil {
+		return fail(Step{Name: "remove volumes", Command: removeVolumes}, err)
+	}
+
+	rmCmd := sudo + "rm -rf /opt/shampoore /var/lib/shampoore"
+	out, err = remote.Run(ctx, rmCmd)
 	addStep(Step{Name: "remove files", Command: rmCmd, Output: out, Error: errString(err)})
 	if err != nil {
 		return fail(Step{Name: "remove files", Command: rmCmd}, err)

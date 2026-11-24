@@ -110,7 +110,7 @@ func (a *API) updateSettings(w http.ResponseWriter, r *http.Request) {
 	a.setCurrentSettings(saved)
 	status := a.syncLocalCaddy(r.Context())
 
-	a.redeployDeployedExits("public URL changed")
+	a.redeployNodesWithAgents("public URL changed")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"settings": settingsView{
 			Settings:          saved,
@@ -140,7 +140,7 @@ func (a *API) deleteSettingsDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	a.setCurrentSettings(saved)
 	status := a.syncLocalCaddy(r.Context())
-	a.redeployDeployedExits("public domain removed")
+	a.redeployNodesWithAgents("public domain removed")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"settings": settingsView{
 			Settings:          saved,

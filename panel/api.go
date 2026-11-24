@@ -1,14 +1,11 @@
 package panel
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -46,8 +43,11 @@ type API struct {
 	provisioner NodeDeployer
 	publicURL   string
 	deployMu    sync.Mutex
-	deploying   map[int64]struct{}
-	pending     map[int64]struct{}
+	deploys     map[int64]*deployJob
+	pending     map[int64]string
+	deploySem   chan struct{}
+	nodeLocksMu sync.Mutex
+	nodeLocks   map[int64]*sync.Mutex
 
 	settingsMu   sync.RWMutex
 	settings     panelstore.Settings
@@ -75,8 +75,10 @@ func New(client *control.Client, sup ServerManager, logger *logging.Logger, toke
 		filter:         filter,
 		rulesDir:       rulesDir,
 		limiter:        newLoginLimiter(),
-		deploying:      make(map[int64]struct{}),
-		pending:        make(map[int64]struct{}),
+		deploys:        make(map[int64]*deployJob),
+		pending:        make(map[int64]string),
+		deploySem:      make(chan struct{}, 2),
+		nodeLocks:      make(map[int64]*sync.Mutex),
 		settings:       panelstore.DefaultSettings(),
 		geoClient:      &http.Client{Timeout: geoDownloadTimeout},
 		geoUpdateEvery: time.Minute,
@@ -115,7 +117,6 @@ func (a *API) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/stats", a.stats)
 	mux.HandleFunc("GET /api/stats/stream", a.statsStream)
-	mux.HandleFunc("GET /api/system/stats", a.systemStats)
 	a.registerSystemRoutes(mux)
 
 	mux.HandleFunc("GET /api/templates", a.templates)
@@ -130,8 +131,6 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/configs/{name}/disable", a.disable)
 	mux.HandleFunc("POST /api/configs/{name}/restart", a.restart)
 	mux.HandleFunc("GET /api/configs/{name}/logs", a.logs)
-
-	mux.HandleFunc("GET /api/backup", a.backup)
 
 	mux.HandleFunc("GET /api/rules", a.listRules)
 	mux.HandleFunc("POST /api/rules/{name}/enable", a.enableRule)
@@ -177,8 +176,9 @@ func (a *API) Handler() http.Handler {
 		}
 
 		path := r.URL.Path
-		if strings.HasPrefix(path, "/api/") || path == "/" || strings.HasSuffix(path, ".html") {
-			w.Header().Set("Cache-Control", "no-store")
+		if noStorePath(path) {
+			w.Header().Set("Cache-Control", "no-store, max-age=0")
+			w.Header().Set("Pragma", "no-cache")
 		}
 		if path == "/login" || path == "/login.html" || path == "/api/login" {
 			mux.ServeHTTP(w, r)
@@ -210,6 +210,20 @@ func (a *API) Handler() http.Handler {
 		}
 		writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 	})
+}
+
+func noStorePath(path string) bool {
+	if strings.HasPrefix(path, "/api/") || path == "/" {
+		return true
+	}
+	switch {
+	case strings.HasSuffix(path, ".html"),
+		strings.HasSuffix(path, ".js"),
+		strings.HasSuffix(path, ".css"),
+		strings.HasSuffix(path, ".json"):
+		return true
+	}
+	return false
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
@@ -342,67 +356,6 @@ func (a *API) applyRules(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restarted": true})
-}
-
-func (a *API) systemStats(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, getSystemStats())
-}
-
-func (a *API) backup(w http.ResponseWriter, r *http.Request) {
-	entries, err := os.ReadDir(a.configsDir)
-	if err != nil {
-		writeErr(w, 500, err)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf(`attachment; filename="shampoore-backup-%s.tar.gz"`,
-			time.Now().Format("2006-01-02-150405")))
-
-	gz := gzip.NewWriter(w)
-	tw := tar.NewWriter(gz)
-	defer func() {
-		if err := tw.Close(); err != nil {
-			a.logger.Warn("panel: backup tar close: ", err)
-		}
-		if err := gz.Close(); err != nil {
-			a.logger.Warn("panel: backup gzip close: ", err)
-		}
-	}()
-
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		path := filepath.Join(a.configsDir, e.Name())
-		info, err := e.Info()
-		if err != nil {
-			a.logger.Warn("panel: backup stat ", e.Name(), ": ", err)
-			continue
-		}
-		hdr, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			a.logger.Warn("panel: backup header ", e.Name(), ": ", err)
-			continue
-		}
-		hdr.Name = e.Name()
-		if err := tw.WriteHeader(hdr); err != nil {
-			a.logger.Warn("panel: backup write header: ", err)
-			return
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			a.logger.Warn("panel: backup open ", e.Name(), ": ", err)
-			continue
-		}
-		if _, err := io.Copy(tw, f); err != nil {
-			a.logger.Warn("panel: backup copy ", e.Name(), ": ", err)
-		}
-		if err := f.Close(); err != nil {
-			a.logger.Warn("panel: backup close ", e.Name(), ": ", err)
-		}
-	}
 }
 
 func (a *API) findConfigPath(name string) (string, error) {

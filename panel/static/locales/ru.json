@@ -13,10 +13,14 @@
     "rules": "Geo-правила"
   },
   "time": {
+    "justNow": "только что",
     "secAgo": "сек назад",
     "minAgo": "мин назад",
     "hourAgo": "ч назад",
-    "dayAgo": "дн назад"
+    "dayAgo": "дн назад",
+    "hoursAgo": "{hours} ч назад",
+    "hoursMinutesAgo": "{hours} ч {minutes} мин назад",
+    "daysAgo": "{days} дн назад"
   },
   "dashboard": {
     "relays": "Входные (Relay)",
@@ -59,9 +63,6 @@
     "deployDone": "Развёртывание завершено",
     "connecting": "Подключаемся к ноде…",
     "deleteTitle": "Удалить сервер",
-    "deleteBody": "Удалить «{name}»? Панель может сначала очистить Docker-контейнеры и /opt/shampoore.",
-    "deleteClean": "Очистить и удалить",
-    "deleteForce": "VPS уже удалён — удалить принудительно",
     "cleaning": "Очищаем сервер…",
     "deploySucceeded": "Развёртывание успешно",
     "deployFailed": "Развёртывание не удалось",
@@ -119,7 +120,30 @@
     "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
     "decoyRepoHint": "Укажите ссылку на публичный GitHub-репозиторий с index.html, style.css и app.js. Если поле пустое, сайт-заглушка не развёртывается",
     "secretsHint": "Секреты хранятся в базе панели и передаются на сервер при развёртывании. Нажмите 🎲, чтобы сгенерировать значение.",
-    "regenerate": "Сгенерировать случайное значение"
+    "regenerate": "Сгенерировать случайное значение",
+    "metricsCpu": "CPU",
+    "metricsRam": "RAM",
+    "metricsDisk": "Диск",
+    "resources": "Ресурсы",
+    "server": "Сервер",
+    "roles": "Роли",
+    "updatedAt": "Обновлено",
+    "actions": "Действия",
+    "metricsPending": "метрик ещё нет",
+    "lastSeen": "Обновлено {time}",
+    "neverSeen": "Нет телеметрии",
+    "redeployAll": "Переразвернуть все",
+    "redeployAllQueued": "В очереди: {count}",
+    "redeployAllDone": "Переразвёртывание завершено",
+    "redeployAllEmpty": "Нет развёрнутых серверов",
+    "queued": "В очереди",
+    "cleanupContainers": "Docker-контейнеры и тома",
+    "cleanupFiles": "Каталог /opt/shampoore и данные агента",
+    "cleanupSystemd": "Systemd-юниты и бинарники shampoore",
+    "deleteConfirmBody": "Удалить «{name}»? Панель остановит контейнеры, удалит тома, /opt/shampoore и systemd-юниты, затем удалит запись из БД.",
+    "deleteForceOption": "Сервер недоступен — удалить только запись из БД",
+    "deleteForceHint": "Включите, если VPS уже удалён или SSH недоступен. На сервере ничего не будет удалено.",
+    "deleteConfirmAction": "Очистить и удалить"
   },
   "roles": {
     "title": "Роль сервера",
@@ -175,7 +199,7 @@
     "routes": "Маршруты",
     "active": "Активен",
     "inactive": "Неактивен",
-    "never": "Никогда",
+    "never": "Бессрочно",
     "allRoutes": "Все маршруты",
     "qr": "QR-код",
     "copy": "Скопировать ссылку",
@@ -203,7 +227,24 @@
     "copyJson": "Скопировать JSON",
     "downloadJson": "Скачать .json",
     "bundleCopied": "JSON скопирован в буфер",
-    "bundleEmpty": "У этого пользователя пока нет доступных маршрутов."
+    "bundleEmpty": "У этого пользователя пока нет доступных маршрутов.",
+    "edit": "Редактировать",
+    "routesOrder": "Маршруты и порядок подписки",
+    "routesAvailable": "Доступные маршруты",
+    "routesSelected": "Порядок в подписке",
+    "noRoutesSelected": "Маршруты не выбраны — пользователь получит все маршруты.",
+    "allRoutesSelected": "Все маршруты уже выбраны.",
+    "orderHint": "Перетащите маршруты или используйте стрелки ▲▼. Ссылки в подписке идут в этом порядке.",
+    "moveUp": "Выше",
+    "moveDown": "Ниже",
+    "dragHint": "Перетащите, чтобы изменить порядок",
+    "date": "Дата",
+    "expiryDate": "Дата окончания",
+    "nameRequired": "Укажите имя пользователя",
+    "dateRequired": "Выберите дату окончания",
+    "limitRequired": "Укажите лимит трафика",
+    "daysLeft": "осталось {days} дн.",
+    "copyLink": "Копировать shampoore://"
   },
   "server": {
     "checking": "Проверка…",
@@ -261,7 +302,6 @@
     "remove": "Удалить",
     "refresh": "Обновить",
     "menu": "Меню",
-    "backup": "Резервная копия",
     "logout": "Выход"
   },
   "dialog": {
@@ -278,6 +318,7 @@
     "encryptionHint": "Необязательно. Общий секрет для XChaCha20-Poly1305.",
     "transport": "Транспорт",
     "advanced": "Расширенные параметры",
+    "advancedOptions": "Расширенные параметры",
     "advancedHint": "Дополнительные параметры транспорта. Пусто — используются умолчания.",
     "advancedEmpty": "Пока нет параметров.",
     "addPair": "Добавить параметр",
@@ -321,11 +362,6 @@
   },
   "confirm": {
     "deleteConfig": "Удалить этот конфиг? Действие необратимо."
-  },
-  "stats": {
-    "cpu": "Загрузка CPU",
-    "ram": "Использование RAM",
-    "uptime": "Время работы системы"
   },
   "rules": {
     "title": "Гео-правила",
@@ -371,7 +407,11 @@
     "exitNodesHint": "По умолчанию правило применяется ко всем Exit-серверам.",
     "noExitNodes": "Нет доступных Exit-серверов",
     "exitNodesRequired": "Выберите хотя бы один Exit-сервер",
-    "exitNodesSaved": "Привязка Exit-серверов сохранена"
+    "exitNodesSaved": "Привязка Exit-серверов сохранена",
+    "subtitle": "GeoIP-правила и списки CIDR для Exit-серверов.",
+    "loading": "Загружаем правила…",
+    "manualHint": "Правило добавлено вручную; обновите список CIDR при необходимости.",
+    "applyShort": "Применить"
   },
   "update": {
     "current": "Версия",
@@ -389,5 +429,12 @@
     "waiting": "Ожидание перезапуска панели…",
     "done": "Обновление установлено. Перезагрузка…",
     "failed": "Панель не вернулась вовремя"
+  },
+  "live": {
+    "on": "Live",
+    "paused": "Пауза",
+    "pause": "Приостановить обновление",
+    "resume": "Возобновить обновление",
+    "hint": "Данные обновляются каждые несколько секунд."
   }
 }

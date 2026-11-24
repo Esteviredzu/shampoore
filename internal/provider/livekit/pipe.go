@@ -202,12 +202,13 @@ func (p *Pipe) heartbeatLoop(ctx context.Context) {
 
 		p.sendHeartbeat()
 
-		if !p.peerHeartbeat.Load() {
-			continue
-		}
 		timeout := p.heartbeatTimeout
 		if timeout <= 0 {
 			timeout = pipeHeartbeatTimeout
+		}
+
+		if !p.peerHeartbeat.Load() && p.GetRemoteID() == "" {
+			continue
 		}
 		if time.Since(time.Unix(0, p.lastRecv.Load())) >= timeout {
 			p.fireDead()

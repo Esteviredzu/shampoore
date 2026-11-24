@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -13,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/Esteviredzu/shampoore/internal/wsshape"
 )
 
 const (
@@ -25,6 +26,8 @@ const (
 	minTickDelay  = 300 * time.Millisecond
 	maxTickJitter = 300 * time.Millisecond
 	telemetryRead = 16 << 10
+
+	decoyRateWait = 250 * time.Millisecond
 
 	clientQueueCap = 256
 )
@@ -40,6 +43,7 @@ type Server struct {
 	feed      *Feed
 	now       func() time.Time
 	tickDelay func() time.Duration
+	shape     shapeState
 
 	decoyMu  sync.Mutex
 	decoyDir string
@@ -98,13 +102,12 @@ func New(password string) *Server {
 	s := &Server{
 		password:       strings.TrimSpace(password),
 		maxMessageSize: DefaultMaxMessageSize,
-		pingInterval:   defaultPingInterval,
-		pongWait:       defaultPongWait,
 		feed:           NewFeed(FeedOptions{}),
 		now:            time.Now,
-		tickDelay:      defaultTickDelay,
 		rooms:          make(map[string]map[*client]struct{}),
 	}
+	s.shape.config = wsshape.Default()
+	s.shape.source = "default"
 	base := websocket.Upgrader{
 		CheckOrigin:     func(*http.Request) bool { return true },
 		ReadBufferSize:  32 << 10,
@@ -125,10 +128,6 @@ func (s *Server) SetFeed(f *Feed) {
 }
 
 func (s *Server) Feed() *Feed { return s.feed }
-
-func defaultTickDelay() time.Duration {
-	return minTickDelay + time.Duration(rand.Int64N(int64(maxTickJitter)+1))
-}
 
 func (s *Server) SetMaxMessageSize(n int64) {
 	if n > 0 {
@@ -205,7 +204,7 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveTunnel(room string, conn *websocket.Conn) {
 	conn.SetReadLimit(s.maxMessageSize)
 
-	wait := s.pongWait
+	wait := s.pongWaitDuration()
 	if wait <= 0 {
 		wait = defaultPongWait
 	}
@@ -247,7 +246,12 @@ func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	conn.SetReadLimit(telemetryRead)
+	shape := s.Shape()
+	readLimit := int64(shape.Frame.MaxMessageBytes)
+	if readLimit <= 0 {
+		readLimit = telemetryRead
+	}
+	conn.SetReadLimit(readLimit)
 	c := newClient(conn)
 	go s.writeLoop(c)
 	defer func() { c.close() }()
@@ -266,9 +270,10 @@ func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
 	defer close(stopPing)
 	go s.pingLoop(c, stopPing)
 
+	limiter := decoyLimiter(shape.Rate)
 	ctx := r.Context()
 	for {
-		timer := time.NewTimer(s.tickDelay())
+		timer := time.NewTimer(s.nextTickDelay())
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -279,11 +284,32 @@ func (s *Server) serveTelemetry(w http.ResponseWriter, r *http.Request) {
 		case <-timer.C:
 		}
 
-		data, err := json.Marshal(s.feed.Tick())
+		shape = s.Shape()
+		payload, err := json.Marshal(s.feed.Tick())
 		if err != nil {
 			return
 		}
-		if !c.enqueue(clientMessage{typ: websocket.TextMessage, data: data}) {
+		frame := wsshape.PadPayload(payload, shape.Padding)
+		if maxFrame := shape.Frame.MaxFrameBytes; maxFrame > 0 && len(frame) > maxFrame {
+
+			if len(payload) > maxFrame {
+				continue
+			}
+			frame = payload
+		}
+		if limiter != nil {
+			waitCtx, cancel := context.WithTimeout(ctx, decoyRateWait)
+			err := limiter.WaitN(waitCtx, len(frame))
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
+				continue
+			}
+		}
+		if !c.enqueue(clientMessage{typ: websocket.TextMessage, data: frame}) {
 			return
 		}
 	}
@@ -305,7 +331,7 @@ func (s *Server) writeLoop(c *client) {
 }
 
 func (s *Server) pingLoop(c *client, stop <-chan struct{}) {
-	ticker := time.NewTicker(s.pingInterval)
+	ticker := time.NewTicker(s.pingEvery())
 	defer ticker.Stop()
 	for {
 		select {

@@ -33,17 +33,21 @@ type syncResponse struct {
 	Users  []auth.UserSpec `json:"users"`
 }
 
-func (p *HTTPPanel) Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta) ([]auth.UserSpec, error) {
+func (p *HTTPPanel) Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error) {
 	if p == nil || p.BaseURL == "" {
 		return nil, fmt.Errorf("nodeagent: panel url is empty")
 	}
 	if traffic == nil {
 		traffic = []panelstore.TrafficDelta{}
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"node_id": nodeID,
 		"traffic": traffic,
-	})
+	}
+	if metrics != nil {
+		payload["metrics"] = metrics
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}

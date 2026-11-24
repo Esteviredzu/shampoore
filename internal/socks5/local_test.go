@@ -31,6 +31,31 @@ func TestLocalHandshakeDeadline(t *testing.T) {
 	}
 }
 
+func TestNormalizeListen(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"127.0.0.1:1080", "127.0.0.1:1080"},
+		{" 127.0.0.1:1080 ", "127.0.0.1:1080"},
+		{":1080", "127.0.0.1:1080"},
+		{"0.0.0.0:1080", "127.0.0.1:1080"},
+		{"[::]:1080", "127.0.0.1:1080"},
+		{"*:1080", "127.0.0.1:1080"},
+		{"1080", "127.0.0.1:1080"},
+		{"[::1]:9050", "[::1]:9050"},
+		{"localhost:1080", "localhost:1080"},
+		{"not-an-address", "not-an-address"},
+	}
+	for _, tc := range cases {
+		if got := NormalizeListen(tc.in); got != tc.want {
+			t.Fatalf("NormalizeListen(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func tcpPair(t *testing.T) (client, server net.Conn) {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")

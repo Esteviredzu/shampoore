@@ -11,6 +11,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/core/reliability/kcp"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/mode/raw"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/provider/telemost"
 )
 
@@ -49,6 +50,16 @@ func init() {
 				Required:    true,
 				Placeholder: "https://telemost.yandex.ru/j/...",
 				Hint:        "Conference URL or its ID",
+			},
+			{
+				Key:         "utls_profile",
+				Label:       "uTLS Profile",
+				Type:        app.FieldTypeText,
+				Required:    false,
+				Advanced:    true,
+				Options:     utlsdial.SupportedProfiles(),
+				Placeholder: "chrome",
+				Hint:        "chrome (default), random, firefox, safari, ios, edge",
 			},
 		},
 		Defaults:  defaults,

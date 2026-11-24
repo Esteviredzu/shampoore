@@ -30,6 +30,10 @@ type Field struct {
 	Hint        string    `json:"hint,omitempty"`
 	Type        FieldType `json:"type"`
 	Required    bool      `json:"required,omitempty"`
+
+	Advanced bool `json:"advanced,omitempty"`
+
+	Options []string `json:"options,omitempty"`
 }
 
 type Builder func(

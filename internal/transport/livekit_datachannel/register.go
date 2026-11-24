@@ -16,6 +16,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 	lk "github.com/Esteviredzu/shampoore/internal/provider/livekit"
 	"github.com/Esteviredzu/shampoore/internal/transport"
@@ -83,6 +84,16 @@ func init() {
 				Type:        app.FieldTypeText,
 				Required:    false,
 				Placeholder: "shampoore",
+			},
+			{
+				Key:         "utls_profile",
+				Label:       "uTLS Profile",
+				Type:        app.FieldTypeText,
+				Required:    false,
+				Advanced:    true,
+				Options:     utlsdial.SupportedProfiles(),
+				Placeholder: "chrome",
+				Hint:        "chrome (default), random, firefox, safari, ios, edge",
 			},
 		},
 		Defaults: defaults,

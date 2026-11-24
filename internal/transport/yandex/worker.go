@@ -13,6 +13,7 @@ type WorkerConfig struct {
 	ScanInterval time.Duration
 	BatchSize    int
 	BatchPause   time.Duration
+	UTLSProfile  string
 }
 
 type CleanupWorker struct {
@@ -49,7 +50,7 @@ func NewCleanupWorker(creds *Credentials, logger logging.ContextLogger, cfg Work
 }
 
 func (w *CleanupWorker) Start(ctx context.Context) error {
-	boardCfg := BoardConfig{QueueSize: 65536}
+	boardCfg := BoardConfig{QueueSize: 65536, UTLSProfile: w.cfg.UTLSProfile}
 	client := NewBoardClient(w.logger, w.creds, boardCfg)
 	if err := client.Connect(ctx); err != nil {
 		return err

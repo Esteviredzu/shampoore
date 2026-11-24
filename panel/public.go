@@ -74,6 +74,7 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NodeID  int64                     `json:"node_id"`
 		Traffic []panelstore.TrafficDelta `json:"traffic"`
+		Metrics *panelstore.NodeMetrics   `json:"metrics"`
 	}
 	if err := decodeBody(w, r, &req, 4<<20); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -96,7 +97,19 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = a.store.TouchNode(r.Context(), node.ID)
+
+	if req.Metrics != nil {
+		if err := a.store.RecordNodeMetrics(r.Context(), node.ID, *req.Metrics); err != nil {
+			if errors.Is(err, panelstore.ErrInvalid) {
+				writeErr(w, http.StatusBadRequest, err)
+			} else {
+				writeErr(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+	} else {
+		_ = a.store.TouchNode(r.Context(), node.ID)
+	}
 
 	now := time.Now()
 	users, err := a.store.ActiveUsersForExit(r.Context(), node.ID, now)

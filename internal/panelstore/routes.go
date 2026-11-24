@@ -292,7 +292,8 @@ func (s *Store) DeleteRoute(ctx context.Context, id int64) error {
 	if affected == 0 {
 		return fmt.Errorf("%w: route %d", ErrNotFound, id)
 	}
-	return nil
+
+	return s.pruneUserRouteRefs(ctx, id)
 }
 
 func (s *Store) routeUsedByMulti(ctx context.Context, id int64) (Route, bool, error) {

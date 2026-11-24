@@ -3,6 +3,9 @@ package nodeagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"testing"
 
@@ -15,10 +18,12 @@ import (
 type fakePanel struct {
 	users   []auth.UserSpec
 	traffic [][]panelstore.TrafficDelta
+	metrics []*panelstore.NodeMetrics
 }
 
-func (f *fakePanel) Sync(_ context.Context, _ int64, traffic []panelstore.TrafficDelta) ([]auth.UserSpec, error) {
+func (f *fakePanel) Sync(_ context.Context, _ int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error) {
 	f.traffic = append(f.traffic, append([]panelstore.TrafficDelta(nil), traffic...))
+	f.metrics = append(f.metrics, metrics)
 	return f.users, nil
 }
 
@@ -185,5 +190,120 @@ func TestStateKeysAreStable(t *testing.T) {
 	sort.Strings(keys)
 	if keys[0] != "a\x00u1" || keys[1] != "a\x00u2" || keys[2] != "b\x00u1" {
 		t.Fatalf("unexpected keys: %q", keys)
+	}
+}
+
+type fakeMetrics struct {
+	metrics panelstore.NodeMetrics
+	err     error
+}
+
+func (f fakeMetrics) Sample() (panelstore.NodeMetrics, error) { return f.metrics, f.err }
+
+func TestSyncOnceReportsHostMetrics(t *testing.T) {
+	panel := &fakePanel{}
+	ctrl := &fakeControl{}
+	metrics := fakeMetrics{metrics: panelstore.NodeMetrics{
+		CPUPercent:     33.5,
+		MemUsedBytes:   256 << 20,
+		MemTotalBytes:  1024 << 20,
+		DiskUsedBytes:  4 << 30,
+		DiskTotalBytes: 32 << 30,
+	}}
+	agent := NewWithClients(Config{
+		NodeID:    7,
+		StateFile: t.TempDir() + "/state.json",
+		Metrics:   metrics,
+	}, panel, ctrl)
+	if err := agent.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(panel.metrics) != 1 || panel.metrics[0] == nil {
+		t.Fatalf("metrics were not sent: %+v", panel.metrics)
+	}
+	if got := panel.metrics[0]; got.CPUPercent != 33.5 || got.MemTotalBytes != 1024<<20 || got.DiskUsedBytes != 4<<30 {
+		t.Fatalf("sent metrics = %+v", got)
+	}
+}
+
+func TestSyncOnceSurvivesMetricsFailure(t *testing.T) {
+	panel := &fakePanel{}
+	ctrl := &fakeControl{}
+	agent := NewWithClients(Config{
+		NodeID:    7,
+		StateFile: t.TempDir() + "/state.json",
+		Metrics:   fakeMetrics{err: errors.New("no /proc")},
+	}, panel, ctrl)
+	if err := agent.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("metrics failure must not break sync: %v", err)
+	}
+	if len(panel.metrics) != 1 || panel.metrics[0] != nil {
+		t.Fatalf("metrics after failure = %+v", panel.metrics)
+	}
+}
+
+type failingControl struct{}
+
+func (failingControl) Usage() ([]manager.UsageEntry, error) {
+	return nil, errors.New("control socket is unavailable")
+}
+func (failingControl) List() ([]manager.EntryView, error) {
+	return nil, errors.New("control socket is unavailable")
+}
+func (failingControl) Update(string, manager.ConfigEntry) error {
+	return errors.New("control socket is unavailable")
+}
+
+func TestSyncOnceWithoutControlStillReportsMetrics(t *testing.T) {
+	panel := &fakePanel{}
+	metrics := fakeMetrics{metrics: panelstore.NodeMetrics{
+		CPUPercent:     12,
+		MemUsedBytes:   128 << 20,
+		MemTotalBytes:  512 << 20,
+		DiskUsedBytes:  1 << 30,
+		DiskTotalBytes: 8 << 30,
+	}}
+	agent := NewWithClients(Config{
+		NodeID:    9,
+		StateFile: t.TempDir() + "/state.json",
+		Metrics:   metrics,
+	}, panel, failingControl{})
+	if err := agent.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("relay heartbeat must survive a missing control socket: %v", err)
+	}
+	if len(panel.metrics) != 1 || panel.metrics[0] == nil {
+		t.Fatalf("metrics were not sent: %+v", panel.metrics)
+	}
+	if got := panel.metrics[0]; got.CPUPercent != 12 || got.DiskTotalBytes != 8<<30 {
+		t.Fatalf("sent metrics = %+v", got)
+	}
+	if len(panel.traffic) != 1 || len(panel.traffic[0]) != 0 {
+		t.Fatalf("traffic = %+v, want an empty heartbeat", panel.traffic)
+	}
+}
+
+func TestHTTPPanelSendsMetrics(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"node_id":3,"users":[]}`))
+	}))
+	defer server.Close()
+	panel := NewHTTPPanel(server.URL, "secret")
+	metrics := &panelstore.NodeMetrics{CPUPercent: 12.5, MemUsedBytes: 100, MemTotalBytes: 200}
+	if _, err := panel.Sync(context.Background(), 3, nil, metrics); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := got["metrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("metrics missing in payload: %+v", got)
+	}
+	if raw["cpu_percent"] != 12.5 || raw["mem_used_bytes"] != float64(100) {
+		t.Fatalf("payload metrics = %+v", raw)
 	}
 }

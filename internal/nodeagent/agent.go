@@ -19,7 +19,7 @@ import (
 )
 
 type PanelClient interface {
-	Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta) ([]auth.UserSpec, error)
+	Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error)
 }
 
 type ControlClient interface {
@@ -36,15 +36,19 @@ type Config struct {
 	ConfigsDir    string
 	StateFile     string
 	Interval      time.Duration
+	Metrics       MetricsSource
 }
 
 type Agent struct {
 	cfg     Config
 	panel   PanelClient
 	control ControlClient
+	metrics MetricsSource
 
-	mu    sync.Mutex
-	state stateFile
+	mu             sync.Mutex
+	state          stateFile
+	lastMetricsErr time.Time
+	lastControlErr time.Time
 }
 
 type baseline struct {
@@ -58,15 +62,23 @@ type stateFile struct {
 
 func New(cfg Config) *Agent {
 	if cfg.Interval <= 0 {
-		cfg.Interval = 30 * time.Second
+		cfg.Interval = 5 * time.Second
+	}
+	if cfg.Interval < 2*time.Second {
+		cfg.Interval = 2 * time.Second
 	}
 	if cfg.StateFile == "" {
 		cfg.StateFile = "/opt/shampoore/agent-state.json"
+	}
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = NewHostMetrics()
 	}
 	return &Agent{
 		cfg:     cfg,
 		panel:   NewHTTPPanel(cfg.PanelURL, cfg.NodeSecret),
 		control: control.NewClient(cfg.ControlSocket),
+		metrics: metrics,
 		state:   stateFile{Entries: map[string]baseline{}},
 	}
 }
@@ -102,14 +114,75 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) SyncOnce(ctx context.Context) error {
-	if a.panel == nil || a.control == nil {
-		return fmt.Errorf("nodeagent: clients are not configured")
+	if a.panel == nil {
+		return fmt.Errorf("nodeagent: panel client is not configured")
+	}
+
+	usage, usageOK := a.collectUsage()
+	next, traffic := a.trafficDeltas(usage, usageOK)
+	metrics := a.sampleMetrics()
+	users, err := a.panel.Sync(ctx, a.cfg.NodeID, traffic, metrics)
+	if err != nil {
+		return fmt.Errorf("nodeagent: panel sync: %w", err)
+	}
+
+	updated, applyErr := a.applyUsers(users)
+	if applyErr != nil {
+		a.logControlFailure("apply users", applyErr)
+	}
+
+	if !usageOK {
+
+		return nil
+	}
+
+	a.mu.Lock()
+	a.state.Entries = next
+	for _, config := range updated {
+		prefix := config + "\x00"
+		for key := range a.state.Entries {
+			if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+				delete(a.state.Entries, key)
+			}
+		}
+	}
+	snapshot := stateFile{Entries: make(map[string]baseline, len(a.state.Entries))}
+	for k, v := range a.state.Entries {
+		snapshot.Entries[k] = v
+	}
+	a.mu.Unlock()
+
+	return a.saveState(snapshot)
+}
+
+func (a *Agent) collectUsage() ([]manager.UsageEntry, bool) {
+	if a.control == nil {
+		return nil, false
 	}
 	usage, err := a.control.Usage()
 	if err != nil {
-		return fmt.Errorf("nodeagent: usage: %w", err)
+		a.logControlFailure("usage", err)
+		return nil, false
 	}
+	return usage, true
+}
 
+func (a *Agent) logControlFailure(op string, err error) {
+	a.mu.Lock()
+	shouldLog := a.lastControlErr.IsZero() || time.Since(a.lastControlErr) > time.Minute
+	if shouldLog {
+		a.lastControlErr = time.Now()
+	}
+	a.mu.Unlock()
+	if shouldLog {
+		log.Printf("node-agent: control %s: %v", op, err)
+	}
+}
+
+func (a *Agent) trafficDeltas(usage []manager.UsageEntry, usageOK bool) (map[string]baseline, []panelstore.TrafficDelta) {
+	if !usageOK {
+		return nil, []panelstore.TrafficDelta{}
+	}
 	a.mu.Lock()
 	next := make(map[string]baseline, len(usage))
 	deltas := make(map[string]*panelstore.TrafficDelta)
@@ -142,33 +215,7 @@ func (a *Agent) SyncOnce(ctx context.Context) error {
 	for _, d := range deltas {
 		traffic = append(traffic, *d)
 	}
-	users, err := a.panel.Sync(ctx, a.cfg.NodeID, traffic)
-	if err != nil {
-		return fmt.Errorf("nodeagent: panel sync: %w", err)
-	}
-
-	updated, err := a.applyUsers(users)
-	if err != nil {
-		return fmt.Errorf("nodeagent: apply users: %w", err)
-	}
-
-	a.mu.Lock()
-	a.state.Entries = next
-	for _, config := range updated {
-		prefix := config + "\x00"
-		for key := range a.state.Entries {
-			if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
-				delete(a.state.Entries, key)
-			}
-		}
-	}
-	snapshot := stateFile{Entries: make(map[string]baseline, len(a.state.Entries))}
-	for k, v := range a.state.Entries {
-		snapshot.Entries[k] = v
-	}
-	a.mu.Unlock()
-
-	return a.saveState(snapshot)
+	return next, traffic
 }
 
 func (a *Agent) applyUsers(users []auth.UserSpec) ([]string, error) {

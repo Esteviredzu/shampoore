@@ -247,6 +247,10 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.ensureNodeTelemetryColumns(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	if path != ":memory:" {
 		if err := os.Chmod(path, 0o600); err != nil {
@@ -293,6 +297,47 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+func (s *Store) ensureNodeTelemetryColumns(ctx context.Context) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"cpu_percent", "ALTER TABLE nodes ADD COLUMN cpu_percent REAL NOT NULL DEFAULT 0"},
+		{"mem_used_bytes", "ALTER TABLE nodes ADD COLUMN mem_used_bytes INTEGER NOT NULL DEFAULT 0"},
+		{"mem_total_bytes", "ALTER TABLE nodes ADD COLUMN mem_total_bytes INTEGER NOT NULL DEFAULT 0"},
+		{"disk_used_bytes", "ALTER TABLE nodes ADD COLUMN disk_used_bytes INTEGER NOT NULL DEFAULT 0"},
+		{"disk_total_bytes", "ALTER TABLE nodes ADD COLUMN disk_total_bytes INTEGER NOT NULL DEFAULT 0"},
+		{"last_seen", "ALTER TABLE nodes ADD COLUMN last_seen TEXT NOT NULL DEFAULT ''"},
+	}
+	existing := make(map[string]struct{}, len(columns))
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('nodes')`)
+	if err != nil {
+		return fmt.Errorf("panelstore: read nodes schema: %w", err)
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("panelstore: scan nodes schema: %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("panelstore: read nodes schema: %w", err)
+	}
+	rows.Close()
+	for _, column := range columns {
+		if _, ok := existing[column.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, column.ddl); err != nil {
+			return fmt.Errorf("panelstore: add nodes.%s: %w", column.name, err)
+		}
+	}
+	return nil
 }
 
 func formatTime(t time.Time) string {

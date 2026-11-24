@@ -15,6 +15,7 @@ func (s *Server) SetDecoyDir(dir string) {
 	s.decoyMu.Lock()
 	s.decoyDir = strings.TrimSpace(dir)
 	s.decoyMu.Unlock()
+	s.reloadShape()
 }
 
 func (s *Server) DecoyDir() string {

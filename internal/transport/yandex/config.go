@@ -9,6 +9,8 @@ import (
 type Config struct {
 	Hash string `json:"hash"`
 
+	UTLSProfile string `json:"utls_profile,omitempty"`
+
 	PipeQueue         int   `json:"pipe_queue,omitempty"`
 	BoardQueue        int   `json:"board_queue,omitempty"`
 	SendBatch         int   `json:"send_batch,omitempty"`

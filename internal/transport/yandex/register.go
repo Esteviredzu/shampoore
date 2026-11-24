@@ -8,6 +8,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/core/reliability"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
@@ -31,6 +32,16 @@ func init() {
 				Type:     app.FieldTypeText,
 				Required: true,
 				Hint:     "32 hex chars from the board URL",
+			},
+			{
+				Key:         "utls_profile",
+				Label:       "uTLS Profile",
+				Type:        app.FieldTypeText,
+				Required:    false,
+				Advanced:    true,
+				Options:     utlsdial.SupportedProfiles(),
+				Placeholder: "chrome",
+				Hint:        "chrome (default), random, firefox, safari, ios, edge",
 			},
 		},
 		Defaults:  defaults,
@@ -61,7 +72,7 @@ func buildTransport(
 		return nil, err
 	}
 
-	creds, err := Bootstrap(ctx, cfg.Hash)
+	creds, err := Bootstrap(ctx, cfg.Hash, cfg.UTLSProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +83,7 @@ func buildTransport(
 	boardCfg := DefaultBoardConfig()
 	boardCfg.QueueSize = cfg.BoardQueue
 	boardCfg.HeartbeatDisabled = cfg.HeartbeatDisabled
+	boardCfg.UTLSProfile = cfg.UTLSProfile
 
 	client := NewBoardClient(logger, creds, boardCfg)
 	if err := client.Connect(ctx); err != nil {
@@ -117,6 +129,7 @@ func buildTransport(
 			ScanInterval: time.Duration(cfg.WorkerScanSec) * time.Second,
 			BatchSize:    cfg.WorkerBatch,
 			BatchPause:   time.Duration(cfg.WorkerBatchPauseMs) * time.Millisecond,
+			UTLSProfile:  cfg.UTLSProfile,
 		}
 		sides = append(sides, NewCleanupWorker(creds, logger, workerCfg))
 	}

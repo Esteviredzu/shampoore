@@ -350,7 +350,7 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 
 	switch mode {
 	case runSocks5:
-		listen := s.EffectiveAdvanced().String("socks5_listen", "127.0.0.1:1080")
+		listen := socks5.NormalizeListen(s.EffectiveAdvanced().String("socks5_listen", "127.0.0.1:1080"))
 		srv := socks5.NewLocalServer(listen, mux, lg, app.IPv4Only)
 		srv.SetGeoFilter(filter, false)
 		go func() {

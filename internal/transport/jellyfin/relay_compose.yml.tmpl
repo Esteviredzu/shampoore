@@ -1,0 +1,32 @@
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: shampoore-jellyfin
+    restart: unless-stopped
+    environment:
+      JELLYFIN_PublishedServerUrl: "https://{{ .Domain }}"
+    volumes:
+      - ./jellyfin/config:/config
+      - ./jellyfin/cache:/cache
+      - ./jellyfin/media:/media:ro
+{{ if .LocalRelay }}    ports:
+      - "127.0.0.1:8096:8096"
+{{ end }}
+  jellyfin-broker:
+    image: debian:bookworm-slim
+    restart: unless-stopped
+    command:
+      - /opt/shampoore/bin/shampoore-relay
+      - "-listen="
+      - -jellyfin-listen
+      - ":8097"
+      - -jellyfin-secret
+      - "{{ .Secret }}"
+      - -jellyfin-upstream
+      - "http://jellyfin:8096"
+    depends_on:
+      - jellyfin
+    volumes:
+      - ./bin/shampoore-relay:/opt/shampoore/bin/shampoore-relay:ro
+{{ if .LocalRelay }}    ports:
+      - "127.0.0.1:8097:8097"
+{{ end }}

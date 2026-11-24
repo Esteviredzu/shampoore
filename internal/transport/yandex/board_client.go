@@ -11,13 +11,12 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
-	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 )
 
 const (
 	boardsWSPath = "wss://socket92.boards.yandex.ru/socket.io/?EIO=4&transport=websocket"
 	boardsOrigin = "https://boards.yandex.ru"
-	boardsUA     = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 
 	reconnectInitialDelay = 1 * time.Second
 	reconnectMaxDelay     = 30 * time.Second
@@ -26,6 +25,7 @@ const (
 type BoardConfig struct {
 	QueueSize         int
 	HeartbeatDisabled bool
+	UTLSProfile       string
 }
 
 func DefaultBoardConfig() BoardConfig {
@@ -154,10 +154,11 @@ func (c *BoardClient) NotifyNetworkChanged() {
 func (c *BoardClient) establishConnection(ctx context.Context) error {
 	c.logger.Debug("connecting to Yandex Boards...")
 
+	profile := utlsdial.Profile(c.cfg.UTLSProfile)
 	opts := &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: netdial.NewHTTPTransport()},
+		HTTPClient: &http.Client{Transport: utlsdial.NewHTTPTransport(profile)},
 		HTTPHeader: http.Header{
-			"User-Agent":   []string{boardsUA},
+			"User-Agent":   []string{utlsdial.UserAgent(profile)},
 			"Cookie":       []string{c.creds.Cookie},
 			"Origin":       []string{boardsOrigin},
 			"X-Auth-Proxy": []string{"true"},

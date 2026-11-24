@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,7 +61,7 @@ func (s *minioStore) ListObjects(ctx context.Context, bucket string, opts minio.
 
 func newMinioStore(cfg *Config) (objectStore, error) {
 
-	tr := utlsdial.NewHTTP1Transport(utlsdial.ProfileChrome)
+	tr := utlsdial.NewHTTP1Transport(utlsdial.Profile(strings.TrimSpace(cfg.UTLSProfile)))
 
 	cl, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
@@ -101,6 +102,11 @@ type Pipe struct {
 
 	ctr transport.Counters
 	wg  sync.WaitGroup
+
+	deadOnce sync.Once
+	deadCh   chan struct{}
+	deadMu   sync.Mutex
+	deadErr  error
 }
 
 type listedObject struct {
@@ -175,6 +181,10 @@ const stopFlushTimeout = 2 * time.Second
 
 const bucketTimeout = 15 * time.Second
 
+var s3RequestTimeout = 15 * time.Second
+
+var downloadSilenceLimit = 60 * time.Second
+
 func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
 	store, err := newMinioStore(cfg)
 	if err != nil {
@@ -219,6 +229,7 @@ func newPipeWithStore(cfg *Config, role string, logger logging.ContextLogger, st
 		wake:          make(chan struct{}, 1),
 		deferred:      make(map[string]*deferredBatch),
 		pendingDelete: make(map[string]struct{}),
+		deadCh:        make(chan struct{}),
 	}, nil
 }
 
@@ -235,6 +246,30 @@ func (p *Pipe) pipeContext() context.Context {
 		return stoppedContext
 	}
 	return p.ctx
+}
+
+func (p *Pipe) failSession(err error) {
+	if err == nil {
+		err = transport.ErrPipeReset
+	}
+	p.deadMu.Lock()
+	if p.deadErr == nil {
+		p.deadErr = fmt.Errorf("%w: %v", transport.ErrPipeReset, err)
+	}
+	p.deadMu.Unlock()
+	if p.logger != nil {
+		p.logger.Warn("silo: session failed: ", err)
+	}
+	p.deadOnce.Do(func() { close(p.deadCh) })
+}
+
+func (p *Pipe) deadError() error {
+	p.deadMu.Lock()
+	defer p.deadMu.Unlock()
+	if p.deadErr == nil {
+		return transport.ErrPipeReset
+	}
+	return p.deadErr
 }
 
 func (p *Pipe) Start(ctx context.Context) error {
@@ -363,6 +398,8 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 		return ctx.Err()
 	case <-pipeCtx.Done():
 		return transport.ErrPipeReset
+	case <-p.deadCh:
+		return p.deadError()
 	}
 
 	select {
@@ -372,6 +409,8 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 		return ctx.Err()
 	case <-pipeCtx.Done():
 		return transport.ErrPipeReset
+	case <-p.deadCh:
+		return p.deadError()
 	}
 }
 
@@ -382,6 +421,8 @@ func (p *Pipe) ReceiveMessage(ctx context.Context) ([]byte, error) {
 		return nil, ctx.Err()
 	case <-pipeCtx.Done():
 		return nil, transport.ErrPipeReset
+	case <-p.deadCh:
+		return nil, p.deadError()
 	case data, ok := <-p.recvCh:
 		if !ok {
 			return nil, io.EOF
@@ -439,6 +480,9 @@ func (p *Pipe) sendLoop(ctx context.Context) {
 			flush(flushCtx)
 			cancel()
 			return
+		case <-p.deadCh:
+
+			return
 		case msg := <-p.sendCh:
 			emptyBuffer := len(buffer) == 0
 			var hdr [4]byte
@@ -479,7 +523,9 @@ func (p *Pipe) upload(ctx context.Context, buf []byte) error {
 	objName := fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), rand.Int63())
 	fullKey := p.writePrefix + objName
 
-	_, err := p.store.PutObject(ctx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
+	reqCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
+	defer cancel()
+	_, err := p.store.PutObject(reqCtx, p.cfg.Bucket, fullKey, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{
 		ContentType: "application/octet-stream",
 	})
 	if err != nil {
@@ -524,25 +570,39 @@ func (p *Pipe) receiveLoop(ctx context.Context) {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	lastProgress := time.Now()
+	sawTraffic := false
 
-	poll := func() {
+	poll := func() bool {
 		if p.idleHead(lastProgress) {
 			p.ResetReadHead()
 		}
-		if p.pollOnce(ctx) > 0 {
+		pollCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
+		delivered := p.pollOnce(pollCtx)
+		cancel()
+		if delivered > 0 {
+			sawTraffic = true
 			delay = base
 			lastProgress = time.Now()
-		} else {
-			delay = nextPollDelay(delay, base, maxPollBackoff)
+			return true
 		}
+		delay = nextPollDelay(delay, base, maxPollBackoff)
+		if sawTraffic && downloadSilenceLimit > 0 && time.Since(lastProgress) >= downloadSilenceLimit {
+			p.failSession(fmt.Errorf("silo: downlink silent for %s", downloadSilenceLimit))
+			return false
+		}
+		return true
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-p.deadCh:
+			return
 		case <-p.wake:
-			poll()
+			if !poll() {
+				return
+			}
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -551,7 +611,9 @@ func (p *Pipe) receiveLoop(ctx context.Context) {
 			}
 			timer.Reset(delay)
 		case <-timer.C:
-			poll()
+			if !poll() {
+				return
+			}
 			timer.Reset(delay)
 		}
 	}

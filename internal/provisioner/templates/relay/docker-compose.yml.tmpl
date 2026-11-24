@@ -16,10 +16,28 @@ services:
       - {{ .Name }}
 {{- end }}
 {{ end }}
+{{- if .UsesAgent }}
+  node-agent:
+    image: debian:bookworm-slim
+    restart: unless-stopped
+    command:
+      - /opt/shampoore/bin/shampoore-node-agent
+    env_file:
+      - ./agent.env
+    volumes:
+      - ./bin/shampoore-node-agent:/opt/shampoore/bin/shampoore-node-agent:ro
+      - agent_state:/opt/shampoore/state
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+{{ end }}
 {{- range .Services }}
 {{ printf "%s" .Compose }}
 {{- end }}
-{{ if not .LocalRelay }}volumes:
+{{ if or (not .LocalRelay) .UsesAgent }}volumes:
+{{- if not .LocalRelay }}
   caddy_data:
   caddy_config:
+{{- end }}
+{{- if .UsesAgent }}
+  agent_state:
+{{- end }}
 {{ end }}

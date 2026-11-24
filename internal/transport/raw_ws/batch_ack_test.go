@@ -105,10 +105,9 @@ func TestSendLoopReportsWriteFailure(t *testing.T) {
 		ctx:    ctx,
 		done:   make(chan struct{}),
 		queue:  make(chan outboundMsg, 4),
-		errCh:  make(chan error, 4),
 		cancel: cancel,
 	}
-	go tr.sendLoop(ctx, sess, sess.errCh)
+	go tr.sendLoop(ctx, sess)
 
 	msg := outboundMsg{data: []byte("payload"), done: make(chan error, 1)}
 	if err := sess.enqueue(msg, time.Second); err != nil {

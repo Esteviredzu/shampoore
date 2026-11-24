@@ -35,6 +35,8 @@ type Config struct {
 
 	RoomPrefix string `json:"room_prefix,omitempty"`
 
+	UTLSProfile string `json:"utls_profile,omitempty"`
+
 	IdleTimeoutMs         int `json:"idle_timeout_ms,omitempty"`
 	TokenTTLSeconds       int `json:"token_ttl_seconds,omitempty"`
 	ServerTokenTTLSeconds int `json:"server_token_ttl_seconds,omitempty"`

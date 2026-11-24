@@ -58,6 +58,14 @@ func normalizeNodeIDs(in []int64) ([]int64, error) {
 	return out, nil
 }
 
+type NodeMetrics struct {
+	CPUPercent     float64 `json:"cpu_percent"`
+	MemUsedBytes   uint64  `json:"mem_used_bytes"`
+	MemTotalBytes  uint64  `json:"mem_total_bytes"`
+	DiskUsedBytes  uint64  `json:"disk_used_bytes"`
+	DiskTotalBytes uint64  `json:"disk_total_bytes"`
+}
+
 type Node struct {
 	ID               int64             `json:"id"`
 	Name             string            `json:"name"`
@@ -73,9 +81,14 @@ type Node struct {
 	GeneratedSecrets map[string]string `json:"-"`
 	Secrets          map[string]string `json:"secrets,omitempty"`
 	EncryptionCipher string            `json:"encryption_cipher,omitempty"`
-	SocksPort        int               `json:"socks_port"`
 	Status           string            `json:"status"`
 	LastError        string            `json:"last_error,omitempty"`
+	CPUPercent       float64           `json:"cpu_percent"`
+	MemUsedBytes     uint64            `json:"mem_used_bytes"`
+	MemTotalBytes    uint64            `json:"mem_total_bytes"`
+	DiskUsedBytes    uint64            `json:"disk_used_bytes"`
+	DiskTotalBytes   uint64            `json:"disk_total_bytes"`
+	LastSeen         time.Time         `json:"last_seen,omitempty"`
 	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
@@ -239,7 +252,6 @@ func normalizeAllowedRoutes(in []int64) []int64 {
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 

@@ -12,13 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 )
 
 const (
 	apiBase     = "https://cloud-api.yandex.ru"
 	pageOrigin  = "https://telemost.yandex.ru"
-	userAgent   = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 	httpTimeout = 20 * time.Second
 )
 
@@ -62,16 +61,18 @@ func bootstrap(ctx context.Context, cfg *Config) (*bootstrapResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	profile := utlsdial.Profile(cfg.UTLSProfile)
+	ua := utlsdial.UserAgent(profile)
 	httpClient := &http.Client{
 		Timeout:   httpTimeout,
 		Jar:       jar,
-		Transport: netdial.NewHTTPTransport(),
+		Transport: utlsdial.NewHTTPTransport(profile),
 	}
 
 	instID := newUUID()
 
 	pageURL := pageOrigin + "/j/" + extractConferenceID(conferenceLink)
-	if err := fetchPage(ctx, httpClient, pageURL); err != nil {
+	if err := fetchPage(ctx, httpClient, pageURL, ua); err != nil {
 		return nil, fmt.Errorf("telemost: get page: %w", err)
 	}
 
@@ -105,12 +106,12 @@ func fakeBootstrap(url string) *bootstrapResult {
 	}
 }
 
-func fetchPage(ctx context.Context, c *http.Client, pageURL string) error {
+func fetchPage(ctx context.Context, c *http.Client, pageURL, ua string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "ru,en-US;q=0.7,en;q=0.3")
 
@@ -147,7 +148,7 @@ func fetchConnection(
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", utlsdial.UserAgent(utlsdial.Profile(cfg.UTLSProfile)))
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en")
 	req.Header.Set("Referer", pageOrigin+"/")

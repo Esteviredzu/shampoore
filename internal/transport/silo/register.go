@@ -15,6 +15,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/capability"
 	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 	"github.com/Esteviredzu/shampoore/internal/transport"
 )
@@ -34,6 +35,7 @@ func init() {
 			{Key: "bucket", Label: "Bucket Name", Type: app.FieldTypeText, Required: true},
 			{Key: "access_key", Label: "Access Key", Type: app.FieldTypeText, Required: true},
 			{Key: "secret_key", Label: "Secret Key", Type: app.FieldTypePassword, Required: true},
+			{Key: "utls_profile", Label: "uTLS Profile", Type: app.FieldTypeText, Required: false, Advanced: true, Options: utlsdial.SupportedProfiles(), Placeholder: "chrome", Hint: "chrome (default), random, firefox, safari, ios, edge"},
 			{Key: "user_id", Label: "User ID", Type: app.FieldTypeText, Required: false, Hint: "Isolate objects under <tunnel_id>/users/<user_id>/"},
 			{Key: "multiuser", Label: "Multiuser server", Type: app.FieldTypeBool, Required: false, Hint: "Server only: serve every <tunnel_id>/users/<user_id>/ prefix"},
 		},
@@ -187,6 +189,7 @@ func decodeURL(q url.Values) (json.RawMessage, error) {
 	cfg.SecretKey = q.Get("secret_key")
 	cfg.EncryptionPassword = q.Get("encryption_password")
 	cfg.TunnelID = q.Get("tunnel_id")
+	cfg.UTLSProfile = strings.TrimSpace(q.Get("utls_profile"))
 	cfg.UserID = q.Get("user_id")
 	cfg.Multiuser, _ = strconv.ParseBool(q.Get("multiuser"))
 	return json.Marshal(cfg)
@@ -203,6 +206,9 @@ func encodeURL(raw json.RawMessage, q url.Values) error {
 	q.Set("secret_key", cfg.SecretKey)
 	if cfg.TunnelID != "" {
 		q.Set("tunnel_id", cfg.TunnelID)
+	}
+	if cfg.UTLSProfile != "" {
+		q.Set("utls_profile", cfg.UTLSProfile)
 	}
 	if cfg.EncryptionPassword != "" {
 		q.Set("encryption_password", cfg.EncryptionPassword)

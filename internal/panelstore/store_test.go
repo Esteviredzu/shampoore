@@ -322,9 +322,23 @@ func TestActiveUsersForExitAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	disallowed, err := s.CreateUser(ctx, User{Name: "disallowed", Enabled: true, AllowedRouteIDs: []int64{route.ID + 100}})
+	otherExit := mkExit(t, s, "exit-other")
+	otherRoute, err := s.CreateRoute(ctx, Route{
+		Name:          "route-other",
+		EntryNodeID:   relay.ID,
+		ExitNodeID:    otherExit.ID,
+		TransportType: TransportSilo,
+		Enabled:       true,
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	disallowed, err := s.CreateUser(ctx, User{Name: "disallowed", Enabled: true, AllowedRouteIDs: []int64{otherRoute.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateUser(ctx, User{Name: "dangling", Enabled: true, AllowedRouteIDs: []int64{route.ID + 100}}); err == nil {
+		t.Fatal("user with a non-existent route was accepted")
 	}
 
 	users, err := s.ActiveUsersForExit(ctx, exit.ID, time.Now())

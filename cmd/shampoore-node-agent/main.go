@@ -20,7 +20,7 @@ func main() {
 	controlSocket := flag.String("control-socket", envDefault("CONTROL_SOCKET", "/run/shampoore/shampoore.sock"), "shampoore-server control socket")
 	configsDir := flag.String("configs-dir", envDefault("CONFIGS_DIR", "/opt/shampoore/configs"), "server configs directory")
 	stateFile := flag.String("state", envDefault("STATE_FILE", "/opt/shampoore/agent-state.json"), "agent state file")
-	interval := flag.Duration("interval", envDuration("INTERVAL", 30*time.Second), "sync interval")
+	interval := flag.Duration("interval", envDuration("INTERVAL", 5*time.Second), "sync interval (also the host metrics heartbeat)")
 	flag.Parse()
 
 	logger := logging.New("node-agent", true)

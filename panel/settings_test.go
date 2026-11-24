@@ -210,7 +210,7 @@ func TestRouteChangeRedeploysDeployedExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	exit, err := store.CreateNode(context.Background(), panelstore.Node{
-		Name: "exit", SSHHost: "198.51.100.20", IsExit: true, SocksPort: 1080,
+		Name: "exit", SSHHost: "198.51.100.20", IsExit: true,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -13,10 +13,14 @@
     "rules": "Geo rules"
   },
   "time": {
+    "justNow": "just now",
     "secAgo": "sec ago",
     "minAgo": "min ago",
     "hourAgo": "h ago",
-    "dayAgo": "d ago"
+    "dayAgo": "d ago",
+    "hoursAgo": "{hours} h ago",
+    "hoursMinutesAgo": "{hours} h {minutes} min ago",
+    "daysAgo": "{days} d ago"
   },
   "dashboard": {
     "relays": "Relays",
@@ -59,9 +63,6 @@
     "deployDone": "Deployment finished",
     "connecting": "Connecting to the node…",
     "deleteTitle": "Delete server",
-    "deleteBody": "Delete \"{name}\"? The panel can clean Docker containers and /opt/shampoore first.",
-    "deleteClean": "Clean up and delete",
-    "deleteForce": "VPS is gone — delete anyway",
     "cleaning": "Cleaning up the server…",
     "deploySucceeded": "Deployment succeeded",
     "deployFailed": "Deployment failed",
@@ -119,7 +120,30 @@
     "decoyRepoPlaceholder": "https://github.com/user/decoy-site",
     "decoyRepoHint": "Provide a public GitHub repository with index.html, style.css and app.js. If the field is empty, no decoy site is deployed.",
     "secretsHint": "Secrets are stored in the panel database and pushed to the server on deploy. Use 🎲 to regenerate a value.",
-    "regenerate": "Generate random value"
+    "regenerate": "Generate random value",
+    "metricsCpu": "CPU",
+    "metricsRam": "RAM",
+    "metricsDisk": "Disk",
+    "resources": "Resources",
+    "server": "Server",
+    "roles": "Roles",
+    "updatedAt": "Updated",
+    "actions": "Actions",
+    "metricsPending": "No metrics yet",
+    "lastSeen": "Updated {time}",
+    "neverSeen": "No telemetry yet",
+    "redeployAll": "Redeploy all",
+    "redeployAllQueued": "Queued: {count}",
+    "redeployAllDone": "Redeploy finished",
+    "redeployAllEmpty": "No deployed servers",
+    "queued": "Queued",
+    "cleanupContainers": "Docker containers and volumes",
+    "cleanupFiles": "/opt/shampoore and agent data",
+    "cleanupSystemd": "systemd units and shampoore binaries",
+    "deleteConfirmBody": "Delete \"{name}\"? The panel will stop containers, remove volumes, /opt/shampoore and systemd units, then delete the database record.",
+    "deleteForceOption": "Server is unreachable — delete the database record only",
+    "deleteForceHint": "Enable this when the VPS is already gone or SSH is unavailable. Nothing will be removed on the server.",
+    "deleteConfirmAction": "Clean up and delete"
   },
   "roles": {
     "title": "Server role",
@@ -175,7 +199,7 @@
     "routes": "Routes",
     "active": "Active",
     "inactive": "Inactive",
-    "never": "Never",
+    "never": "Unlimited",
     "allRoutes": "All routes",
     "qr": "QR code",
     "copy": "Copy link",
@@ -203,7 +227,24 @@
     "copyJson": "Copy JSON",
     "downloadJson": "Download .json",
     "bundleCopied": "JSON copied to clipboard",
-    "bundleEmpty": "This user has no available routes yet."
+    "bundleEmpty": "This user has no available routes yet.",
+    "edit": "Edit",
+    "routesOrder": "Routes and subscription order",
+    "routesAvailable": "Available routes",
+    "routesSelected": "Subscription order",
+    "noRoutesSelected": "No routes selected — the user gets every route.",
+    "allRoutesSelected": "All routes are already selected.",
+    "orderHint": "Drag routes or use ▲▼. Subscription links follow this order.",
+    "moveUp": "Move up",
+    "moveDown": "Move down",
+    "dragHint": "Drag to reorder",
+    "date": "Date",
+    "expiryDate": "Expires on",
+    "nameRequired": "Enter a user name",
+    "dateRequired": "Pick an expiry date",
+    "limitRequired": "Enter a traffic limit",
+    "daysLeft": "{days} days left",
+    "copyLink": "Copy shampoore:// link"
   },
   "server": {
     "checking": "Checking…",
@@ -261,7 +302,6 @@
     "remove": "Remove",
     "refresh": "Refresh",
     "menu": "Menu",
-    "backup": "Backup",
     "logout": "Logout"
   },
   "dialog": {
@@ -278,6 +318,7 @@
     "encryptionHint": "Optional. Shared secret for XChaCha20-Poly1305.",
     "transport": "Transport",
     "advanced": "Advanced",
+    "advancedOptions": "Advanced options",
     "advancedHint": "Extra parameters for this transport. Empty = use defaults.",
     "advancedEmpty": "No parameters yet.",
     "addPair": "Add parameter",
@@ -321,11 +362,6 @@
   },
   "confirm": {
     "deleteConfig": "Delete this config? This cannot be undone."
-  },
-  "stats": {
-    "cpu": "CPU usage",
-    "ram": "RAM usage",
-    "uptime": "System uptime"
   },
   "rules": {
     "title": "Geo rules",
@@ -371,7 +407,11 @@
     "exitNodesHint": "By default the rule applies to every Exit server.",
     "noExitNodes": "No Exit servers available",
     "exitNodesRequired": "Select at least one Exit server",
-    "exitNodesSaved": "Exit server bindings saved"
+    "exitNodesSaved": "Exit server bindings saved",
+    "subtitle": "GeoIP rules and CIDR lists applied to Exit servers.",
+    "loading": "Loading rules…",
+    "manualHint": "This rule was added manually; refresh its CIDR list when needed.",
+    "applyShort": "Apply"
   },
   "update": {
     "current": "Version",
@@ -389,5 +429,12 @@
     "waiting": "Waiting for the panel to come back…",
     "done": "Update installed. Reloading…",
     "failed": "The panel did not come back in time"
+  },
+  "live": {
+    "on": "Live",
+    "paused": "Paused",
+    "pause": "Pause live updates",
+    "resume": "Resume live updates",
+    "hint": "Data refreshes every few seconds."
   }
 }

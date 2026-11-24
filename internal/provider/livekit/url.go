@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 func DecodeURL(q url.Values) (json.RawMessage, error) {
@@ -56,6 +57,9 @@ func DecodeURL(q url.Values) (json.RawMessage, error) {
 	if prefix := q.Get("room_prefix"); prefix != "" {
 		out["room_prefix"] = prefix
 	}
+	if profile := strings.TrimSpace(q.Get("utls_profile")); profile != "" {
+		out["utls_profile"] = profile
+	}
 	if token != "" {
 		out["token"] = token
 	}
@@ -101,6 +105,9 @@ func EncodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if cfg.RoomPrefix != "" {
 		q.Set("room_prefix", cfg.RoomPrefix)
+	}
+	if cfg.UTLSProfile != "" {
+		q.Set("utls_profile", cfg.UTLSProfile)
 	}
 	return nil
 }

@@ -26,7 +26,8 @@ func dialRelay(t *testing.T, srv *httptest.Server, room, password string) (*webs
 }
 
 func TestRelayPasswordAndBroadcast(t *testing.T) {
-	srv := httptest.NewServer(New("secret"))
+	srvServer := New("secret")
+	srv := httptest.NewServer(srvServer)
 	defer srv.Close()
 
 	if _, resp, err := dialRelay(t, srv, "room", "wrong"); err == nil {
@@ -42,6 +43,14 @@ func TestRelayPasswordAndBroadcast(t *testing.T) {
 	b, _, err := dialRelay(t, srv, "room", "secret")
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for srvServer.RoomSize("room") < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if size := srvServer.RoomSize("room"); size != 2 {
+		t.Fatalf("room size = %d, want 2", size)
 	}
 	if err := a.WriteMessage(websocket.BinaryMessage, []byte("hello")); err != nil {
 		t.Fatal(err)

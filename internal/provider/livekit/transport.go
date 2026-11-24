@@ -15,17 +15,25 @@ import (
 const livekitAPITimeout = 15 * time.Second
 
 func NewHTTPClient(timeout time.Duration) *http.Client {
+	return NewHTTPClientForProfile(timeout, utlsdial.DefaultProfile)
+}
+
+func NewHTTPClientForProfile(timeout time.Duration, profile utlsdial.Profile) *http.Client {
 	if timeout <= 0 {
 		timeout = livekitAPITimeout
 	}
 	return &http.Client{
-		Transport: utlsdial.NewHTTPTransport(utlsdial.DefaultProfile),
+		Transport: utlsdial.NewHTTPTransport(profile),
 		Timeout:   timeout,
 	}
 }
 
 func NewSignalDialer() *websocket.Dialer {
-	return utlsdial.NewWebSocketDialer(utlsdial.DefaultProfile)
+	return NewSignalDialerForProfile(utlsdial.DefaultProfile)
+}
+
+func NewSignalDialerForProfile(profile utlsdial.Profile) *websocket.Dialer {
+	return utlsdial.NewWebSocketDialer(profile)
 }
 
 type pipeTransport struct {

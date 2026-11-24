@@ -286,9 +286,12 @@ func TestProfileMapping(t *testing.T) {
 	cases := map[Profile]utls.ClientHelloID{
 		ProfileChrome:       utls.HelloChrome_Auto,
 		"":                  utls.HelloChrome_Auto,
+		"default":           utls.HelloChrome_Auto,
 		"unknown":           utls.HelloChrome_Auto,
 		ProfileFirefox:      utls.HelloFirefox_Auto,
 		ProfileSafari:       utls.HelloSafari_Auto,
+		ProfileIOS:          utls.HelloIOS_Auto,
+		ProfileEdge:         utls.HelloEdge_Auto,
 		Profile(" SAFARI "): utls.HelloSafari_Auto,
 	}
 	for profile, want := range cases {
@@ -302,8 +305,143 @@ func TestProfileMapping(t *testing.T) {
 	if ua := UserAgent(ProfileFirefox); !strings.Contains(ua, "Firefox/") {
 		t.Fatalf("firefox UA = %q", ua)
 	}
+	if ua := UserAgent(ProfileIOS); !strings.Contains(ua, "iPhone") {
+		t.Fatalf("ios UA = %q", ua)
+	}
+	if ua := UserAgent(ProfileEdge); !strings.Contains(ua, "Edg/") {
+		t.Fatalf("edge UA = %q", ua)
+	}
 	if ua := UserAgent("bogus"); !strings.Contains(ua, "Chrome/") {
 		t.Fatalf("fallback UA = %q", ua)
+	}
+	if ua := UserAgent(ProfileRandom); ua == "" {
+		t.Fatal("random UA is empty")
+	}
+}
+
+func TestNormalizeProfile(t *testing.T) {
+	cases := map[Profile]Profile{
+		"":             ProfileChrome,
+		"default":      ProfileChrome,
+		"unknown":      ProfileChrome,
+		" CHROME ":     ProfileChrome,
+		"firefox":      ProfileFirefox,
+		" SAFARI ":     ProfileSafari,
+		"iOS":          ProfileIOS,
+		"Edge":         ProfileEdge,
+		" random ":     ProfileRandom,
+		"f1refox-typo": ProfileChrome,
+	}
+	for raw, want := range cases {
+		if got := NormalizeProfile(raw); got != want {
+			t.Fatalf("NormalizeProfile(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestSupportedProfiles(t *testing.T) {
+	want := []string{"chrome", "random", "firefox", "safari", "ios", "edge"}
+	got := SupportedProfiles()
+	if len(got) != len(want) {
+		t.Fatalf("SupportedProfiles() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("SupportedProfiles()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	got[0] = "mutated"
+	if SupportedProfiles()[0] != "chrome" {
+		t.Fatal("SupportedProfiles() must return a copy")
+	}
+}
+
+func TestRandomHelloPool(t *testing.T) {
+	if len(randomHelloPool) == 0 {
+		t.Fatal("random hello pool is empty")
+	}
+	required := []utls.ClientHelloID{
+		utls.HelloChrome_Auto,
+		utls.HelloFirefox_Auto,
+		utls.HelloSafari_Auto,
+		utls.HelloIOS_Auto,
+		utls.HelloEdge_Auto,
+	}
+	for _, want := range required {
+		found := false
+		for _, entry := range randomHelloPool {
+			if entry.hello == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("random pool misses %v", want)
+		}
+	}
+
+	seen := map[utls.ClientHelloID]struct{}{}
+	for i := 0; i < 128; i++ {
+		hello, family := resolveHello(ProfileRandom)
+		if family == "" || family == ProfileRandom {
+			t.Fatalf("resolveHello(random) family = %q", family)
+		}
+		found := false
+		for _, entry := range randomHelloPool {
+			if entry.hello == hello && entry.profile == family {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("resolveHello(random) returned %v/%q outside the pool", hello, family)
+		}
+		seen[hello] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("random profile produced a single hello: %v", seen)
+	}
+}
+
+func TestRandomHelloPoolSupportsTLS13(t *testing.T) {
+	for _, entry := range randomHelloPool {
+		spec, err := utls.UTLSIdToSpec(entry.hello)
+		if err != nil {
+			t.Fatalf("UTLSIdToSpec(%v): %v", entry.hello, err)
+		}
+		offers := false
+		for _, ext := range spec.Extensions {
+			versions, ok := ext.(*utls.SupportedVersionsExtension)
+			if !ok {
+				continue
+			}
+			for _, v := range versions.Versions {
+				if v == tls.VersionTLS13 {
+					offers = true
+					break
+				}
+			}
+		}
+		if !offers {
+			t.Fatalf("profile %q (%v) does not offer TLS 1.3", entry.profile, entry.hello)
+		}
+	}
+}
+
+func TestDialContextRandomProfile(t *testing.T) {
+	srv := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}), "http/1.1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for i := 0; i < 4; i++ {
+		conn, err := DialContext(ctx, "tcp", serverAddr(t, srv), "", WebSocketALPN, ProfileRandom)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		_ = conn.Close()
 	}
 }
 

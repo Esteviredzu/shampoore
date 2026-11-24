@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strings"
 )
 
 func DecodeURL(q url.Values) (json.RawMessage, error) {
@@ -18,6 +19,9 @@ func DecodeURL(q url.Values) (json.RawMessage, error) {
 	out := map[string]any{
 		"conference_link": "https://telemost.yandex.ru/j/" + id,
 	}
+	if profile := strings.TrimSpace(q.Get("utls_profile")); profile != "" {
+		out["utls_profile"] = profile
+	}
 	return json.Marshal(out)
 }
 
@@ -30,6 +34,9 @@ func EncodeURL(raw json.RawMessage, q url.Values) error {
 	}
 	if id := extractConferenceID(cfg.EffectiveConferenceLink()); id != "" {
 		q.Set("conference_link", id)
+	}
+	if cfg.UTLSProfile != "" {
+		q.Set("utls_profile", cfg.UTLSProfile)
 	}
 	return nil
 }

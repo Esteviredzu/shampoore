@@ -5,7 +5,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"text/template"
@@ -42,6 +41,11 @@ type relayData struct {
 	Sites      []relaySite
 	Services   []relayService
 	LocalRelay bool
+	PanelURL   string
+}
+
+func (d relayData) UsesAgent() bool {
+	return strings.TrimSpace(d.PanelURL) != "" && strings.TrimSpace(d.Node.NodeSecret) != ""
 }
 
 type RenderResult struct {
@@ -50,12 +54,10 @@ type RenderResult struct {
 }
 
 type exitData struct {
-	Node          panelstore.Node
-	Secrets       map[string]string
-	PanelURL      string
-	SocksPort     int
-	ExitUpstreams []string
-	ConfigFiles   []string
+	Node        panelstore.Node
+	Secrets     map[string]string
+	PanelURL    string
+	ConfigFiles []string
 }
 
 func RenderRelay(node panelstore.Node, opts RenderOptions) ([]File, error) {
@@ -74,6 +76,7 @@ func RenderRelayPlan(node panelstore.Node, opts RenderOptions) (RenderResult, er
 		Node:       node,
 		Secrets:    cloneSecrets(node.GeneratedSecrets),
 		LocalRelay: opts.LocalRelay,
+		PanelURL:   strings.TrimSpace(opts.PanelURL),
 	}
 	siteIndex := make(map[string]int)
 	seenServices := make(map[string]struct{})
@@ -131,12 +134,24 @@ func RenderRelayPlan(node panelstore.Node, opts RenderOptions) (RenderResult, er
 	if len(data.Sites) == 0 {
 		return RenderResult{}, fmt.Errorf("provisioner: relay %q has no enabled transports with domains", node.Name)
 	}
-	files, err := renderTemplates("templates/relay/*.tmpl", data)
+	fileList, err := renderTemplates("templates/relay/*.tmpl", data)
 	if err != nil {
 		return RenderResult{}, err
 	}
-	files = append(files, extraFiles...)
-	return RenderResult{Files: files, Steps: steps}, nil
+	fileList = append(fileList, extraFiles...)
+	if data.UsesAgent() {
+		fileList = append(fileList, agentEnvFile(data.Node, data.PanelURL))
+	}
+	return RenderResult{Files: fileList, Steps: steps}, nil
+}
+
+func agentEnvFile(node panelstore.Node, panelURL string) File {
+	data := fmt.Sprintf("PANEL_URL=%s\nNODE_ID=%d\nNODE_SECRET=%s\n"+
+		"CONTROL_SOCKET=/run/shampoore/shampoore.sock\n"+
+		"CONFIGS_DIR=/opt/shampoore/configs\n"+
+		"STATE_FILE=/opt/shampoore/state/agent-state.json\nINTERVAL=5s\n",
+		panelURL, node.ID, node.NodeSecret)
+	return File{Name: "agent.env", Mode: 0o600, Data: []byte(data)}
 }
 
 func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelstore.Node, opts RenderOptions) ([]File, error) {
@@ -152,20 +167,9 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 		byID[n.ID] = n
 	}
 	data := exitData{
-		Node:      node,
-		Secrets:   cloneSecrets(node.GeneratedSecrets),
-		PanelURL:  panelURL,
-		SocksPort: node.SocksPort,
-	}
-	if data.SocksPort == 0 {
-		data.SocksPort = 1080
-	}
-	for _, other := range nodes {
-		if !other.IsExit || other.ID == node.ID || other.SocksPort <= 0 || strings.TrimSpace(other.SSHHost) == "" {
-			continue
-		}
-		addr := net.JoinHostPort(strings.TrimSpace(other.SSHHost), strconv.Itoa(other.SocksPort))
-		data.ExitUpstreams = append(data.ExitUpstreams, fmt.Sprintf("%d=socks5://%s", other.ID, addr))
+		Node:     node,
+		Secrets:  cloneSecrets(node.GeneratedSecrets),
+		PanelURL: panelURL,
 	}
 
 	var configFiles []File
@@ -211,19 +215,28 @@ func RenderExit(node panelstore.Node, routes []panelstore.Route, nodes []panelst
 func mergeRoleFiles(relayFiles, exitFiles []File) ([]File, error) {
 	var relayCompose, exitCompose []byte
 	out := make([]File, 0, len(relayFiles)+len(exitFiles))
+
+	seen := make(map[string]struct{}, len(relayFiles)+len(exitFiles))
+	appendFile := func(f File) {
+		if _, ok := seen[f.Name]; ok {
+			return
+		}
+		seen[f.Name] = struct{}{}
+		out = append(out, f)
+	}
 	for _, f := range relayFiles {
 		if f.Name == "docker-compose.yml" {
 			relayCompose = f.Data
 			continue
 		}
-		out = append(out, f)
+		appendFile(f)
 	}
 	for _, f := range exitFiles {
 		if f.Name == "docker-compose.yml" {
 			exitCompose = f.Data
 			continue
 		}
-		out = append(out, f)
+		appendFile(f)
 	}
 	if len(relayCompose) == 0 || len(exitCompose) == 0 {
 		return nil, fmt.Errorf("provisioner: combined role is missing a compose file")

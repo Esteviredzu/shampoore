@@ -18,6 +18,8 @@ type Config struct {
 
 	UseSharing bool `json:"use_sharing,omitempty"`
 
+	UTLSProfile string `json:"utls_profile,omitempty"`
+
 	LocalSignalingURL string `json:"local_signaling_url,omitempty"`
 
 	displayName string

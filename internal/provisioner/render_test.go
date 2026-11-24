@@ -28,6 +28,7 @@ func secretsFor(name string) map[string]string {
 		"s3_access_key":       "s3-key-" + name,
 		"s3_secret_key":       "s3-secret-" + name,
 		"s3_bucket":           "bucket-" + name,
+		"jellyfin_secret":     "jellyfin-" + name,
 		"tunnel_id":           "shampoore",
 	}
 }
@@ -38,6 +39,39 @@ func fileMap(files []File) map[string]File {
 		out[f.Name] = f
 	}
 	return out
+}
+
+func assertNoSOCKSExposure(t *testing.T, composeData []byte) {
+	t.Helper()
+	text := string(composeData)
+	for _, forbidden := range []string{"--socks-listen", "--exit-upstream", "1080:1080"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("exit compose must not contain %q:\n%s", forbidden, text)
+		}
+	}
+	var compose struct {
+		Services map[string]struct {
+			Ports   []string `yaml:"ports"`
+			Command []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(composeData, &compose); err != nil {
+		t.Fatalf("compose yaml: %v", err)
+	}
+	server, ok := compose.Services["shampoore-server"]
+	if !ok {
+		t.Fatalf("compose has no shampoore-server service:\n%s", text)
+	}
+	for _, port := range server.Ports {
+		if strings.Contains(port, "1080") {
+			t.Fatalf("exit compose publishes SOCKS5 port %q:\n%s", port, text)
+		}
+	}
+	for _, arg := range server.Command {
+		if strings.HasPrefix(arg, "--socks-listen") || strings.HasPrefix(arg, "--exit-upstream") {
+			t.Fatalf("exit command still passes %q:\n%s", arg, text)
+		}
+	}
 }
 
 func TestRenderRelay(t *testing.T) {
@@ -232,7 +266,6 @@ func TestMergeRoleFilesForDirectNode(t *testing.T) {
 		Name:             "direct",
 		IsRelay:          true,
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "direct-secret",
 		GeneratedSecrets: secretsFor("direct"),
 		Transports: []panelstore.Transport{
@@ -260,6 +293,7 @@ func TestMergeRoleFilesForDirectNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := fileMap(merged)
+	assertNoSOCKSExposure(t, m["docker-compose.yml"].Data)
 	var compose map[string]any
 	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &compose); err != nil {
 		t.Fatal(err)
@@ -294,11 +328,10 @@ func TestRenderExit(t *testing.T) {
 		ID:               2,
 		Name:             "exit",
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "exit-secret",
 		GeneratedSecrets: secretsFor("exit"),
 	}
-	otherExit := panelstore.Node{ID: 3, Name: "exit-2", IsExit: true, SSHHost: "198.51.100.9", SocksPort: 1081}
+	otherExit := panelstore.Node{ID: 3, Name: "exit-2", IsExit: true, SSHHost: "198.51.100.9"}
 	routes := []panelstore.Route{{
 		ID:            7,
 		Name:          "route-7",
@@ -313,11 +346,12 @@ func TestRenderExit(t *testing.T) {
 	}
 	m := fileMap(files)
 	compose := string(m["docker-compose.yml"].Data)
-	for _, want := range []string{"shampoore-server", "node-agent", "socks-listen=:1080", "3=socks5://198.51.100.9:1081", "-c", "/opt/shampoore/configs/route-7.json", "./rules:/opt/shampoore/rules:ro", "--rules-dir=/opt/shampoore/rules"} {
+	for _, want := range []string{"shampoore-server", "node-agent", "-c", "/opt/shampoore/configs/route-7.json", "./rules:/opt/shampoore/rules:ro", "--rules-dir=/opt/shampoore/rules"} {
 		if !strings.Contains(compose, want) {
 			t.Fatalf("compose missing %q:\n%s", want, compose)
 		}
 	}
+	assertNoSOCKSExposure(t, m["docker-compose.yml"].Data)
 	var exitCompose map[string]any
 	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &exitCompose); err != nil {
 		t.Fatalf("exit compose yaml: %v", err)
@@ -364,6 +398,66 @@ func TestRenderExit(t *testing.T) {
 	}
 }
 
+func TestExitComposeDoesNotExposeSOCKS5(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               1,
+		Name:             "relay",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+		},
+	}
+	exit := panelstore.Node{
+		ID:               2,
+		Name:             "exit",
+		IsExit:           true,
+		NodeSecret:       "exit-secret",
+		GeneratedSecrets: secretsFor("exit"),
+	}
+	route := panelstore.Route{
+		ID:            7,
+		Name:          "route-7",
+		EntryNodeID:   relay.ID,
+		ExitNodeID:    exit.ID,
+		TransportType: panelstore.TransportRawWS,
+		Enabled:       true,
+	}
+
+	t.Run("exit", func(t *testing.T) {
+		files, err := RenderExit(exit, []panelstore.Route{route}, []panelstore.Node{relay, exit},
+			RenderOptions{PanelURL: "https://panel.example.com"})
+		if err != nil {
+			t.Fatalf("render exit: %v", err)
+		}
+		assertNoSOCKSExposure(t, fileMap(files)["docker-compose.yml"].Data)
+	})
+
+	t.Run("relay_exit", func(t *testing.T) {
+		combined := relay
+		combined.IsExit = true
+		combined.NodeSecret = "combined-secret"
+		combinedRoute := route
+		combinedRoute.EntryNodeID = combined.ID
+		combinedRoute.ExitNodeID = combined.ID
+
+		relayFiles, err := RenderRelay(combined, RenderOptions{})
+		if err != nil {
+			t.Fatalf("render relay: %v", err)
+		}
+		exitFiles, err := RenderExit(combined, []panelstore.Route{combinedRoute}, []panelstore.Node{combined},
+			RenderOptions{PanelURL: "https://panel.example.com"})
+		if err != nil {
+			t.Fatalf("render exit: %v", err)
+		}
+		merged, err := mergeRoleFiles(relayFiles, exitFiles)
+		if err != nil {
+			t.Fatalf("merge roles: %v", err)
+		}
+		assertNoSOCKSExposure(t, fileMap(merged)["docker-compose.yml"].Data)
+	})
+}
+
 func TestRenderExitMultiBondAggregatesSubflows(t *testing.T) {
 	relay := panelstore.Node{
 		ID:               1,
@@ -379,7 +473,6 @@ func TestRenderExitMultiBondAggregatesSubflows(t *testing.T) {
 		ID:               2,
 		Name:             "exit",
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "exit-secret",
 		GeneratedSecrets: secretsFor("exit"),
 	}
@@ -482,7 +575,6 @@ func TestRenderExitLiveKitSubscriptionServerConfig(t *testing.T) {
 		ID:               2,
 		Name:             "exit",
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "exit-secret",
 		GeneratedSecrets: secretsFor("exit"),
 	}
@@ -615,7 +707,7 @@ func TestExitRuleFilesSelectsAssignedActiveRules(t *testing.T) {
 }
 
 func TestRenderExitAppendsRuleFiles(t *testing.T) {
-	exit := panelstore.Node{ID: 2, Name: "exit", IsExit: true, SocksPort: 1080}
+	exit := panelstore.Node{ID: 2, Name: "exit", IsExit: true}
 	ruleFile := File{Name: "rules/a.txt", Mode: 0o644, Data: []byte("1.1.1.0/24\n")}
 	files, err := RenderExit(exit, nil, []panelstore.Node{exit}, RenderOptions{
 		PanelURL:  "https://panel.example.com",
@@ -645,7 +737,6 @@ func TestRenderExitSiloNamespacesStayIsolated(t *testing.T) {
 		ID:               2,
 		Name:             "exit",
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "exit-secret",
 		GeneratedSecrets: secretsFor("exit"),
 	}
@@ -740,4 +831,193 @@ type siloMultiPayload struct {
 		Type      string          `json:"type"`
 		Transport json.RawMessage `json:"transport"`
 	} `json:"transports"`
+}
+
+func TestRenderRelayJellyfinOnly(t *testing.T) {
+	node := panelstore.Node{
+		ID:               43,
+		Name:             "media",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("media"),
+		Transports: []panelstore.Transport{
+			{Type: "jellyfin", Domain: "media.example.com", Enabled: true},
+		},
+	}
+	files, err := RenderRelay(node, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	compose := string(m["docker-compose.yml"].Data)
+	for _, want := range []string{
+		"jellyfin/jellyfin:latest",
+		"jellyfin-broker:",
+		"shampoore-relay",
+		"-jellyfin-listen",
+		"-jellyfin-secret",
+		"jellyfin-media",
+		"http://jellyfin:8096",
+	} {
+		if !strings.Contains(compose, want) {
+			t.Fatalf("relay compose missing %q:\n%s", want, compose)
+		}
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &parsed); err != nil {
+		t.Fatalf("relay compose yaml: %v", err)
+	}
+	services, _ := parsed["services"].(map[string]any)
+	if services["jellyfin"] == nil || services["jellyfin-broker"] == nil {
+		t.Fatalf("relay compose services = %+v", services)
+	}
+	caddy := string(m["Caddyfile"].Data)
+	if !strings.Contains(caddy, "media.example.com") ||
+		!strings.Contains(caddy, "reverse_proxy jellyfin-broker:8097") {
+		t.Fatalf("Caddyfile missing jellyfin broker upstream:\n%s", caddy)
+	}
+
+	localFiles, err := RenderRelay(node, RenderOptions{LocalRelay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := fileMap(localFiles)
+	localRaw := string(local["docker-compose.yml"].Data)
+	for _, want := range []string{"127.0.0.1:8097:8097", "127.0.0.1:8096:8096"} {
+		if !strings.Contains(localRaw, want) {
+			t.Fatalf("local relay compose missing %q:\n%s", want, localRaw)
+		}
+	}
+	if strings.Contains(localRaw, "caddy:") {
+		t.Fatalf("local relay must not start containerized caddy:\n%s", localRaw)
+	}
+}
+
+func TestRenderExitJellyfinPairConfig(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               4,
+		Name:             "relay",
+		IsRelay:          true,
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: "jellyfin", Domain: "media.example.com", Enabled: true},
+		},
+	}
+	exit := panelstore.Node{
+		ID:               5,
+		Name:             "exit",
+		IsExit:           true,
+		NodeSecret:       "exit-secret",
+		GeneratedSecrets: secretsFor("exit"),
+	}
+	routes := []panelstore.Route{{
+		ID:            9,
+		Name:          "route-9",
+		EntryNodeID:   relay.ID,
+		ExitNodeID:    exit.ID,
+		TransportType: "jellyfin",
+		Enabled:       true,
+	}}
+	files, err := RenderExit(exit, routes, []panelstore.Node{relay, exit}, RenderOptions{PanelURL: "https://panel.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	cfgFile, ok := m["configs/route-9.json"]
+	if !ok {
+		t.Fatalf("missing exit config: %v", m)
+	}
+	var settings app.Settings
+	if err := json.Unmarshal(cfgFile.Data, &settings); err != nil {
+		t.Fatalf("config json: %v\n%s", err, cfgFile.Data)
+	}
+	if settings.Type != "jellyfin" {
+		t.Fatalf("type = %q", settings.Type)
+	}
+	if settings.EncryptionPassword != "enc-relay" {
+		t.Fatalf("encryption password = %q", settings.EncryptionPassword)
+	}
+	var tr map[string]any
+	if err := json.Unmarshal(settings.Transport, &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr["mode"] != "pair" || tr["role"] != "exit" || tr["multiuser"] != true {
+		t.Fatalf("transport = %+v", tr)
+	}
+	if tr["url"] != "https://media.example.com" || tr["namespace"] != "route-9" {
+		t.Fatalf("transport = %+v", tr)
+	}
+	if _, ok := tr["listen"]; ok {
+		t.Fatalf("pair exit must not listen: %+v", tr)
+	}
+	if _, ok := tr["upstream_url"]; ok {
+		t.Fatalf("pair exit must not proxy upstream: %+v", tr)
+	}
+	if users, ok := tr["users"].([]any); !ok || len(users) != 0 {
+		t.Fatalf("users = %#v, want empty array", tr["users"])
+	}
+}
+func TestRenderRelayIncludesNodeAgentHeartbeat(t *testing.T) {
+	node := panelstore.Node{
+		ID:               11,
+		Name:             "relay-agent",
+		IsRelay:          true,
+		NodeSecret:       "relay-secret",
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+		},
+	}
+	files, err := RenderRelay(node, RenderOptions{PanelURL: "https://panel.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fileMap(files)
+	var compose map[string]any
+	if err := yaml.Unmarshal(m["docker-compose.yml"].Data, &compose); err != nil {
+		t.Fatalf("compose yaml: %v\n%s", err, m["docker-compose.yml"].Data)
+	}
+	services, _ := compose["services"].(map[string]any)
+	agent, ok := services["node-agent"].(map[string]any)
+	if !ok {
+		t.Fatalf("relay compose has no node-agent service:\n%s", m["docker-compose.yml"].Data)
+	}
+	envFile, _ := agent["env_file"].([]any)
+	if len(envFile) != 1 || envFile[0] != "./agent.env" {
+		t.Fatalf("node-agent env_file = %v", agent["env_file"])
+	}
+	command, _ := agent["command"].([]any)
+	if len(command) != 1 || command[0] != "/opt/shampoore/bin/shampoore-node-agent" {
+		t.Fatalf("node-agent command = %v", agent["command"])
+	}
+	env, ok := m["agent.env"]
+	if !ok {
+		t.Fatalf("relay render has no agent.env: %v", m)
+	}
+	for _, want := range []string{
+		"PANEL_URL=https://panel.example.com",
+		"NODE_ID=11",
+		"NODE_SECRET=relay-secret",
+		"INTERVAL=5s",
+	} {
+		if !strings.Contains(string(env.Data), want) {
+			t.Fatalf("agent.env missing %q:\n%s", want, env.Data)
+		}
+	}
+
+	plain, err := RenderRelay(node, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainMap := fileMap(plain)
+	var plainCompose map[string]any
+	if err := yaml.Unmarshal(plainMap["docker-compose.yml"].Data, &plainCompose); err != nil {
+		t.Fatalf("compose yaml: %v", err)
+	}
+	plainServices, _ := plainCompose["services"].(map[string]any)
+	if plainServices["node-agent"] != nil {
+		t.Fatal("node-agent must be omitted without a panel URL")
+	}
+	if _, ok := plainMap["agent.env"]; ok {
+		t.Fatal("agent.env must be omitted without a panel URL")
+	}
 }

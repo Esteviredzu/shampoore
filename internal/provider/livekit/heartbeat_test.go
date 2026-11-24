@@ -38,16 +38,28 @@ func TestSignalResetDropsStaleDataAndInterruptsReceive(t *testing.T) {
 	defer func() { _ = p.Stop(context.Background()) }()
 
 	p.recvCh <- []byte("stale")
+	p.SignalReset(fmt.Errorf("%w: test reset", transport.ErrTransportReset))
+	if got := len(p.recvCh); got != 0 {
+		t.Fatalf("stale data was not drained: %d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := p.ReceiveMessage(ctx)
+	cancel()
+	if !errors.Is(err, transport.ErrTransportReset) {
+		t.Fatalf("receive error = %v, want ErrTransportReset", err)
+	}
 
+	blocked := newPipe(nil, "topic", "")
+	defer func() { _ = blocked.Stop(context.Background()) }()
 	done := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_, err := p.ReceiveMessage(ctx)
+		_, err := blocked.ReceiveMessage(ctx)
 		done <- err
 	}()
 
-	p.SignalReset(fmt.Errorf("%w: test reset", transport.ErrTransportReset))
+	blocked.SignalReset(fmt.Errorf("%w: test reset", transport.ErrTransportReset))
 
 	select {
 	case err := <-done:
@@ -133,7 +145,8 @@ func TestPeerJoinedReportsOnlyNewPeers(t *testing.T) {
 }
 
 func TestHeartbeatWatchdogIgnoresPeerWithoutHeartbeats(t *testing.T) {
-	p := newPipe(nil, "topic", "remote")
+
+	p := newPipe(nil, "topic", "")
 	p.heartbeatInterval = 10 * time.Millisecond
 	p.heartbeatTimeout = 20 * time.Millisecond
 
@@ -147,6 +160,28 @@ func TestHeartbeatWatchdogIgnoresPeerWithoutHeartbeats(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	if got := dead.Load(); got != 0 {
-		t.Fatalf("watchdog fired %d times without peer heartbeat support", got)
+		t.Fatalf("watchdog fired %d times without a peer", got)
+	}
+}
+
+func TestHeartbeatWatchdogFiresForSilentRemote(t *testing.T) {
+	p := newPipe(nil, "topic", "remote")
+	p.heartbeatInterval = 10 * time.Millisecond
+	p.heartbeatTimeout = 20 * time.Millisecond
+
+	var dead atomic.Int32
+	p.SetDeadHandler(func() { dead.Add(1) })
+
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = p.Stop(context.Background()) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && dead.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if dead.Load() == 0 {
+		t.Fatal("watchdog ignored a silent peer that joined the room")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,9 +67,29 @@ type LocalServer struct {
 	halfCloseIdle    time.Duration
 }
 
+func NormalizeListen(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+
+		if p, convErr := strconv.Atoi(addr); convErr == nil && p > 0 && p <= 65535 {
+			return net.JoinHostPort("127.0.0.1", addr)
+		}
+		return addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "*":
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func NewLocalServer(listen string, m multiplexing.StreamMultiplexer, log logging.ContextLogger, ipv4Only bool) *LocalServer {
 	return &LocalServer{
-		listen:   listen,
+		listen:   NormalizeListen(listen),
 		mux:      m,
 		logger:   log,
 		ipv4Only: ipv4Only,

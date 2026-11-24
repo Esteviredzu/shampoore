@@ -2,7 +2,6 @@ package telemost
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/core/channel/vp8"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 	"github.com/Esteviredzu/shampoore/internal/netdial"
 )
 
@@ -330,8 +330,17 @@ func (s *signaling) connectWS(ctx context.Context) error {
 		}
 	}
 
-	dialer := &net.Dialer{Timeout: wsHandshakeTimeout, Control: netdial.Control}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(u.Hostname(), port))
+	profile := utlsdial.Profile(s.cfg.UTLSProfile)
+	ua := utlsdial.UserAgent(profile)
+	addr := net.JoinHostPort(u.Hostname(), port)
+
+	var conn net.Conn
+	if u.Scheme == "wss" {
+		conn, err = utlsdial.DialContext(ctx, "tcp", addr, u.Hostname(), utlsdial.WebSocketALPN, profile)
+	} else {
+		dialer := &net.Dialer{Timeout: wsHandshakeTimeout, Control: netdial.Control}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
 		return fmt.Errorf("telemost: ws dial: %w", err)
 	}
@@ -360,24 +369,8 @@ func (s *signaling) connectWS(ctx context.Context) error {
 		return fmt.Errorf("telemost: ws handshake deadline: %w", err)
 	}
 
-	if u.Scheme == "wss" {
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName: u.Hostname(),
-			MinVersion: tls.VersionTLS12,
-		})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			close(abort)
-			<-abortDone
-			if cerr := tlsConn.Close(); cerr != nil {
-				s.logger.Debug("telemost: close ws tls connection: ", cerr)
-			}
-			return fmt.Errorf("telemost: ws tls handshake: %w", err)
-		}
-		conn = tlsConn
-	}
-
 	header := http.Header{}
-	header.Set("User-Agent", userAgent)
+	header.Set("User-Agent", ua)
 	header.Set("Origin", pageOrigin)
 	header.Set("Referer", pageOrigin+"/")
 	if s.boot.jar != nil {
@@ -561,7 +554,7 @@ func (s *signaling) sendHello() error {
 			"sdkInfo": map[string]any{
 				"implementation": "browser",
 				"version":        s.cfg.SDKVersion,
-				"userAgent":      userAgent,
+				"userAgent":      utlsdial.UserAgent(utlsdial.Profile(s.cfg.UTLSProfile)),
 				"hwConcurrency":  8,
 			},
 			"sdkInitializationId":    newUUID(),

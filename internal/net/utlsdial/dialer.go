@@ -2,7 +2,9 @@ package utlsdial
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -31,9 +33,26 @@ const (
 	ProfileChrome  Profile = "chrome"
 	ProfileFirefox Profile = "firefox"
 	ProfileSafari  Profile = "safari"
+	ProfileIOS     Profile = "ios"
+	ProfileEdge    Profile = "edge"
+
+	ProfileRandom Profile = "random"
 
 	DefaultProfile = ProfileChrome
 )
+
+var supportedProfiles = []string{
+	string(ProfileChrome),
+	string(ProfileRandom),
+	string(ProfileFirefox),
+	string(ProfileSafari),
+	string(ProfileIOS),
+	string(ProfileEdge),
+}
+
+func SupportedProfiles() []string {
+	return append([]string(nil), supportedProfiles...)
+}
 
 var HTTPTransportALPN = []string{"h2", "http/1.1"}
 
@@ -45,6 +64,8 @@ var userAgents = map[Profile]string{
 	ProfileChrome:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 	ProfileFirefox: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
 	ProfileSafari:  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+	ProfileIOS:     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+	ProfileEdge:    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
 }
 
 var insecureSkipVerify atomic.Bool
@@ -55,29 +76,83 @@ func NormalizeProfile(p Profile) Profile {
 		return ProfileFirefox
 	case ProfileSafari:
 		return ProfileSafari
-	case ProfileChrome:
+	case ProfileIOS:
+		return ProfileIOS
+	case ProfileEdge:
+		return ProfileEdge
+	case ProfileRandom:
+		return ProfileRandom
+	case ProfileChrome, "default":
 		return ProfileChrome
 	default:
 		return DefaultProfile
 	}
 }
 
-func UserAgent(p Profile) string {
-	if ua, ok := userAgents[NormalizeProfile(p)]; ok {
-		return ua
+type helloProfile struct {
+	profile Profile
+	hello   utls.ClientHelloID
+}
+
+var randomHelloPool = []helloProfile{
+	{ProfileChrome, utls.HelloChrome_Auto},
+	{ProfileFirefox, utls.HelloFirefox_Auto},
+	{ProfileSafari, utls.HelloSafari_Auto},
+	{ProfileIOS, utls.HelloIOS_Auto},
+	{ProfileEdge, utls.HelloEdge_Auto},
+	{ProfileChrome, utls.HelloChrome_133},
+	{ProfileChrome, utls.HelloChrome_131},
+	{ProfileChrome, utls.HelloChrome_120},
+	{ProfileFirefox, utls.HelloFirefox_120},
+	{ProfileFirefox, utls.HelloFirefox_105},
+	{ProfileSafari, utls.HelloSafari_16_0},
+	{ProfileIOS, utls.HelloIOS_14},
+}
+
+func pickRandomHello() helloProfile {
+	if len(randomHelloPool) == 0 {
+		return helloProfile{profile: DefaultProfile, hello: utls.HelloChrome_Auto}
 	}
-	return userAgents[DefaultProfile]
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return randomHelloPool[0]
+	}
+	idx := int(binary.BigEndian.Uint64(b[:]) % uint64(len(randomHelloPool)))
+	return randomHelloPool[idx]
+}
+
+func resolveHello(p Profile) (utls.ClientHelloID, Profile) {
+	switch NormalizeProfile(p) {
+	case ProfileFirefox:
+		return utls.HelloFirefox_Auto, ProfileFirefox
+	case ProfileSafari:
+		return utls.HelloSafari_Auto, ProfileSafari
+	case ProfileIOS:
+		return utls.HelloIOS_Auto, ProfileIOS
+	case ProfileEdge:
+		return utls.HelloEdge_Auto, ProfileEdge
+	case ProfileRandom:
+		chosen := pickRandomHello()
+		return chosen.hello, chosen.profile
+	default:
+		return utls.HelloChrome_Auto, ProfileChrome
+	}
 }
 
 func clientHelloID(p Profile) utls.ClientHelloID {
-	switch NormalizeProfile(p) {
-	case ProfileFirefox:
-		return utls.HelloFirefox_Auto
-	case ProfileSafari:
-		return utls.HelloSafari_Auto
-	default:
-		return utls.HelloChrome_Auto
+	hello, _ := resolveHello(p)
+	return hello
+}
+
+func UserAgent(p Profile) string {
+	p = NormalizeProfile(p)
+	if p == ProfileRandom {
+		p = pickRandomHello().profile
 	}
+	if ua, ok := userAgents[p]; ok {
+		return ua
+	}
+	return userAgents[DefaultProfile]
 }
 
 func DialContext(ctx context.Context, network, addr, serverName string, alpn []string, profile Profile) (net.Conn, error) {

@@ -7,13 +7,9 @@ services:
       - --configs-dir=/opt/shampoore/configs
       - --control-socket=/run/shampoore/shampoore.sock
       - --rules-dir=/opt/shampoore/rules
-      - --socks-listen=:{{ .SocksPort }}
 {{- range .ConfigFiles }}
       - -c
       - /opt/shampoore/{{ . }}
-{{- end }}
-{{- range .ExitUpstreams }}
-      - --exit-upstream={{ . }}
 {{- end }}
     volumes:
       - ./bin/shampoore-server:/opt/shampoore/bin/shampoore-server:ro
@@ -21,8 +17,6 @@ services:
       - ./rules:/opt/shampoore/rules:ro
       - shampoore-run:/run/shampoore
       - /etc/ssl/certs:/etc/ssl/certs:ro
-    ports:
-      - "{{ .SocksPort }}:{{ .SocksPort }}"
 
   node-agent:
     image: debian:bookworm-slim

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/control"
 	"github.com/Esteviredzu/shampoore/internal/logging"
@@ -144,7 +145,7 @@ func TestControlPlaneNodeRouteUserCRUD(t *testing.T) {
 		t.Fatalf("encryption cipher = %q", relay.EncryptionCipher)
 	}
 
-	exitBody := `{"name":"exit-fr","ssh_host":"198.51.100.20","is_exit":true,"socks_port":1080}`
+	exitBody := `{"name":"exit-fr","ssh_host":"198.51.100.20","is_exit":true}`
 	rec = perform(h, http.MethodPost, "/api/nodes", exitBody, authRequest())
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create exit = %d: %s", rec.Code, rec.Body.String())
@@ -280,12 +281,38 @@ func TestDeployNodeAndConflict(t *testing.T) {
 		done <- rec.Code
 	}()
 	<-blocking.started
-	rec = perform(h, http.MethodPost, "/api/nodes/"+itoa(node.ID)+"/deploy", "", authRequest())
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("concurrent deploy = %d, want 409", rec.Code)
+	second := make(chan int, 1)
+	go func() {
+		rec := perform(h, http.MethodPost, "/api/nodes/"+itoa(node.ID)+"/deploy", "", authRequest())
+		second <- rec.Code
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		api.deployMu.Lock()
+		_, queued := api.pending[node.ID]
+		api.deployMu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second deploy was not queued")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	close(blocking.block)
-	<-done
+	for i, ch := range []chan int{done, second} {
+		select {
+		case code := <-ch:
+			if code != http.StatusOK {
+				t.Fatalf("deploy request %d = %d, want 200", i+1, code)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("deploy request %d did not finish", i+1)
+		}
+	}
+	if blocking.calls < 2 {
+		t.Fatalf("queued redeploy was not executed: calls = %d", blocking.calls)
+	}
 }
 
 func TestControlPlaneRejectsDuplicateTransportTypes(t *testing.T) {

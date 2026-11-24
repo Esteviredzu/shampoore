@@ -152,7 +152,6 @@ func exitFixture() (panelstore.Node, panelstore.Node, panelstore.Route) {
 		SSHUser:          "root",
 		SSHPort:          22,
 		IsExit:           true,
-		SocksPort:        1080,
 		NodeSecret:       "exit-secret",
 		GeneratedSecrets: secretsFor("exit"),
 	}
@@ -264,7 +263,15 @@ func TestCleanupNodeRemovesContainersAndFiles(t *testing.T) {
 		t.Fatalf("cleanup failed: %+v", result)
 	}
 	joined := strings.Join(remote.commands, "\n")
-	for _, want := range []string{"down -v --remove-orphans", "rm -rf /opt/shampoore"} {
+	for _, want := range []string{
+		"systemctl disable --now shampoore-server",
+		"/etc/systemd/system/shampoore",
+		"/usr/local/bin/shampoore-",
+		"down -v --remove-orphans",
+		"label=com.docker.compose.project=shampoore",
+		"docker volume rm",
+		"rm -rf /opt/shampoore /var/lib/shampoore",
+	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("cleanup did not run %q:\n%s", want, joined)
 		}
@@ -387,5 +394,49 @@ func TestValidateArchiveName(t *testing.T) {
 		if err := validateArchiveName(name); err == nil {
 			t.Errorf("validateArchiveName(%q) = nil, want error", name)
 		}
+	}
+}
+func TestDeployRelayUploadsAgentAndStartsHeartbeat(t *testing.T) {
+	relay := panelstore.Node{
+		ID:               9,
+		Name:             "relay-agent",
+		SSHHost:          "203.0.113.9",
+		SSHUser:          "root",
+		SSHPort:          22,
+		IsRelay:          true,
+		NodeSecret:       "relay-secret",
+		GeneratedSecrets: secretsFor("relay"),
+		Transports: []panelstore.Transport{
+			{Type: panelstore.TransportRawWS, Domain: "ws.example.com", Enabled: true},
+		},
+	}
+	store := &fakeStore{nodes: []panelstore.Node{relay}}
+	remote := &fakeRemote{}
+	p := New(store, Options{
+		PanelURL:    "https://panel.example.com",
+		LocalBinDir: writeFakeBinaries(t),
+		Dial:        func(context.Context, panelstore.Node) (Remote, error) { return remote, nil },
+	})
+	if _, err := p.DeployNode(context.Background(), relay); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	uploads := make(map[string]string, len(remote.uploads))
+	for _, f := range remote.uploads {
+		uploads[f.Name] = string(f.Data)
+	}
+	for _, name := range []string{"bin/shampoore-relay", "bin/shampoore-node-agent", "agent.env", "docker-compose.yml"} {
+		if _, ok := uploads[name]; !ok {
+			t.Fatalf("relay deploy did not upload %q", name)
+		}
+	}
+	if got := uploads["bin/shampoore-node-agent"]; got != "binary-shampoore-node-agent" {
+		t.Fatalf("uploaded agent binary = %q", got)
+	}
+	if !strings.Contains(uploads["agent.env"], "INTERVAL=5s") {
+		t.Fatalf("agent.env = %q", uploads["agent.env"])
+	}
+	compose := uploads["docker-compose.yml"]
+	if !strings.Contains(compose, "node-agent:") || !strings.Contains(compose, "shampoore-node-agent") {
+		t.Fatalf("relay compose does not run the agent:\n%s", compose)
 	}
 }

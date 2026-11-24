@@ -82,6 +82,9 @@ func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 	if err := normalizeUser(&u); err != nil {
 		return User{}, err
 	}
+	if err := s.validateUserRoutes(ctx, u.AllowedRouteIDs); err != nil {
+		return User{}, err
+	}
 	allowedRaw, err := json.Marshal(u.AllowedRouteIDs)
 	if err != nil {
 		return User{}, err
@@ -176,6 +179,9 @@ func (s *Store) UpdateUser(ctx context.Context, u User) (User, error) {
 		u.TrafficLimitBytes = existing.TrafficLimitBytes
 	}
 	if err := normalizeUser(&u); err != nil {
+		return User{}, err
+	}
+	if err := s.validateUserRoutes(ctx, u.AllowedRouteIDs); err != nil {
 		return User{}, err
 	}
 	allowedRaw, err := json.Marshal(u.AllowedRouteIDs)
@@ -330,4 +336,127 @@ func (s *Store) ActiveUsersForExit(ctx context.Context, exitNodeID int64, now ti
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+func (s *Store) validateUserRoutes(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	unique := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	placeholders := make([]string, len(unique))
+	args := make([]any, len(unique))
+	for i, id := range unique {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM routes WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return wrapDBErr(err, "validate user routes")
+	}
+	found := make(map[int64]struct{}, len(unique))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return wrapDBErr(err, "scan user route")
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return wrapDBErr(err, "validate user routes")
+	}
+	rows.Close()
+	missing := make([]int64, 0)
+	for _, id := range unique {
+		if _, ok := found[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return invalidf("user routes %v do not exist", missing)
+	}
+	return nil
+}
+
+func (s *Store) pruneUserRouteRefs(ctx context.Context, ids ...int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	drop := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			drop[id] = struct{}{}
+		}
+	}
+	if len(drop) == 0 {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, allowed_route_ids_json FROM users`)
+	if err != nil {
+		return wrapDBErr(err, "list users for route cleanup")
+	}
+	type pending struct {
+		id    string
+		order []int64
+	}
+	updates := make([]pending, 0)
+	for rows.Next() {
+		var (
+			id  string
+			raw string
+		)
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return wrapDBErr(err, "scan user route refs")
+		}
+		var current []int64
+		if strings.TrimSpace(raw) != "" {
+			if err := json.Unmarshal([]byte(raw), &current); err != nil {
+				rows.Close()
+				return fmt.Errorf("panelstore: decode user %s routes: %w", id, err)
+			}
+		}
+		next := make([]int64, 0, len(current))
+		for _, routeID := range current {
+			if _, gone := drop[routeID]; gone {
+				continue
+			}
+			next = append(next, routeID)
+		}
+		if len(next) == len(current) {
+			continue
+		}
+		updates = append(updates, pending{id: id, order: next})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return wrapDBErr(err, "list users for route cleanup")
+	}
+	rows.Close()
+	if len(updates) == 0 {
+		return nil
+	}
+	now := formatTime(time.Now())
+	for _, item := range updates {
+		encoded, err := json.Marshal(item.order)
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE users SET allowed_route_ids_json = ?, updated_at = ? WHERE id = ?`,
+			string(encoded), now, item.id); err != nil {
+			return wrapDBErr(err, "prune user routes")
+		}
+	}
+	return nil
 }

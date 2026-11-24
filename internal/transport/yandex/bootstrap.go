@@ -15,13 +15,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Esteviredzu/shampoore/internal/names"
-	"github.com/Esteviredzu/shampoore/internal/netdial"
+	"github.com/Esteviredzu/shampoore/internal/net/utlsdial"
 )
 
 const (
 	boardOrigin = "https://boards.yandex.ru"
 	httpTimeout = 20 * time.Second
-	userAgent   = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 )
 
 type Credentials struct {
@@ -35,12 +34,14 @@ type Credentials struct {
 	ParticipantName string
 }
 
-func Bootstrap(ctx context.Context, hash string) (*Credentials, error) {
+func Bootstrap(ctx context.Context, hash, utlsProfile string) (*Credentials, error) {
 	if !isValidHash(hash) {
 		return nil, fmt.Errorf("invalid board hash: %q", hash)
 	}
 
 	chosenName := names.Random()
+	profile := utlsdial.Profile(utlsProfile)
+	ua := utlsdial.UserAgent(profile)
 
 	guestURL := boardOrigin + "/guest/?hash=" + hash
 
@@ -48,11 +49,11 @@ func Bootstrap(ctx context.Context, hash string) (*Credentials, error) {
 	client := &http.Client{
 		Timeout:   httpTimeout,
 		Jar:       jar,
-		Transport: netdial.NewHTTPTransport(),
+		Transport: utlsdial.NewHTTPTransport(profile),
 	}
 
 	cookieHeader, tokenValue, err := requestGuestToken(
-		ctx, client, guestURL, hash, chosenName,
+		ctx, client, guestURL, hash, chosenName, ua,
 	)
 	if err != nil {
 		return nil, err
@@ -92,12 +93,13 @@ func requestGuestToken(
 	guestURL string,
 	presentation string,
 	name string,
+	ua string,
 ) (string, string, error) {
 	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, guestURL, nil)
 	if err != nil {
 		return "", "", err
 	}
-	getReq.Header.Set("User-Agent", userAgent)
+	getReq.Header.Set("User-Agent", ua)
 	getReq.Header.Set("Accept-Language", "ru,en-US;q=0.7,en;q=0.3")
 
 	getResp, err := client.Do(getReq)
@@ -136,7 +138,7 @@ func requestGuestToken(
 	if err != nil {
 		return "", "", err
 	}
-	postReq.Header.Set("User-Agent", userAgent)
+	postReq.Header.Set("User-Agent", ua)
 	postReq.Header.Set("Content-Type", "application/json")
 	postReq.Header.Set("X-Requested-With", "XMLHttpRequest")
 	postReq.Header.Set("Origin", boardOrigin)

@@ -127,8 +127,8 @@ func TestHandlerRequiresAuth(t *testing.T) {
 	if rec := perform(h, http.MethodGet, "/api/configs", "", nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("GET /api/configs without auth = %d, want 401", rec.Code)
 	}
-	if rec := perform(h, http.MethodGet, "/api/backup", "", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("GET /api/backup without auth = %d, want 401", rec.Code)
+	if rec := perform(h, http.MethodGet, "/api/users", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/users without auth = %d, want 401", rec.Code)
 	}
 	if rec := perform(h, http.MethodPost, "/api/server/stop", "", nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("POST /api/server/stop without auth = %d, want 401", rec.Code)

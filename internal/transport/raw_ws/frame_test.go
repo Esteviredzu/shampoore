@@ -18,7 +18,7 @@ func TestEncodeDecodeFrameRoundTrip(t *testing.T) {
 			if !batched {
 				in = msgs[:1]
 			}
-			frame := encodeFrame(in, batched, padding)
+			frame := encodeFrame(in, batched, padding, shapeDefaults.Padding)
 			if len(frame) < frameHeaderSize {
 				t.Fatalf("batched=%v padding=%v: short frame %d", batched, padding, len(frame))
 			}
