@@ -18,6 +18,11 @@ import (
 
 const serverRecvQueueCap = 4096
 
+const (
+	sparseFlushFrames = 8
+	sparseFlushBytes  = 32 << 10
+)
+
 type SessionHandler func(ctx context.Context, sess *Session) error
 
 type Handler struct {
@@ -213,11 +218,32 @@ func (h *Handler) getOrCreate(info SessionInfo) (*Session, error) {
 			oldest.cancel()
 		}
 	}
+
+	var stale []*Session
+	if h.cfg.ReapStaleSessions {
+		prefix := info.Namespace + "\x00" + info.UserID + "\x00" + info.Role + "\x00"
+		for otherKey, session := range h.sessions {
+			if otherKey == key || !strings.HasPrefix(otherKey, prefix) {
+				continue
+			}
+			delete(h.sessions, otherKey)
+			stale = append(stale, session)
+		}
+	}
 	session := newSession(h, key, info, sid)
 	h.sessions[key] = session
 	h.wg.Add(1)
 	go h.serveSession(session)
 	h.mu.Unlock()
+
+	for _, old := range stale {
+		if h.logger != nil {
+			h.logger.Info("httpstream: retiring stale session ", shortSessionID(old.info.SessionID),
+				" of user ", old.info.UserID)
+		}
+		old.closeTransport()
+		old.cancel()
+	}
 	return session, nil
 }
 
@@ -507,9 +533,23 @@ func (s *Session) enqueueDownlink(ctx context.Context, kind frameKind, messages 
 			return 0, ctx.Err()
 		case <-s.ctx.Done():
 			return 0, fmt.Errorf("%w: httpstream: session closed", transport.ErrTransportReset)
-		case <-time.After(50 * time.Millisecond):
+		case <-s.dlWait:
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+func (s *Session) resetDownlink() uint32 {
+	s.dlMu.Lock()
+	s.dlFrames = nil
+	s.dlBytes = 0
+	s.dlMinSeq = 1
+	s.dlNextSeq = 1
+	s.dlAcked = 0
+	generation := s.generation.Add(1)
+	s.dlMu.Unlock()
+	s.notifyDownlink()
+	return generation
 }
 
 func (s *Session) ackDownlink(cursor uint64) {
@@ -582,9 +622,10 @@ func (s *Session) handleFrame(frame decodedFrame) error {
 		return errors.New("httpstream: frame session mismatch")
 	}
 	s.touch()
+
+	s.ackDownlink(frame.Ack)
 	switch frame.Kind {
 	case frameKeepAlive:
-		s.ackDownlink(frame.Ack)
 		return nil
 	case frameClose:
 		s.closeTransport()
@@ -595,7 +636,6 @@ func (s *Session) handleFrame(frame decodedFrame) error {
 			s.epoch.Store(frame.Epoch)
 			s.reorder.Reset(frame.Epoch)
 		}
-		s.ackDownlink(frame.Ack)
 		return nil
 	case frameData:
 		if frame.Epoch == 0 || frame.Seq == 0 {
@@ -618,6 +658,7 @@ func (s *Session) handleFrame(frame decodedFrame) error {
 			return nil
 		}
 		s.uplinkCursor.Store(s.reorder.Delivered())
+		timeout := s.handler.cfg.DeliveryTimeout
 		for _, payload := range ready {
 			msgs, err := decodeMessages(payload)
 			if err != nil {
@@ -625,19 +666,31 @@ func (s *Session) handleFrame(frame decodedFrame) error {
 			}
 			s.ctr.FramesRecv.Add(1)
 			for _, msg := range msgs {
-				cp := append([]byte(nil), msg...)
-				select {
-				case s.recvCh <- cp:
-				case <-s.ctx.Done():
-					return fmt.Errorf("%w: httpstream: session closed", transport.ErrTransportReset)
+
+				if !s.deliverOrTimeout(msg, timeout) {
+					return fmt.Errorf("%w: httpstream: receive queue stalled", transport.ErrTransportReset)
 				}
-				s.ctr.UsefulRecv.Add(int64(len(cp)))
+				s.ctr.UsefulRecv.Add(int64(len(msg)))
 				s.ctr.MessagesRecv.Add(1)
 			}
 		}
 		return nil
 	default:
 		return fmt.Errorf("httpstream: unexpected uplink frame kind %d", frame.Kind)
+	}
+}
+
+func (s *Session) deliverOrTimeout(msg []byte, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = defaultDeliveryTimeout
+	}
+	select {
+	case s.recvCh <- msg:
+		return true
+	case <-s.ctx.Done():
+		return false
+	case <-time.After(timeout):
+		return false
 	}
 }
 
@@ -705,6 +758,7 @@ func (h *Handler) downlinkStream(w http.ResponseWriter, r *http.Request, session
 	if err := writeFrame(w, initial); err != nil {
 		return
 	}
+	flushResponse(w)
 	budget -= len(initial)
 	if budget <= 0 {
 		return
@@ -724,22 +778,30 @@ func (h *Handler) downlinkStream(w http.ResponseWriter, r *http.Request, session
 		}
 		frames, needReset := session.snapshotFrom(cursor, budget)
 		if needReset {
+
+			session.resetDownlink()
 			h.writeEpochReset(w, session)
-			session.closeTransport()
-			session.cancel()
-			return
+			cursor = 0
+			budget = h.profile.MaxStreamBytes
+			continue
 		}
 		if len(frames) > 0 {
+			sparse := len(frames) <= sparseFlushFrames
 			for _, frame := range frames {
 				if err := writeFrame(w, frame.wire); err != nil {
 					return
 				}
 				cursor = frame.seq
 				budget -= len(frame.wire)
+				if sparse && len(frame.wire) <= sparseFlushBytes {
+					flushResponse(w)
+				}
 				if budget <= 0 {
+					flushResponse(w)
 					return
 				}
 			}
+			flushResponse(w)
 			continue
 		}
 
@@ -758,6 +820,7 @@ func (h *Handler) downlinkStream(w http.ResponseWriter, r *http.Request, session
 			if err := writeFrame(w, frame); err != nil {
 				return
 			}
+			flushResponse(w)
 			budget -= len(frame)
 			if budget <= 0 {
 				return
@@ -783,9 +846,9 @@ func (h *Handler) downlinkPoll(w http.ResponseWriter, r *http.Request, session *
 		if needReset {
 			setStreamHeaders(w)
 			w.WriteHeader(http.StatusOK)
+			session.resetDownlink()
 			h.writeEpochReset(w, session)
-			session.closeTransport()
-			session.cancel()
+			flushResponse(w)
 			return
 		}
 		if len(frames) > 0 {
@@ -797,6 +860,7 @@ func (h *Handler) downlinkPoll(w http.ResponseWriter, r *http.Request, session *
 				}
 				cursor = frame.seq
 			}
+			flushResponse(w)
 			return
 		}
 
@@ -814,6 +878,7 @@ func (h *Handler) downlinkPoll(w http.ResponseWriter, r *http.Request, session *
 			if err := writeFrame(w, frame); err != nil {
 				return
 			}
+			flushResponse(w)
 			return
 		case <-watch.C:
 			session.touch()
@@ -828,14 +893,12 @@ func (h *Handler) writeEpochReset(w http.ResponseWriter, session *Session) {
 	if err := writeFrame(w, frame); err != nil && h.logger != nil {
 		h.logger.Debug("httpstream: write epoch reset: ", err)
 	}
+	flushResponse(w)
 }
 
 func writeFrame(w http.ResponseWriter, frame []byte) error {
-	if _, err := w.Write(frame); err != nil {
-		return err
-	}
-	flushResponse(w)
-	return nil
+	_, err := w.Write(frame)
+	return err
 }
 
 func (h *Handler) WalkLayers() []transport.Layer {

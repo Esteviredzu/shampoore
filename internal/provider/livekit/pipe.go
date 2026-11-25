@@ -46,13 +46,21 @@ type Pipe struct {
 
 	lastRecv      atomic.Int64
 	peerHeartbeat atomic.Bool
-	deadFired     atomic.Bool
+
+	lastSentNs atomic.Int64
+
+	peerPresent atomic.Bool
+
+	adoptFirst atomic.Bool
+	deadFired  atomic.Bool
 
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
 
 	deadMu sync.Mutex
 	onDead func()
+
+	onPublishError func(error)
 
 	resetMu   sync.Mutex
 	lastReset time.Time
@@ -98,6 +106,24 @@ func (p *Pipe) SetDeadHandler(fn func()) {
 	p.deadMu.Unlock()
 }
 
+func (p *Pipe) SetPublishErrorHandler(fn func(error)) {
+	p.deadMu.Lock()
+	p.onPublishError = fn
+	p.deadMu.Unlock()
+}
+
+func (p *Pipe) reportPublishError(err error) {
+	if err == nil {
+		return
+	}
+	p.deadMu.Lock()
+	fn := p.onPublishError
+	p.deadMu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
+}
+
 func (p *Pipe) ResetLiveness() {
 	p.lastRecv.Store(time.Now().UnixNano())
 	p.deadFired.Store(false)
@@ -107,9 +133,18 @@ func (p *Pipe) noteIncoming() {
 	p.lastRecv.Store(time.Now().UnixNano())
 }
 
+func (p *Pipe) LastPublishOK() time.Time {
+	ns := p.lastSentNs.Load()
+	if ns <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
 func (p *Pipe) PeerJoined(id string) bool {
 	previous := p.GetRemoteID()
 	p.SetRemoteID(id)
+	p.peerPresent.Store(true)
 	p.ResetLiveness()
 	return previous == ""
 }
@@ -117,8 +152,13 @@ func (p *Pipe) PeerJoined(id string) bool {
 func (p *Pipe) PeerLeft() {
 	p.SetRemoteID("")
 	p.peerHeartbeat.Store(false)
+	p.peerPresent.Store(false)
 	p.ResetLiveness()
 }
+
+func (p *Pipe) PeerPresent() bool { return p.peerPresent.Load() }
+
+func (p *Pipe) SetAdoptFirstPacket(enable bool) { p.adoptFirst.Store(enable) }
 
 func (p *Pipe) SignalReset(err error) {
 	if err == nil {
@@ -207,7 +247,8 @@ func (p *Pipe) heartbeatLoop(ctx context.Context) {
 			timeout = pipeHeartbeatTimeout
 		}
 
-		if !p.peerHeartbeat.Load() && p.GetRemoteID() == "" {
+		if !p.peerPresent.Load() {
+
 			continue
 		}
 		if time.Since(time.Unix(0, p.lastRecv.Load())) >= timeout {
@@ -218,9 +259,6 @@ func (p *Pipe) heartbeatLoop(ctx context.Context) {
 
 func (p *Pipe) sendHeartbeat() {
 	rid := p.GetRemoteID()
-	if rid == "" {
-		return
-	}
 	p.localMu.RLock()
 	local := p.local
 	p.localMu.RUnlock()
@@ -230,8 +268,11 @@ func (p *Pipe) sendHeartbeat() {
 	opts := []lksdk.DataPublishOption{
 		lksdk.WithDataPublishReliable(true),
 		lksdk.WithDataPublishTopic(p.topic),
-		lksdk.WithDataPublishDestination([]string{rid}),
 	}
+	if rid != "" {
+		opts = append(opts, lksdk.WithDataPublishDestination([]string{rid}))
+	}
+
 	_ = local.PublishDataPacket(lksdk.UserData(heartbeatPayload), opts...)
 }
 
@@ -249,14 +290,26 @@ func (p *Pipe) fireDead() {
 
 func (p *Pipe) PushIncoming(data []byte, senderIdentity string) {
 	rid := p.GetRemoteID()
-	if rid != "" && senderIdentity != rid {
-		return
+	if rid != "" && senderIdentity != "" && senderIdentity != rid {
+		if p.peerPresent.Load() || !p.adoptFirst.Load() {
+
+			return
+		}
+
+		rid = senderIdentity
+		p.SetRemoteID(senderIdentity)
+	}
+
+	if rid == "" && senderIdentity != "" {
+		p.SetRemoteID(senderIdentity)
 	}
 	select {
 	case <-p.closed:
 		return
 	default:
 	}
+
+	p.peerPresent.Store(true)
 	p.noteIncoming()
 	if isHeartbeatPayload(data) {
 		p.peerHeartbeat.Store(true)
@@ -323,8 +376,10 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 	}
 
 	if err := local.PublishDataPacket(lksdk.UserData(data), opts...); err != nil {
+		p.reportPublishError(err)
 		return err
 	}
+	p.lastSentNs.Store(time.Now().UnixNano())
 	n := int64(len(data))
 	p.bytesSent.Add(n)
 	p.ctr.UsefulSent.Add(n)

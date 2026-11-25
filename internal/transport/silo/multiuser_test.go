@@ -138,10 +138,12 @@ func (s *fakeStore) ListObjects(_ context.Context, bucket string, opts minio.Lis
 		})
 	}
 	s.mu.Unlock()
-	for _, info := range infos {
-		ch <- info
-	}
-	close(ch)
+	go func() {
+		for _, info := range infos {
+			ch <- info
+		}
+		close(ch)
+	}()
 	return ch
 }
 

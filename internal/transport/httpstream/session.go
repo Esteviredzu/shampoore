@@ -46,6 +46,8 @@ const (
 	defaultDownlinkReplayBytes   = 4 << 20
 	defaultKeepAliveInterval     = 5 * time.Second
 	defaultStableSessionLifetime = 15 * time.Second
+
+	defaultDeliveryTimeout = 30 * time.Second
 )
 
 type SessionInfo struct {
@@ -381,6 +383,10 @@ type ServerConfig struct {
 	DownlinkReplayBytes int
 	PollHold            time.Duration
 	KeepAliveInterval   time.Duration
+
+	DeliveryTimeout time.Duration
+
+	ReapStaleSessions bool
 }
 
 func normalizeClientConfig(profile MimicProfile, cfg ClientConfig) (ClientConfig, error) {
@@ -436,6 +442,9 @@ func normalizeClientConfig(profile MimicProfile, cfg ClientConfig) (ClientConfig
 	}
 	if cfg.MaxUplinkRetries <= 0 {
 		cfg.MaxUplinkRetries = defaultMaxUplinkRetries
+	}
+	if cfg.AckInterval <= 0 {
+		cfg.AckInterval = profile.AckInterval
 	}
 	if cfg.AckInterval <= 0 {
 		cfg.AckInterval = defaultAckInterval
@@ -520,6 +529,9 @@ func normalizeServerConfig(profile MimicProfile, cfg ServerConfig) (ServerConfig
 	}
 	if cfg.KeepAliveInterval <= 0 {
 		cfg.KeepAliveInterval = defaultKeepAliveInterval
+	}
+	if cfg.DeliveryTimeout <= 0 {
+		cfg.DeliveryTimeout = defaultDeliveryTimeout
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = logging.New("httpstream", false)

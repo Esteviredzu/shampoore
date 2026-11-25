@@ -2003,6 +2003,7 @@ function renderNodes() {
         <div class="node-card__meta">
           <span class="role-chip">${esc(nodeRoles(node))}</span>
           <span class="meta-chip"><span class="material-symbols-rounded">sensors</span><span data-node-last-seen="${escAttr(node.id)}">${esc(nodeLastSeenText(node))}</span></span>
+          <span class="meta-chip" title="${escAttr(t('nodes.updatedAt'))}"><span class="material-symbols-rounded">rocket_launch</span><span data-node-updated="${escAttr(node.id)}" data-time-iso="${escAttr(node.updated_at || '')}">${esc(nodeDeployedText(node))}</span></span>
         </div>
         ${exitOnly ? '' : `<div class="transport-list">${transports}</div>`}
         ${nodeMetricsHTML(node)}

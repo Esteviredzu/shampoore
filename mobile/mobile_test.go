@@ -53,6 +53,7 @@ type fakeMux struct {
 	startErr  error
 	startCall atomic.Int32
 	stopCall  atomic.Int32
+	doneCh    chan struct{}
 }
 
 func (m *fakeMux) Start(context.Context) error {
@@ -66,6 +67,8 @@ func (m *fakeMux) OpenStream(context.Context, map[string]any) (multiplexing.Stre
 func (m *fakeMux) AcceptStream(context.Context) (multiplexing.Stream, error) {
 	return nil, errors.New("fakeMux: AcceptStream is not implemented")
 }
+
+func (m *fakeMux) Done() <-chan struct{} { return m.doneCh }
 
 type fakeBundle struct {
 	transport *fakeTransport
@@ -144,6 +147,8 @@ func resetMobileState(t *testing.T) {
 	cancel = nil
 	done = nil
 	currentRuntime = nil
+	currentMuxDone = nil
+	sessionGen = 0
 	stateListener = nil
 	tunnelHealth = HealthStatus{}
 	healthError = false
@@ -409,6 +414,44 @@ func TestAsyncTUNFailureNotifiesListener(t *testing.T) {
 	if bundle.provider.stopCalls.Load() == 0 || bundle.mux.stopCall.Load() == 0 {
 		t.Fatal("asynchronous TUN failure leaked runtime resources")
 	}
+}
+
+func TestStartClientAfterTunnelDiedDoesNotSayAlreadyRunning(t *testing.T) {
+	resetMobileState(t)
+	startTUNFD = runFakeTUN
+
+	first := &fakeBundle{
+		transport: &fakeTransport{},
+		provider:  &fakeProvider{},
+		mux:       &fakeMux{doneCh: make(chan struct{})},
+	}
+	var calls atomic.Int32
+	installFakeBuilder(t, func() *fakeBundle {
+		if calls.Add(1) == 1 {
+			return first
+		}
+		return &fakeBundle{
+			transport: &fakeTransport{},
+			provider:  &fakeProvider{},
+			mux:       &fakeMux{},
+		}
+	})
+
+	if got := StartClientVPN(testSource, 0, 1500); got != "" {
+		t.Fatalf("first StartClientVPN returned %q", got)
+	}
+
+	close(first.mux.doneCh)
+
+	if got := StartClientVPN(testSource, 0, 1500); got != "" {
+		t.Fatalf("reconnect after a dead tunnel returned %q", got)
+	}
+	if !IsRunning() {
+		t.Fatal("client is not running after a successful reconnect")
+	}
+
+	StopClient()
+	waitForState(t, StateIdle, 5*time.Second)
 }
 
 func TestGlobalFilterPointerStableAcrossReloads(t *testing.T) {

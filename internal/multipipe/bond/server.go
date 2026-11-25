@@ -48,12 +48,18 @@ type aggregate struct {
 	tubes   map[string]transport.Transport
 	raw     map[string]transport.Transport
 	started bool
+	live    int
 	mux     multiplexing.StreamMultiplexer
 	conn    *connManager
 
 	once    sync.Once
 	timeout *time.Timer
 }
+
+const (
+	tubeStartRetryBase = time.Second
+	tubeStartRetryMax  = 10 * time.Second
+)
 
 func NewServer(
 	names []string,
@@ -183,37 +189,147 @@ func (s *Server) register(tube, userID string, tr transport.Transport) (func(), 
 		}
 		s.users[userID] = agg
 	}
-	if agg.timeout == nil && !agg.started {
-		agg.timeout = time.AfterFunc(aggregateRendezvousTimeout, func() {
-			s.teardown(agg, "rendezvous timeout")
-		})
-	}
 	previousRaw := agg.raw[tube]
 	replaced := previousRaw != nil && previousRaw != tr
 	agg.tubes[tube] = tr
 	agg.raw[tube] = tr
-	ready := !replaced && len(agg.tubes) >= len(s.names)
 	started := agg.started
+	doneCh := agg.done
 	s.mu.Unlock()
 
-	release := func() { s.teardown(agg, "tube released") }
+	release := func() {
+		s.mu.Lock()
+		current := s.users[userID]
+		matches := current == agg && agg.raw[tube] == tr
+		empty := false
+		var cm *connManager
+		if matches {
+			delete(agg.tubes, tube)
+			delete(agg.raw, tube)
+			empty = len(agg.tubes) == 0 || s.ctx == nil || s.ctx.Err() != nil
+			cm = agg.conn
+		}
+		s.mu.Unlock()
+		if !matches {
+			return
+		}
+		if cm != nil {
+			cm.dropTube(tube)
+		}
+		stopCtx, cancel := context.WithTimeout(context.Background(), aggregateStopTimeout)
+		_ = tr.Stop(stopCtx)
+		cancel()
+		if empty {
+			go s.teardown(agg, "all tubes released")
+		}
+	}
 
 	if replaced {
 		stopCtx, cancel := context.WithTimeout(context.Background(), aggregateStopTimeout)
 		_ = previousRaw.Stop(stopCtx)
 		cancel()
-		if started {
-
-			s.teardown(agg, "tube replaced")
-			return func() {}, agg.done
-		}
-		return release, agg.done
 	}
-	if ready {
+
+	if !started {
+
 		s.startAggregate(agg)
+		return release, doneCh
+	}
+	if replaced {
+		go s.attachTube(agg, tube, tr)
+		return release, doneCh
+	}
+	go s.attachTube(agg, tube, tr)
+	return release, doneCh
+}
+
+func (s *Server) attachTube(agg *aggregate, tube string, raw transport.Transport) {
+	if agg == nil || raw == nil {
+		return
+	}
+	s.mu.Lock()
+	password := s.password
+	logger := s.logger
+	aggCtx := agg.ctx
+	s.mu.Unlock()
+
+	wrapped, err := wrapBondTube(raw, password, security.RoleServer, logger)
+	if err != nil {
+		logger.Warn("bond: secure tube ", tube, ": ", err)
+		return
 	}
 
-	return release, agg.done
+	backoff := tubeStartRetryBase
+	for {
+		if aggCtx.Err() != nil {
+			stopTransport(wrapped)
+			return
+		}
+		if err := wrapped.Start(aggCtx); err == nil {
+			break
+		} else {
+			logger.Warn("bond: start tube ", tube, ": ", err)
+		}
+		select {
+		case <-aggCtx.Done():
+			stopTransport(wrapped)
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > tubeStartRetryMax {
+			backoff = tubeStartRetryMax
+		}
+	}
+
+	deadline := time.Now().Add(aggregateRendezvousTimeout)
+	for {
+		s.mu.Lock()
+		live := s.users[agg.userID] == agg && agg.started
+		cm := agg.conn
+		if live && cm != nil {
+			agg.tubes[tube] = wrapped
+		}
+		s.mu.Unlock()
+		if !live {
+			stopTransport(wrapped)
+			return
+		}
+		if cm != nil {
+			cm.addTube(tube, &transportTube{t: wrapped})
+			s.noteLiveTube(agg)
+			return
+		}
+		if time.Now().After(deadline) {
+			logger.Warn("bond: aggregate for ", agg.userID, " never became ready for tube ", tube)
+			stopTransport(wrapped)
+			return
+		}
+		select {
+		case <-aggCtx.Done():
+			stopTransport(wrapped)
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) noteLiveTube(agg *aggregate) {
+	s.mu.Lock()
+	if agg.live == 0 && agg.timeout != nil {
+		agg.timeout.Stop()
+		agg.timeout = nil
+	}
+	agg.live++
+	s.mu.Unlock()
+}
+
+func stopTransport(tr transport.Transport) {
+	if tr == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), aggregateStopTimeout)
+	_ = tr.Stop(stopCtx)
+	cancel()
 }
 
 func (s *Server) startAggregate(agg *aggregate) {
@@ -222,53 +338,50 @@ func (s *Server) startAggregate(agg *aggregate) {
 		s.mu.Unlock()
 		return
 	}
-	if len(agg.tubes) < len(s.names) {
-		s.mu.Unlock()
-		return
-	}
 	agg.started = true
-	if agg.timeout != nil {
-		agg.timeout.Stop()
-	}
-	names := make([]string, len(s.names))
-	tubes := make([]tubeLike, len(s.names))
-	transports := make([]transport.Transport, len(s.names))
-	var ensureErr error
-	for i, name := range s.names {
-		tr := agg.tubes[name]
-		if tr == nil {
-			agg.started = false
-			s.mu.Unlock()
-			return
-		}
-		wrapped, err := security.EnsureSecureTransport(tr, s.password, security.RoleServer, s.logger)
-		if err != nil {
-			ensureErr = fmt.Errorf("secure tube %s: %w", name, err)
-			agg.started = false
-			break
-		}
-		agg.tubes[name] = wrapped
-		names[i] = name
-		transports[i] = wrapped
-		tubes[i] = &transportTube{t: wrapped}
-	}
 	handler := s.handler
 	exitNodeID := s.exitNodeID
-	s.mu.Unlock()
-	if ensureErr != nil {
-		s.teardown(agg, ensureErr.Error())
-		return
+	aggCtx := agg.ctx
+	pending := make(map[string]transport.Transport, len(agg.raw))
+	for name, tr := range agg.raw {
+		pending[name] = tr
 	}
+	s.mu.Unlock()
 
-	for i, tr := range transports {
-		if err := tr.Start(agg.ctx); err != nil {
-			s.teardown(agg, fmt.Sprintf("start tube %s: %v", names[i], err))
-			return
+	hintTubes := make([]tubeLike, 0, len(pending))
+	for _, tr := range pending {
+		if tr != nil {
+			hintTubes = append(hintTubes, &transportTube{t: tr})
 		}
 	}
+	session := newConnManager(aggCtx, nil, nil, s.logger)
+	if hint := aggregateMaxPayload(hintTubes); hint > 0 && hint < session.payload {
+		session.payload = hint
+	}
+	ct := &connTransport{session: session, maxPayload: session.MaxPayload()}
 
-	session := newConnManager(agg.ctx, names, tubes, s.logger)
-	ct := &connTransport{session: session, maxPayload: session.MaxPayload(), numTubes: len(tubes)}
+	s.mu.Lock()
+	if s.users[agg.userID] != agg {
+		s.mu.Unlock()
+		_ = session.Close()
+		return
+	}
+	agg.conn = session
+	for name, tr := range agg.raw {
+		if _, ok := pending[name]; !ok {
+			pending[name] = tr
+		}
+	}
+	launched := make(map[string]struct{}, len(pending))
+	for name := range pending {
+		launched[name] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	for name, tr := range pending {
+		go s.attachTube(agg, name, tr)
+	}
+
 	cfg := s.muxCfg
 	cfg.Registry = s.registry
 
@@ -279,7 +392,7 @@ func (s *Server) startAggregate(agg *aggregate) {
 		go s.teardown(agg, "session error: "+err.Error())
 	}
 	mux := tunnel.New(ct, s.logger, cfg)
-	if err := mux.Start(agg.ctx); err != nil {
+	if err := mux.Start(aggCtx); err != nil {
 		_ = session.Close()
 		s.teardown(agg, "tunnel start: "+err.Error())
 		return
@@ -288,12 +401,30 @@ func (s *Server) startAggregate(agg *aggregate) {
 	s.mu.Lock()
 	if s.users[agg.userID] != agg {
 		s.mu.Unlock()
-		_ = mux.Stop(context.Background())
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), aggregateStopTimeout)
+		_ = mux.Stop(stopCtx)
+		cancelStop()
 		_ = session.Close()
 		return
 	}
 	agg.mux = mux
-	agg.conn = session
+
+	extra := make(map[string]transport.Transport, len(agg.raw))
+	for name, tr := range agg.raw {
+		if _, ok := launched[name]; !ok {
+			extra[name] = tr
+		}
+	}
+	if agg.timeout == nil {
+		agg.timeout = time.AfterFunc(aggregateRendezvousTimeout, func() {
+			s.mu.Lock()
+			live := agg.live > 0
+			s.mu.Unlock()
+			if !live {
+				s.teardown(agg, "rendezvous timeout")
+			}
+		})
+	}
 	s.mu.Unlock()
 
 	if handler == nil {
@@ -311,8 +442,17 @@ func (s *Server) startAggregate(agg *aggregate) {
 		s.teardown(agg, "handler finished")
 	}()
 
+	for name, tr := range extra {
+		select {
+		case <-aggCtx.Done():
+			return
+		default:
+		}
+		go s.attachTube(agg, name, tr)
+	}
+
 	s.logger.Info("bond: aggregated session ready for user ", agg.userID,
-		" tubes=", len(names))
+		" pending tubes=", len(pending)+len(extra))
 }
 
 func (s *Server) teardown(agg *aggregate, reason string) {
@@ -328,11 +468,17 @@ func (s *Server) teardown(agg *aggregate, reason string) {
 		}
 		mux := agg.mux
 		conn := agg.conn
+		live := agg.live
 		agg.mux = nil
 		agg.conn = nil
-		tubes := make([]transport.Transport, 0, len(agg.tubes))
+		tubes := make([]transport.Transport, 0, len(agg.tubes)+len(agg.raw))
 		for _, tr := range agg.tubes {
 			tubes = append(tubes, tr)
+		}
+		for name, tr := range agg.raw {
+			if _, dup := agg.tubes[name]; !dup {
+				tubes = append(tubes, tr)
+			}
 		}
 		agg.tubes = make(map[string]transport.Transport)
 		agg.raw = make(map[string]transport.Transport)
@@ -344,6 +490,11 @@ func (s *Server) teardown(agg *aggregate, reason string) {
 
 		close(agg.done)
 
+		if live == 0 && conn != nil {
+			_ = conn.Close()
+			conn = nil
+		}
+
 		if mux != nil {
 			stopCtx, cancel := context.WithTimeout(context.Background(), aggregateStopTimeout)
 			_ = mux.Stop(stopCtx)
@@ -352,6 +503,7 @@ func (s *Server) teardown(agg *aggregate, reason string) {
 		if conn != nil {
 			_ = conn.Close()
 		}
+
 		agg.cancel()
 		for _, tr := range tubes {
 			stopCtx, cancel := context.WithTimeout(context.Background(), aggregateStopTimeout)

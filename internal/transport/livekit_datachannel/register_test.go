@@ -7,6 +7,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/logging"
+	lk "github.com/Esteviredzu/shampoore/internal/provider/livekit"
 )
 
 func TestBuildMultiuserServer(t *testing.T) {
@@ -146,6 +147,26 @@ func TestBuildServerConfigMultiuser(t *testing.T) {
 	for _, removed := range []string{"token_listen", "token_url", "token_secret"} {
 		if _, ok := tr[removed]; ok {
 			t.Fatalf("server config has removed field %s: %v", removed, tr)
+		}
+	}
+}
+
+func TestNormalizeClientIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  lk.Config
+		want string
+	}{
+		{name: "from user id", cfg: lk.Config{UserID: " alice "}, want: "alice"},
+		{name: "explicit identity", cfg: lk.Config{UserID: "alice", Identity: " bob "}, want: "bob"},
+		{name: "uuid lowercased", cfg: lk.Config{UserID: "3F2504E0-4F89-11D3-9A0C-0305E82C3301"}, want: "3f2504e0-4f89-11d3-9a0c-0305e82c3301"},
+		{name: "empty", cfg: lk.Config{}, want: ""},
+	}
+	for _, tc := range cases {
+		cfg := tc.cfg
+		normalizeClientIdentity(&cfg)
+		if cfg.Identity != tc.want {
+			t.Fatalf("%s: identity = %q, want %q", tc.name, cfg.Identity, tc.want)
 		}
 	}
 }

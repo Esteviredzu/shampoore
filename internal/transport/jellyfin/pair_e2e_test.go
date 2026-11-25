@@ -13,6 +13,7 @@ import (
 
 	"github.com/Esteviredzu/shampoore/internal/app"
 	"github.com/Esteviredzu/shampoore/internal/auth"
+	"github.com/Esteviredzu/shampoore/internal/core/security"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multipipe/bond"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
@@ -197,7 +198,11 @@ func TestPairE2EBondAggregatesExit(t *testing.T) {
 		_ = raw.Stop(stopCtx)
 	}()
 
-	bm, err := bond.NewMux([]transport.Transport{raw}, []string{"0-jellyfin"}, lg)
+	secured, err := security.WrapTransport(raw, testPipeSecret, security.RoleClient, testLogger{})
+	if err != nil {
+		t.Fatalf("wrap client: %v", err)
+	}
+	bm, err := bond.NewMux([]transport.Transport{secured}, []string{"0-jellyfin"}, lg)
 	if err != nil {
 		t.Fatalf("bond mux: %v", err)
 	}

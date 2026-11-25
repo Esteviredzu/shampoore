@@ -106,6 +106,8 @@ func (s *Server) ensureEngine() (*httpstream.Handler, error) {
 		RequireUser:      s.cfg.Multiuser,
 		FallbackHandler:  newFallbackHandler(s.cfg.UpstreamURL, s.logger),
 		Logger:           s.logger,
+
+		DownlinkReplayBytes: profile.DownlinkReplayBytes,
 	}
 	if s.registry != nil {
 		registry := s.registry

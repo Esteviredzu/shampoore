@@ -44,7 +44,13 @@ var (
 	cancel         context.CancelFunc
 	done           chan struct{}
 	currentRuntime *app.Runtime
+	currentMuxDone <-chan struct{}
 	stateListener  StateListener
+
+	sessionGen uint64
+
+	startCancel context.CancelFunc
+	startDone   chan struct{}
 
 	tunnelHealth HealthStatus
 	healthError  bool
@@ -205,6 +211,42 @@ func setStateIf(current, next, msg string) bool {
 	return true
 }
 
+func muxDoneOf(mux multiplexing.StreamMultiplexer) <-chan struct{} {
+	if mux == nil {
+		return nil
+	}
+	if d, ok := mux.(interface{ Done() <-chan struct{} }); ok {
+		return d.Done()
+	}
+	return nil
+}
+
+func channelClosed(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func clearDeadSessionLocked() (StateListener, bool) {
+	if currentRuntime == nil && cancel == nil && done == nil {
+		return nil, false
+	}
+	currentRuntime = nil
+	cancel = nil
+	done = nil
+	currentMuxDone = nil
+	state = StateIdle
+	stateMessage = ""
+	resetHealthLocked()
+	return stateListener, true
+}
+
 func StartClient(source string) string {
 	return startClient(source, runSocks5, 0, 0)
 }
@@ -229,9 +271,11 @@ const (
 type clientSession struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
+	gen        uint64
 	rt         *app.Runtime
 	mux        multiplexing.StreamMultiplexer
 	detachMux  multiplexing.StreamMultiplexer
+	muxDone    <-chan struct{}
 	healthCtl  *healthController
 	tunMode    bool
 	tunStopped <-chan struct{}
@@ -246,7 +290,27 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 	stateMu.Lock()
 	current := state
 	runtimeAlive := currentRuntime != nil
+	priorDone := done
+	priorMuxDone := currentMuxDone
 	stateMu.Unlock()
+
+	if runtimeAlive && (channelClosed(priorDone) || channelClosed(priorMuxDone)) {
+		waitDone(priorDone, 10*time.Second)
+		stateMu.Lock()
+		switch state {
+		case StateStarting, StateStopping:
+			stateMu.Unlock()
+			return "shampoore: client already running"
+		}
+		listener, cleared := clearDeadSessionLocked()
+		current = state
+		runtimeAlive = currentRuntime != nil
+		stateMu.Unlock()
+		if cleared && listener != nil {
+			listener.OnStateChanged(StateIdle, "")
+		}
+	}
+
 	switch current {
 	case StateStarting, StateConnecting, StateRunning, StateStopping:
 		return "shampoore: client already running"
@@ -256,10 +320,40 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 		}
 	}
 
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	sessionDone := make(chan struct{})
+	stateMu.Lock()
+	sessionGen++
+	gen := sessionGen
+	startCancel = rootCancel
+	startDone = sessionDone
+	stateMu.Unlock()
+
+	clearStart := func() {
+		stateMu.Lock()
+		if startCancel != nil {
+			startCancel = nil
+		}
+		if startDone == sessionDone {
+			startDone = nil
+		}
+		stateMu.Unlock()
+	}
+
 	transitionState(StateStarting, "")
-	sess, err := startLocked(source, mode, vpnFD, vpnMTU)
+	sess, err := startLocked(rootCtx, rootCancel, sessionDone, gen, source, mode, vpnFD, vpnMTU)
 	if err != nil {
+		cancelled := rootCtx.Err() != nil
+		clearStart()
+		rootCancel()
+		if cancelled {
+
+			transitionState(StateIdle, "")
+			close(sessionDone)
+			return "shampoore: start cancelled"
+		}
 		transitionState(StateError, err.Error())
+		close(sessionDone)
 		return "shampoore: " + err.Error()
 	}
 
@@ -269,6 +363,7 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 		next = StateConnecting
 	}
 	if !setStateIf(StateStarting, next, "") {
+		clearStart()
 		stateMu.Lock()
 		msg := stateMessage
 		stateMu.Unlock()
@@ -276,20 +371,21 @@ func startClient(source string, mode runMode, vpnFD int, vpnMTU int) string {
 			msg = "start aborted"
 		}
 		sess.cancel()
-		go monitorRuntime(sess.ctx, sess.rt, sess.mux, sess.detachMux, sess.tunStopped, sess.fatalCh, sess.doneCh, nil)
+		go monitorRuntime(sess.ctx, sess.gen, sess.rt, sess.mux, sess.detachMux, sess.muxDone, sess.tunStopped, sess.fatalCh, sess.doneCh, nil)
 		return "shampoore: " + msg
 	}
+	clearStart()
 
 	var healthDone <-chan struct{}
 	if sess.tunMode && probeEnabled && sess.healthCtl != nil {
 		sess.healthCtl.start()
 		healthDone = sess.healthCtl.done
 	}
-	go monitorRuntime(sess.ctx, sess.rt, sess.mux, sess.detachMux, sess.tunStopped, sess.fatalCh, sess.doneCh, healthDone)
+	go monitorRuntime(sess.ctx, sess.gen, sess.rt, sess.mux, sess.detachMux, sess.muxDone, sess.tunStopped, sess.fatalCh, sess.doneCh, healthDone)
 	return ""
 }
 
-func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSession, error) {
+func startLocked(parent context.Context, rootCancel context.CancelFunc, sessionDone chan struct{}, gen uint64, source string, mode runMode, vpnFD int, vpnMTU int) (*clientSession, error) {
 	s, err := app.ParseSource(source)
 	if err != nil {
 		return nil, err
@@ -300,7 +396,10 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 	filter := globalFilter
 	filterMu.Unlock()
 
-	ctx, cancelFn := context.WithCancel(context.Background())
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancelFn := context.WithCancel(parent)
 
 	rt, err := app.BuildRuntime(ctx, s, "client", lg)
 	if err != nil {
@@ -332,16 +431,22 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 		}
 		mux = tunnel.New(rt.Transport, lg, muxCfg)
 	}
+	muxDone := muxDoneOf(mux)
 
 	if err := mux.Start(ctx); err != nil {
-		cleanupRuntime(rt, mux, nil, nil)
+		cleanupRuntime(gen, rt, mux, nil, nil)
 		cancelFn()
 		return nil, err
 	}
 	if err := rt.Start(ctx); err != nil {
-		cleanupRuntime(rt, mux, nil, nil)
+		cleanupRuntime(gen, rt, mux, nil, nil)
 		cancelFn()
 		return nil, err
+	}
+	if ctx.Err() != nil {
+		cleanupRuntime(gen, rt, mux, nil, nil)
+		cancelFn()
+		return nil, ctx.Err()
 	}
 
 	var tunDone <-chan error
@@ -375,14 +480,14 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 		stopped, err := startTUNFD(ctx, vpnFD, vpnMTU)
 		if err != nil {
 			runtime.DetachMuxForTUN(tunMux)
-			cleanupRuntime(rt, mux, nil, nil)
+			cleanupRuntime(gen, rt, mux, nil, nil)
 			cancelFn()
 			return nil, fmt.Errorf("mobile: start TUN: %w", err)
 		}
 		tunDone = stopped
 
 	default:
-		cleanupRuntime(rt, mux, nil, nil)
+		cleanupRuntime(gen, rt, mux, nil, nil)
 		cancelFn()
 		return nil, fmt.Errorf("mobile: unknown run mode %d", mode)
 	}
@@ -393,11 +498,17 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 	statsJSONCache.Invalidate()
 	statsMu.Unlock()
 
-	doneCh := make(chan struct{})
+	if rootCancel == nil {
+		rootCancel = cancelFn
+	}
+	if sessionDone == nil {
+		sessionDone = make(chan struct{})
+	}
 	stateMu.Lock()
-	cancel = cancelFn
-	done = doneCh
+	cancel = rootCancel
+	done = sessionDone
 	currentRuntime = rt
+	currentMuxDone = muxDone
 	stateMu.Unlock()
 
 	var tunStopped <-chan struct{}
@@ -408,14 +519,16 @@ func startLocked(source string, mode runMode, vpnFD int, vpnMTU int) (*clientSes
 	return &clientSession{
 		ctx:        ctx,
 		cancel:     cancelFn,
+		gen:        gen,
 		rt:         rt,
 		mux:        mux,
 		detachMux:  detachMux,
+		muxDone:    muxDone,
 		healthCtl:  newHealthCtl,
 		tunMode:    mode == runTUN,
 		tunStopped: tunStopped,
 		fatalCh:    fatalCh,
-		doneCh:     doneCh,
+		doneCh:     sessionDone,
 	}, nil
 }
 
@@ -438,7 +551,7 @@ func watchTUN(ctx context.Context, tunDone <-chan error, fatalCh chan<- error) <
 	return stopped
 }
 
-func cleanupRuntime(rt *app.Runtime, mux, detachMux multiplexing.StreamMultiplexer, tunStopped <-chan struct{}) {
+func cleanupRuntime(gen uint64, rt *app.Runtime, mux, detachMux multiplexing.StreamMultiplexer, tunStopped <-chan struct{}) {
 	if tunStopped != nil {
 		select {
 		case <-tunStopped:
@@ -466,18 +579,25 @@ func cleanupRuntime(rt *app.Runtime, mux, detachMux multiplexing.StreamMultiplex
 		runtime.DetachMuxForTUN(detach)
 	}
 
-	statsMu.Lock()
-	currentMux = nil
-	statsAgg = nil
-	statsJSONCache.Invalidate()
-	statsMu.Unlock()
+	stateMu.Lock()
+	currentGen := gen == sessionGen
+	stateMu.Unlock()
+	if currentGen {
+		statsMu.Lock()
+		currentMux = nil
+		statsAgg = nil
+		statsJSONCache.Invalidate()
+		statsMu.Unlock()
+	}
 }
 
 func monitorRuntime(
 	ctx context.Context,
+	gen uint64,
 	rt *app.Runtime,
 	mux multiplexing.StreamMultiplexer,
 	detachMux multiplexing.StreamMultiplexer,
+	muxDone <-chan struct{},
 	tunStopped <-chan struct{},
 	fatalCh <-chan error,
 	doneCh chan struct{},
@@ -489,14 +609,26 @@ func monitorRuntime(
 	case fatalErr = <-fatalCh:
 		stateMu.Lock()
 		cancelFn := cancel
+		current := gen == sessionGen
 		stateMu.Unlock()
-		if cancelFn != nil {
+		if current && cancelFn != nil {
+			cancelFn()
+		}
+		<-ctx.Done()
+	case <-muxDone:
+
+		fatalErr = errors.New("mobile: session transport stopped")
+		stateMu.Lock()
+		cancelFn := cancel
+		current := gen == sessionGen
+		stateMu.Unlock()
+		if current && cancelFn != nil {
 			cancelFn()
 		}
 		<-ctx.Done()
 	}
 
-	cleanupRuntime(rt, mux, detachMux, tunStopped)
+	cleanupRuntime(gen, rt, mux, detachMux, tunStopped)
 	if healthDone != nil {
 		select {
 		case <-healthDone:
@@ -505,6 +637,12 @@ func monitorRuntime(
 	}
 
 	stateMu.Lock()
+	if gen != sessionGen {
+
+		stateMu.Unlock()
+		close(doneCh)
+		return
+	}
 	prev := state
 	switch {
 	case prev == StateStopping:
@@ -518,6 +656,7 @@ func monitorRuntime(
 		stateMessage = "transport stopped unexpectedly"
 	}
 	currentRuntime = nil
+	currentMuxDone = nil
 	cancel = nil
 	done = nil
 	resetHealthLocked()
@@ -545,6 +684,30 @@ func waitDone(d chan struct{}, timeout time.Duration) {
 }
 
 func StopClient() {
+
+	stateMu.Lock()
+	current := state
+	if current == StateStarting {
+		cancelStart := startCancel
+		startFinished := startDone
+		stateMu.Unlock()
+		if cancelStart != nil {
+			cancelStart()
+		}
+		waitDone(startFinished, 7*time.Second)
+		return
+	}
+	if current == StateStopping {
+		d := done
+		if d == nil {
+			d = startDone
+		}
+		stateMu.Unlock()
+		waitDone(d, 7*time.Second)
+		return
+	}
+	stateMu.Unlock()
+
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
 
@@ -565,8 +728,12 @@ func StopClient() {
 			}
 			return
 		}
-	case StateStopping:
+	case StateStarting, StateStopping:
+
 		d := done
+		if d == nil {
+			d = startDone
+		}
 		stateMu.Unlock()
 		waitDone(d, 7*time.Second)
 		return
@@ -592,10 +759,12 @@ func IsRunning() bool {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	switch state {
-	case StateStarting, StateConnecting, StateRunning:
+	case StateStarting:
 		return true
+	case StateConnecting, StateRunning:
+		return currentRuntime != nil && !channelClosed(done) && !channelClosed(currentMuxDone)
 	case StateError:
-		return currentRuntime != nil
+		return currentRuntime != nil && !channelClosed(done) && !channelClosed(currentMuxDone)
 	}
 	return false
 }

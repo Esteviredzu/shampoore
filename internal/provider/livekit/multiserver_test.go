@@ -74,6 +74,12 @@ func (d *fakeDialer) last() dialCall {
 	return d.calls[len(d.calls)-1]
 }
 
+func (d *fakeDialer) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.calls)
+}
+
 type deleteRecorder struct {
 	mu    sync.Mutex
 	rooms []string
@@ -184,6 +190,33 @@ func waitForSessionCount(t *testing.T, server *MultiServer, want int) {
 		server.mu.Lock()
 		defer server.mu.Unlock()
 		return len(server.sessions) == want
+	})
+}
+
+func TestExitSessionAdoptsFirstPacketFromUnknownIdentity(t *testing.T) {
+	registry := newSubscriptionRegistry(t, auth.UserSpec{UserID: "alice", Enabled: true})
+	server, dialer, _ := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+	startTestMultiServer(t, server)
+	waitForSessionCount(t, server, 1)
+
+	call := dialer.last()
+	call.events.OnDataPacket([]byte("first-packet"), "alice-mobile")
+
+	server.mu.Lock()
+	session := server.sessions["test-alice"]
+	server.mu.Unlock()
+	if session == nil {
+		t.Fatal("alice session was not registered")
+	}
+	session.mu.Lock()
+	pipe := session.pipe
+	session.mu.Unlock()
+	if pipe == nil {
+		t.Fatal("session pipe is missing")
+	}
+
+	waitForCondition(t, 2*time.Second, "peer adopted from the first packet", func() bool {
+		return pipe.GetRemoteID() == "alice-mobile" && pipe.PeerPresent()
 	})
 }
 
@@ -331,4 +364,57 @@ func TestMultiServerSubscriptionStopsInactiveUsers(t *testing.T) {
 		}
 		waitForSessionCount(t, server, 0)
 	})
+}
+
+func TestMultiServerWaitingRoomSurvivesEmptyRoom(t *testing.T) {
+	prevInterval := pipeHeartbeatInterval
+	prevTimeout := pipeHeartbeatTimeout
+	pipeHeartbeatInterval = 5 * time.Millisecond
+	pipeHeartbeatTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		pipeHeartbeatInterval = prevInterval
+		pipeHeartbeatTimeout = prevTimeout
+	})
+
+	registry := newSubscriptionRegistry(t, auth.UserSpec{UserID: "alice", Enabled: true})
+	server, dialer, deleted := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+	server.syncInterval = 20 * time.Millisecond
+	startTestMultiServer(t, server)
+	waitForSessionCount(t, server, 1)
+
+	first := dialer.last()
+
+	time.Sleep(10 * pipeHeartbeatTimeout)
+	waitForSessionCount(t, server, 1)
+	if got := dialer.count(); got != 1 {
+		t.Fatalf("the empty room was rejoined %d times, want 1 join", got)
+	}
+
+	for i := 0; i < 8; i++ {
+		first.events.OnParticipantJoined("alice")
+		first.events.OnParticipantLeft("alice")
+	}
+	time.Sleep(10 * pipeHeartbeatTimeout)
+	waitForSessionCount(t, server, 1)
+	if got := dialer.count(); got != 1 {
+		t.Fatalf("client churn rejoined the room %d times, want 1", got)
+	}
+	select {
+	case room := <-deleted.done:
+		t.Fatalf("room %q was deleted while the exit node was waiting", room)
+	default:
+	}
+
+	joins := dialer.count()
+	first.events.OnParticipantJoined("alice")
+	first.events.OnDataPacket(heartbeatPayload, "alice")
+	waitForCondition(t, 3*time.Second, "session recreated after the peer went silent", func() bool {
+		return dialer.count() > joins
+	})
+	waitForSessionCount(t, server, 1)
+	select {
+	case room := <-deleted.done:
+		t.Fatalf("room %q was deleted after the peer went silent", room)
+	default:
+	}
 }

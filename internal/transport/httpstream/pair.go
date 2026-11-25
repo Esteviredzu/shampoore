@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/transport"
@@ -43,12 +44,21 @@ type uplinkSeed struct {
 	delivered uint64
 }
 
+const pairSendTimeout = 20 * time.Second
+
+const maxPairSeeds = 16
+
 func NewPairBroker(profile MimicProfile, cfg ServerConfig) (*PairBroker, error) {
+	profile = profile.Normalize()
 	cfg.RequireUser = true
 	cfg.PinnedUserID = ""
 	cfg.PinnedExitNodeID = ""
 	cfg.Authorize = nil
 	cfg.AllowedRoles = []string{RoleClient, RoleExit}
+	cfg.ReapStaleSessions = true
+	if cfg.DownlinkReplayBytes <= 0 {
+		cfg.DownlinkReplayBytes = profile.DownlinkReplayBytes
+	}
 
 	b := &PairBroker{
 		rooms: make(map[string]*pairRoom),
@@ -235,10 +245,15 @@ func (b *PairBroker) pump(ctx context.Context, room *pairRoom, epoch uint64, src
 			}
 			return
 		}
-		if err := dst.Send(ctx, msg); err != nil {
+		sendCtx, cancel := context.WithTimeout(ctx, pairSendTimeout)
+		err = dst.Send(sendCtx, msg)
+		cancel()
+		if err != nil {
 			if ctx.Err() == nil && b.logger != nil {
 				b.logger.Debug("pair: pump send stop: ", err)
 			}
+
+			room.dropPeer(epoch, dst)
 			return
 		}
 	}
@@ -310,6 +325,31 @@ func (r *pairRoom) finishPump(epoch uint64) {
 	r.pumpEpoch++
 }
 
+func (r *pairRoom) dropPeer(epoch uint64, sess *Session) {
+	if sess == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.closed || r.pumpEpoch != epoch {
+		r.mu.Unlock()
+		return
+	}
+	role := RoleClient
+	switch sess {
+	case r.exit:
+		role = RoleExit
+	case r.client:
+	default:
+		r.mu.Unlock()
+		return
+	}
+	r.recordLocked(role, sess)
+	r.setSlot(role, nil)
+	r.stopPumpsLocked()
+	r.mu.Unlock()
+	_ = sess.Stop(context.Background())
+}
+
 func (r *pairRoom) stopPumpsLocked() {
 	if r.pumpCancel != nil {
 		r.pumpCancel()
@@ -344,9 +384,16 @@ func (r *pairRoom) recordLocked(role string, sess *Session) {
 	if r.seeds == nil {
 		r.seeds = make(map[string]uplinkSeed)
 	}
+	key := seedKey(role, sess.Info().SessionID)
+	if _, ok := r.seeds[key]; !ok && len(r.seeds) >= maxPairSeeds {
+
+		for stale := range r.seeds {
+			delete(r.seeds, stale)
+			break
+		}
+	}
 	epoch, delivered := sess.UplinkState()
-	info := sess.Info()
-	r.seeds[seedKey(role, info.SessionID)] = uplinkSeed{epoch: epoch, delivered: delivered}
+	r.seeds[key] = uplinkSeed{epoch: epoch, delivered: delivered}
 }
 
 func seedKey(role, sessionID string) string {

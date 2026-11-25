@@ -20,7 +20,10 @@ import (
 )
 
 const (
-	connectTimeout = 15 * time.Second
+	connectTimeout = 5 * time.Second
+
+	reconnectBaseDelay = 500 * time.Millisecond
+	reconnectMaxDelay  = 2 * time.Second
 )
 
 type Provider struct {
@@ -38,6 +41,9 @@ type Provider struct {
 	identity string
 
 	disconnected chan struct{}
+
+	publishMu      sync.Mutex
+	publishTracker publishFailureTracker
 
 	started  atomic.Bool
 	stopped  atomic.Bool
@@ -136,12 +142,25 @@ func (p *Provider) connect() error {
 			}
 		},
 		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
-			p.logger.Warn("livekit: remote participant left: ", rp.Identity())
+			identity := ""
+			if rp != nil {
+				identity = rp.Identity()
+			}
+			if identity != "" {
+				p.logger.Warn("livekit: remote participant left: ", identity)
+			} else {
+				p.logger.Warn("livekit: remote participant left")
+			}
 			p.pipeMu.Lock()
 			pipe := p.pipe
 			p.pipeMu.Unlock()
-			if pipe != nil && pipe.GetRemoteID() == rp.Identity() {
+			if pipe == nil {
+				return
+			}
+
+			if rid := pipe.GetRemoteID(); rid == "" || identity == "" || rid == identity {
 				pipe.PeerLeft()
+				pipe.SignalReset(fmt.Errorf("%w: livekit: peer left", transport.ErrTransportReset))
 			}
 		},
 		OnDisconnected: func() {
@@ -187,17 +206,12 @@ func (p *Provider) connect() error {
 	p.pipeMu.Unlock()
 
 	pipe.SetDeadHandler(func() {
-		p.roomMu.Lock()
-		busy := p.closing || p.room == nil
-		p.roomMu.Unlock()
-		if busy {
-			return
-		}
-		p.logger.Warn("livekit: peer heartbeat lost, reconnecting")
-		p.signalDisconnected()
+		p.requestReconnect("peer heartbeat lost")
 	})
-	pipe.ResetLiveness()
-	pipe.SetRemoteID("")
+	pipe.SetPublishErrorHandler(p.notePublishError)
+
+	pipe.PeerLeft()
+	pipe.SetAdoptFirstPacket(true)
 	if rps := room.GetRemoteParticipants(); len(rps) > 0 {
 		pipe.SetRemoteID(rps[0].Identity())
 	}
@@ -217,11 +231,74 @@ func (p *Provider) connect() error {
 	return nil
 }
 
+const publishReconnectGrace = 3 * time.Second
+
+type publishFailureTracker struct {
+	grace time.Duration
+	first time.Time
+}
+
+func (t *publishFailureTracker) observeFailure(now, lastOK time.Time) bool {
+	grace := t.grace
+	if grace <= 0 {
+		grace = publishReconnectGrace
+	}
+	if !lastOK.IsZero() && now.Sub(lastOK) < grace {
+		t.first = time.Time{}
+		return false
+	}
+	if t.first.IsZero() {
+		t.first = now
+		return false
+	}
+	if now.Sub(t.first) < grace {
+		return false
+	}
+	t.first = time.Time{}
+	return true
+}
+
+func (p *Provider) notePublishError(err error) {
+	if p.stopped.Load() {
+		return
+	}
+	var lastOK time.Time
+	if pipe := p.Pipe(); pipe != nil {
+		lastOK = pipe.LastPublishOK()
+	}
+	p.publishMu.Lock()
+	reconnect := p.publishTracker.observeFailure(time.Now(), lastOK)
+	p.publishMu.Unlock()
+	if !reconnect {
+		if p.logger != nil {
+			p.logger.Warn("livekit: datachannel publish failed (keeping the room): ", err)
+		}
+		return
+	}
+	p.requestReconnect("datachannel publish failed")
+}
+
 func (p *Provider) signalDisconnected() {
 	select {
 	case p.disconnected <- struct{}{}:
 	default:
 	}
+}
+
+func (p *Provider) requestReconnect(reason string) {
+	if p.stopped.Load() {
+		return
+	}
+	p.roomMu.Lock()
+	busy := p.closing || p.room == nil
+	p.roomMu.Unlock()
+	if busy {
+		return
+	}
+	if p.logger != nil && reason != "" {
+		p.logger.Warn("livekit: ", reason, "; reconnecting")
+	}
+	p.signalDisconnected()
 }
 
 func (p *Provider) supervise() {
@@ -248,7 +325,7 @@ func (p *Provider) supervise() {
 			oldRoom.Disconnect()
 		}
 
-		delay := time.Second
+		delay := reconnectBaseDelay
 		for {
 			select {
 			case <-p.ctx.Done():
@@ -263,8 +340,8 @@ func (p *Provider) supervise() {
 			if err := p.connect(); err != nil {
 				p.logger.Warn("livekit: reconnect failed: ", err)
 				delay *= 2
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
+				if delay > reconnectMaxDelay {
+					delay = reconnectMaxDelay
 				}
 				continue
 			}

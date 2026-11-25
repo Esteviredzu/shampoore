@@ -54,8 +54,9 @@ type Config struct {
 
 const (
 	defaultPingInterval = 5 * time.Second
-	defaultPingTimeout  = 30 * time.Second
-	maxOpenRetries      = 2
+
+	defaultPingTimeout = 45 * time.Second
+	maxOpenRetries     = 2
 
 	defaultOpenAckTimeout = 3 * time.Second
 
@@ -141,6 +142,10 @@ type TunnelMultiplexer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	doneMu     sync.Mutex
+	done       chan struct{}
+	doneClosed bool
+
 	stateMu sync.Mutex
 	started bool
 	wg      sync.WaitGroup
@@ -169,6 +174,7 @@ func New(
 		incoming:      make(chan multiplexing.Stream, 64),
 		outbound:      make(chan outboundCmd, outboundQueueCap),
 		writerDone:    make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 	m.epoch.Store(newSessionEpoch())
 	m.helloReady = make(chan struct{})
@@ -231,6 +237,13 @@ func (m *TunnelMultiplexer) Start(ctx context.Context) error {
 	m.failed.Store(false)
 	m.peerModern.Store(false)
 	m.lastRecv.Store(time.Now().UnixNano())
+
+	m.doneMu.Lock()
+	if m.done == nil || m.doneClosed {
+		m.done = make(chan struct{})
+		m.doneClosed = false
+	}
+	m.doneMu.Unlock()
 
 	m.started = true
 
@@ -439,6 +452,21 @@ func (m *TunnelMultiplexer) Health() HealthSnapshot {
 	}
 }
 
+func (m *TunnelMultiplexer) Done() <-chan struct{} {
+	m.doneMu.Lock()
+	defer m.doneMu.Unlock()
+	return m.done
+}
+
+func (m *TunnelMultiplexer) closeDone() {
+	m.doneMu.Lock()
+	if !m.doneClosed && m.done != nil {
+		m.doneClosed = true
+		close(m.done)
+	}
+	m.doneMu.Unlock()
+}
+
 func (m *TunnelMultiplexer) recordPingRTT(rtt time.Duration) {
 	if rtt < 500*time.Microsecond {
 		rtt = 500 * time.Microsecond
@@ -632,6 +660,7 @@ func (m *TunnelMultiplexer) Stop(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
+		m.closeDone()
 		return nil
 	}
 	m.closed = true
@@ -660,6 +689,7 @@ func (m *TunnelMultiplexer) Stop(ctx context.Context) error {
 		s.deliverEOF(io.EOF)
 	}
 	m.wg.Wait()
+	m.closeDone()
 
 	return m.transport.Stop(ctx)
 }
@@ -1263,6 +1293,7 @@ func (m *TunnelMultiplexer) failSession(reason error) {
 	if cancel != nil {
 		cancel()
 	}
+	m.closeDone()
 	if notify != nil {
 		notify(reason)
 	}

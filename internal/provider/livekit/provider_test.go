@@ -23,6 +23,41 @@ func (nopLogger) ErrorContext(context.Context, ...any) {}
 func (nopLogger) FatalContext(context.Context, ...any) {}
 func (nopLogger) PanicContext(context.Context, ...any) {}
 
+func TestPublishFailureTrackerDebouncesHiccups(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+
+	tr := publishFailureTracker{grace: 3 * time.Second}
+	if tr.observeFailure(start, start.Add(-100*time.Millisecond)) {
+		t.Fatal("a hiccup right after a successful publish must not rejoin the room")
+	}
+	if tr.observeFailure(start.Add(time.Second), start.Add(900*time.Millisecond)) {
+		t.Fatal("a fresh successful publish resets the burst")
+	}
+
+	dead := publishFailureTracker{grace: 3 * time.Second}
+	if dead.observeFailure(start, time.Time{}) {
+		t.Fatal("the first failed publish must not rejoin the room")
+	}
+	if dead.observeFailure(start.Add(2*time.Second), time.Time{}) {
+		t.Fatal("rejoined before the grace period elapsed")
+	}
+	if !dead.observeFailure(start.Add(3*time.Second), time.Time{}) {
+		t.Fatal("a publish path that stays dead for the grace period must rejoin")
+	}
+}
+
+func TestPipeLastPublishOK(t *testing.T) {
+	p := newPipe(nil, "topic", "")
+	if !p.LastPublishOK().IsZero() {
+		t.Fatal("a pipe that never published must report a zero time")
+	}
+	now := time.Now()
+	p.lastSentNs.Store(now.UnixNano())
+	if got := p.LastPublishOK(); got.UnixNano() != now.UnixNano() {
+		t.Fatalf("LastPublishOK = %v, want %v", got, now)
+	}
+}
+
 func TestNewProviderConnectFailureCleansUp(t *testing.T) {
 	cfg := Config{
 		SignalURL: "ws://127.0.0.1:1",

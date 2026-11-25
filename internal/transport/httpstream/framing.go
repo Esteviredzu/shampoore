@@ -49,12 +49,15 @@ type decodedFrame struct {
 }
 
 func encodeFrame(kind frameKind, sid [16]byte, epoch uint32, seq, ack uint64, messages [][]byte, padLen int) []byte {
-	payload := encodeMessages(messages)
 	if padLen < 0 {
 		padLen = 0
 	}
+	payloadSize := 0
+	for _, msg := range messages {
+		payloadSize += 4 + len(msg)
+	}
 
-	total := frameHeaderSize + len(payload) + padLen
+	total := frameHeaderSize + payloadSize + padLen
 	out := make([]byte, total)
 	copy(out[0:4], frameMagic[:])
 	out[4] = frameVersion
@@ -63,12 +66,18 @@ func encodeFrame(kind frameKind, sid [16]byte, epoch uint32, seq, ack uint64, me
 	binary.BigEndian.PutUint32(out[8:12], epoch)
 	binary.BigEndian.PutUint64(out[12:20], seq)
 	binary.BigEndian.PutUint64(out[20:28], ack)
-	binary.BigEndian.PutUint32(out[28:32], uint32(len(payload)))
+	binary.BigEndian.PutUint32(out[28:32], uint32(payloadSize))
 	binary.BigEndian.PutUint32(out[32:36], uint32(padLen))
 	copy(out[36:52], sid[:])
-	copy(out[52:], payload)
+	offset := frameHeaderSize
+	var hdr [4]byte
+	for _, msg := range messages {
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
+		offset += copy(out[offset:], hdr[:])
+		offset += copy(out[offset:], msg)
+	}
 	if padLen > 0 {
-		fillRandom(out[frameHeaderSize+len(payload):])
+		fillRandom(out[offset:])
 	}
 	return out
 }
@@ -114,7 +123,8 @@ func decodeFrame(data []byte, maxSize int) (decodedFrame, error) {
 		if err != nil {
 			return out, err
 		}
-		out.Payload = append([]byte(nil), payload...)
+
+		out.Payload = payload
 		out.Messages = msgs
 	}
 	return out, nil
@@ -148,24 +158,6 @@ func readFrame(r io.Reader, maxSize int) (decodedFrame, int, error) {
 		return decodedFrame{}, 0, err
 	}
 	return frame, total, nil
-}
-
-func encodeMessages(messages [][]byte) []byte {
-	if len(messages) == 0 {
-		return nil
-	}
-	size := 0
-	for _, msg := range messages {
-		size += 4 + len(msg)
-	}
-	out := make([]byte, 0, size)
-	var hdr [4]byte
-	for _, msg := range messages {
-		binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
-		out = append(out, hdr[:]...)
-		out = append(out, msg...)
-	}
-	return out
 }
 
 func decodeMessages(payload []byte) ([][]byte, error) {

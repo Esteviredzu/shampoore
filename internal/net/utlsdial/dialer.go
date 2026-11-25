@@ -25,7 +25,18 @@ const (
 	wsHandshakeTimeout  = 10 * time.Second
 	idleConnTimeout     = 90 * time.Second
 	keepAlivePeriod     = 30 * time.Second
+
+	happyEyeballsDelay = 250 * time.Millisecond
 )
+
+func newDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:       dialTimeout,
+		KeepAlive:     keepAlivePeriod,
+		FallbackDelay: happyEyeballsDelay,
+		Control:       netdial.Control,
+	}
+}
 
 type Profile string
 
@@ -170,11 +181,7 @@ func DialContext(ctx context.Context, network, addr, serverName string, alpn []s
 		serverName = HostFromAddr(addr)
 	}
 
-	dialer := &net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: keepAlivePeriod,
-		Control:   netdial.Control,
-	}
+	dialer := newDialer()
 	raw, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("utlsdial: dial %s: %w", addr, err)
@@ -204,12 +211,8 @@ func DialContext(ctx context.Context, network, addr, serverName string, alpn []s
 func NewHTTPTransport(profile Profile) *http.Transport {
 	profile = NormalizeProfile(profile)
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   dialTimeout,
-			KeepAlive: keepAlivePeriod,
-			Control:   netdial.Control,
-		}).DialContext,
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: newDialer().DialContext,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return DialContext(ctx, network, addr, HostFromAddr(addr), HTTPTransportALPN, profile)
 		},
@@ -230,12 +233,8 @@ func NewHTTPTransport(profile Profile) *http.Transport {
 func NewHTTP1Transport(profile Profile) *http.Transport {
 	profile = NormalizeProfile(profile)
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   dialTimeout,
-			KeepAlive: keepAlivePeriod,
-			Control:   netdial.Control,
-		}).DialContext,
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: newDialer().DialContext,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return DialContext(ctx, network, addr, HostFromAddr(addr), HTTP1ALPN, profile)
 		},
@@ -257,11 +256,7 @@ func NewWebSocketDialer(profile Profile) *websocket.Dialer {
 	profile = NormalizeProfile(profile)
 	d := &websocket.Dialer{
 		HandshakeTimeout: wsHandshakeTimeout,
-		NetDialContext: (&net.Dialer{
-			Timeout:   dialTimeout,
-			KeepAlive: keepAlivePeriod,
-			Control:   netdial.Control,
-		}).DialContext,
+		NetDialContext:   newDialer().DialContext,
 	}
 	d.NetDialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return DialContext(ctx, network, addr, HostFromAddr(addr), WebSocketALPN, profile)

@@ -577,3 +577,37 @@ func TestHostFromAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestDialerUsesFastHappyEyeballsFallback(t *testing.T) {
+	d := newDialer()
+	if d.FallbackDelay != happyEyeballsDelay {
+		t.Fatalf("FallbackDelay = %s, want %s", d.FallbackDelay, happyEyeballsDelay)
+	}
+	if happyEyeballsDelay <= 0 || happyEyeballsDelay > 250*time.Millisecond {
+		t.Fatalf("happy eyeballs delay %s is outside the 0..250ms budget", happyEyeballsDelay)
+	}
+	if d.Timeout != dialTimeout {
+		t.Fatalf("connect timeout = %s, want %s", d.Timeout, dialTimeout)
+	}
+	if d.Control == nil {
+		t.Fatal("socket protector hook is not wired into the dialer")
+	}
+	if d.KeepAlive != keepAlivePeriod {
+		t.Fatalf("keepalive = %s, want %s", d.KeepAlive, keepAlivePeriod)
+	}
+}
+
+func TestTransportDialersUseTheHappyEyeballsDialer(t *testing.T) {
+	httpTr := NewHTTPTransport(ProfileChrome)
+	if httpTr.DialContext == nil || httpTr.DialTLSContext == nil {
+		t.Fatal("HTTP transport is missing its dial functions")
+	}
+	h1Tr := NewHTTP1Transport(ProfileChrome)
+	if h1Tr.DialContext == nil || h1Tr.DialTLSContext == nil {
+		t.Fatal("HTTP/1.1 transport is missing its dial functions")
+	}
+	ws := NewWebSocketDialer(ProfileChrome)
+	if ws.NetDialContext == nil || ws.NetDialTLSContext == nil {
+		t.Fatal("websocket dialer is missing its dial functions")
+	}
+}

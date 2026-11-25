@@ -90,8 +90,7 @@ func TestSiloDownloadSilenceResetsSession(t *testing.T) {
 		downloadSilenceLimit = restoreSilence
 	})
 
-	store := &stallingStore{fakeStore: newFakeStore("bucket"), stallAfter: 1}
-	store.putObject("default/s2c/msg_0001", appendBatchMessage(nil, []byte("hello")), time.Now())
+	store := &stallingStore{fakeStore: newFakeStore("bucket"), stallAfter: 2}
 
 	cfg := testPipeConfig()
 	pipe, err := newPipeWithStore(&cfg, "client", testLogger{}, store)
@@ -101,6 +100,8 @@ func TestSiloDownloadSilenceResetsSession(t *testing.T) {
 	if err := pipe.Start(context.Background()); err != nil {
 		t.Fatalf("start pipe: %v", err)
 	}
+
+	store.putObject("default/s2c/msg_0001", appendBatchMessage(nil, []byte("hello")), time.Now())
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

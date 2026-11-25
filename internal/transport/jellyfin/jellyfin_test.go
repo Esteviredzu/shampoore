@@ -257,7 +257,7 @@ func TestProfileMatchesHAR(t *testing.T) {
 	if profile.DownlinkMode != httpstream.DownlinkStream {
 		t.Fatalf("downlink mode = %q", profile.DownlinkMode)
 	}
-	if profile.MaxStreamBytes != 8<<20 || profile.MaxStreamDuration != 3*time.Minute {
+	if profile.MaxStreamBytes != 256<<20 || profile.MaxStreamDuration != 30*time.Minute {
 		t.Fatalf("stream limits = %d/%s", profile.MaxStreamBytes, profile.MaxStreamDuration)
 	}
 	if profile.UplinkBatchWindow != 15*time.Millisecond || profile.MaxUplinkBatchBytes != 32<<10 {
@@ -672,7 +672,11 @@ func TestBondAggregatesJellyfin(t *testing.T) {
 		_ = raw.Stop(stopCtx)
 	}()
 
-	bm, err := bond.NewMux([]transport.Transport{raw}, []string{"0-jellyfin"}, lg)
+	secured, err := security.WrapTransport(raw, testPipeSecret, security.RoleClient, testLogger{})
+	if err != nil {
+		t.Fatalf("wrap client: %v", err)
+	}
+	bm, err := bond.NewMux([]transport.Transport{secured}, []string{"0-jellyfin"}, lg)
 	if err != nil {
 		t.Fatalf("bond mux: %v", err)
 	}

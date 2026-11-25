@@ -32,6 +32,8 @@ var errPeerClosed = errors.New("httpstream: peer closed session")
 
 var requestTimeout = httpRequestLimit
 
+var downlinkAckMinInterval = 100 * time.Millisecond
+
 type outboundMsg struct {
 	data []byte
 	done chan error
@@ -70,6 +72,9 @@ type Client struct {
 	pendingSends atomic.Int32
 	resetPending atomic.Bool
 	wake         chan struct{}
+
+	ackWake   chan struct{}
+	lastAckAt atomic.Int64
 
 	dlMu     sync.Mutex
 	dlCancel context.CancelFunc
@@ -130,6 +135,7 @@ func NewClient(profile MimicProfile, cfg ClientConfig) (*Client, error) {
 		sendCh:     make(chan outboundMsg, sendQueueCap),
 		recvCh:     make(chan recvItem, recvQueueCap),
 		wake:       make(chan struct{}, 1),
+		ackWake:    make(chan struct{}, 1),
 	}
 	c.epoch.Store(1)
 	c.downlinkNext.Store(1)
@@ -415,12 +421,41 @@ func (c *Client) sendLoop(ctx context.Context, _ context.Context) {
 		running = false
 	}
 
+	maxInflight := c.profile.MaxUplinkInflight
+	if maxInflight <= 0 {
+		maxInflight = 1
+	}
+	slots := make(chan struct{}, maxInflight)
+	var sendWG sync.WaitGroup
+
+	acquire := func() bool {
+		select {
+		case slots <- struct{}{}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	fail := func(msgs []outboundMsg) {
+		err := fmt.Errorf("%w: httpstream: transport stopped", transport.ErrTransportReset)
+		for _, msg := range msgs {
+			resolveOutbound(msg, err)
+		}
+	}
+
 	flush := func() {
 		if len(batch) == 0 {
 			stopTimer()
 			return
 		}
 		stopTimer()
+
+		if !acquire() {
+			fail(batch)
+			batch = nil
+			batchBytes = 0
+			return
+		}
 		messages := make([][]byte, len(batch))
 		useful := 0
 		for i := range batch {
@@ -435,21 +470,29 @@ func (c *Client) sendLoop(ctx context.Context, _ context.Context) {
 		pad := c.profile.Padding.PadLen(frameHeaderSize + payloadSize)
 		frame := encodeFrame(frameData, c.sid, epoch, seq,
 			c.downlinkCursor.Load(), messages, pad)
-		err := c.sendUplinkFrame(ctx, seq, frame, useful, len(messages))
-		for _, msg := range batch {
-			resolveOutbound(msg, err)
-		}
-		if err != nil {
-			c.signalReset(err)
-		}
+		pending := batch
 		batch = nil
 		batchBytes = 0
+
+		sendWG.Add(1)
+		go func() {
+			defer sendWG.Done()
+			defer func() { <-slots }()
+			err := c.sendUplinkFrame(ctx, seq, frame, useful, len(messages))
+			for _, msg := range pending {
+				resolveOutbound(msg, err)
+			}
+			if err != nil {
+				c.signalReset(err)
+			}
+		}()
 	}
 
 	defer func() {
-		for _, msg := range batch {
-			resolveOutbound(msg, fmt.Errorf("%w: httpstream: transport stopped", transport.ErrTransportReset))
-		}
+		stopTimer()
+		sendWG.Wait()
+		fail(batch)
+		batch = nil
 	}()
 
 	for {
@@ -929,9 +972,9 @@ func (c *Client) deliverDownlink(frame decodedFrame) error {
 			transport.ErrTransportReset, frame.Seq, expected)
 	}
 	for _, msg := range frame.Messages {
-		cp := append([]byte(nil), msg...)
+
 		select {
-		case c.recvCh <- recvItem{data: cp}:
+		case c.recvCh <- recvItem{data: msg}:
 		case <-c.transportContext().Done():
 			return context.Canceled
 		}
@@ -942,6 +985,7 @@ func (c *Client) deliverDownlink(frame decodedFrame) error {
 	c.ctr.MessagesRecv.Add(int64(len(frame.Messages)))
 	c.ctr.FramesRecv.Add(1)
 	c.clearReset()
+	c.noteDownlinkProgress()
 	return nil
 }
 
@@ -983,10 +1027,29 @@ func (c *Client) ackLoop(ctx context.Context, _ context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.sendControl(ctx, frameKeepAlive); err != nil && ctx.Err() == nil && c.logger != nil {
-				c.logger.Debug("httpstream: keepalive failed: ", err)
-			}
+			c.sendAck(ctx)
+		case <-c.ackWake:
+			c.sendAck(ctx)
 		}
+	}
+}
+
+func (c *Client) sendAck(ctx context.Context) {
+	c.lastAckAt.Store(time.Now().UnixNano())
+	if err := c.sendControl(ctx, frameKeepAlive); err != nil && ctx.Err() == nil && c.logger != nil {
+		c.logger.Debug("httpstream: keepalive failed: ", err)
+	}
+}
+
+func (c *Client) noteDownlinkProgress() {
+	if interval := downlinkAckMinInterval; interval > 0 {
+		if last := c.lastAckAt.Load(); last != 0 && time.Since(time.Unix(0, last)) < interval {
+			return
+		}
+	}
+	select {
+	case c.ackWake <- struct{}{}:
+	default:
 	}
 }
 

@@ -259,7 +259,7 @@ func NewRemoteHandler(
 	ipv4Only bool,
 ) *RemoteHandler {
 	if chunkSize <= 0 {
-		chunkSize = 8000
+		chunkSize = 32768
 	}
 	sctx, cancel := context.WithCancel(ctx)
 	return &RemoteHandler{

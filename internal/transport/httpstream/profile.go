@@ -99,6 +99,12 @@ type MimicProfile struct {
 	UplinkBatchWindow   time.Duration `json:"uplink_batch_window,omitempty"`
 	MaxUplinkBatchBytes int           `json:"max_uplink_batch_bytes,omitempty"`
 
+	MaxUplinkInflight int `json:"max_uplink_inflight,omitempty"`
+
+	AckInterval time.Duration `json:"ack_interval,omitempty"`
+
+	DownlinkReplayBytes int `json:"downlink_replay_bytes,omitempty"`
+
 	DecoyRequests []DecoySpec `json:"decoy_requests,omitempty"`
 
 	UTLSProfile string `json:"utls_profile,omitempty"`
@@ -153,6 +159,12 @@ func (p MimicProfile) Normalize() MimicProfile {
 	}
 	if out.MaxUplinkBatchBytes <= 0 {
 		out.MaxUplinkBatchBytes = 32 << 10
+	}
+	if out.MaxUplinkInflight <= 0 {
+		out.MaxUplinkInflight = 1
+	}
+	if out.MaxUplinkInflight > 8 {
+		out.MaxUplinkInflight = 8
 	}
 	if out.Padding.MinPad < 0 {
 		out.Padding.MinPad = 0

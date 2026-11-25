@@ -39,6 +39,49 @@ func testFlowMux(t *testing.T, transports []transport.Transport, names []string)
 	return m
 }
 
+type errStartTransport struct{ fakeTransport }
+
+func (errStartTransport) Start(context.Context) error { return errors.New("subflow is down") }
+func (errStartTransport) Stop(context.Context) error  { return nil }
+
+func TestStartSkipsSubflowThatFailsToStart(t *testing.T) {
+	m := testFlowMux(t,
+		[]transport.Transport{errStartTransport{}, fakeTransport{}},
+		[]string{"dead", "live"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("start with one dead subflow: %v", err)
+	}
+	defer func() { _ = m.Stop(context.Background()) }()
+
+	if len(m.subflows) != 1 || m.subflows[0].name != "live" {
+		t.Fatalf("live subflows = %d, want only %q", len(m.subflows), "live")
+	}
+	stream, err := m.OpenStream(ctx, map[string]any{"host": "example.com", "port": 443})
+	if err != nil {
+		t.Fatalf("open stream over the surviving subflow: %v", err)
+	}
+	_ = stream.Close()
+}
+
+func TestStartFailsWhenEverySubflowIsDead(t *testing.T) {
+	m := testFlowMux(t,
+		[]transport.Transport{errStartTransport{}, errStartTransport{}},
+		[]string{"dead-1", "dead-2"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Start(ctx); err == nil {
+		_ = m.Stop(context.Background())
+		t.Fatal("start succeeded with no live subflow")
+	}
+	if m.started {
+		t.Fatal("a failed start left the multiplexer marked as started")
+	}
+}
+
 func TestOpenStreamFailsOverToHealthySubflow(t *testing.T) {
 	bad := errSendTransport{err: errors.New("subflow down")}
 	good := fakeTransport{}
@@ -86,6 +129,58 @@ func TestNextScoreDecaysWhenIdle(t *testing.T) {
 	}
 	if got := nextScore(0, 500); got != 150 {
 		t.Fatalf("ramp-up score = %d, want 150", got)
+	}
+}
+
+func TestLatencyAwareCandidatesNeverEmpty(t *testing.T) {
+	m := testFlowMux(t,
+		[]transport.Transport{fakeTransport{}, fakeTransport{}, fakeTransport{}},
+		[]string{"fast", "slow", "cold"})
+
+	setRTT := func(sf *subflow, rtt time.Duration) {
+		sf.healthMu.Lock()
+		sf.medianRTT = rtt
+		sf.healthMu.Unlock()
+	}
+
+	setRTT(m.subflows[0], 400*time.Millisecond)
+	setRTT(m.subflows[1], 500*time.Millisecond)
+	setRTT(m.subflows[2], 900*time.Millisecond)
+	if got := m.latencyAwareCandidates(m.candidates(time.Now().UnixNano())); len(got) == 0 {
+		t.Fatal("latencyAwareCandidates returned no candidates with high RTT on every tube")
+	}
+	if sf := m.pickSubflow(); sf == nil {
+		t.Fatal("pickSubflow returned nil while every tube is alive")
+	}
+
+	for _, sf := range m.subflows {
+		setRTT(sf, 0)
+	}
+	if got := m.latencyAwareCandidates(m.candidates(time.Now().UnixNano())); len(got) != len(m.subflows) {
+		t.Fatalf("latencyAwareCandidates = %d before any measurement, want %d", len(got), len(m.subflows))
+	}
+	if sf := m.pickSubflow(); sf == nil {
+		t.Fatal("pickSubflow returned nil before the first RTT measurement")
+	}
+
+	if got := m.latencyAwareCandidates(nil); len(got) != len(m.subflows) {
+		t.Fatalf("latencyAwareCandidates(nil) = %d, want %d", len(got), len(m.subflows))
+	}
+
+	setRTT(m.subflows[0], 20*time.Millisecond)
+	setRTT(m.subflows[1], 800*time.Millisecond)
+	setRTT(m.subflows[2], 0)
+	got := m.latencyAwareCandidates(m.candidates(time.Now().UnixNano()))
+	if len(got) == 0 {
+		t.Fatal("latencyAwareCandidates returned an empty list with a fast tube")
+	}
+	for _, sf := range got {
+		if sf == m.subflows[1] {
+			t.Fatal("the slow tube was not filtered out")
+		}
+	}
+	if got[0] != m.subflows[0] && got[len(got)-1] != m.subflows[0] {
+		t.Fatal("the fast tube is missing from the filtered candidates")
 	}
 }
 

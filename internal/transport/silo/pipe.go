@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -93,8 +94,10 @@ type Pipe struct {
 
 	wake chan struct{}
 
-	lastKeyMu sync.Mutex
-	lastKey   string
+	headMu      sync.Mutex
+	lastKey     string
+	historyHead string
+	initialized bool
 
 	deferMu       sync.Mutex
 	deferred      map[string]*deferredBatch
@@ -102,6 +105,10 @@ type Pipe struct {
 
 	ctr transport.Counters
 	wg  sync.WaitGroup
+
+	sawTraffic atomic.Bool
+
+	lastWrite atomic.Int64
 
 	deadOnce sync.Once
 	deadCh   chan struct{}
@@ -183,7 +190,13 @@ const bucketTimeout = 15 * time.Second
 
 var s3RequestTimeout = 15 * time.Second
 
-var downloadSilenceLimit = 60 * time.Second
+var downloadSilenceLimit = 15 * time.Minute
+
+var pendingDeleteInterval = 500 * time.Millisecond
+
+var purgeTimeout = 15 * time.Second
+
+var staleInlineDeleteBudget = 250 * time.Millisecond
 
 func NewPipe(cfg *Config, role string, logger logging.ContextLogger) (*Pipe, error) {
 	store, err := newMinioStore(cfg)
@@ -295,29 +308,56 @@ func (p *Pipe) Start(ctx context.Context) error {
 	pipeCtx, cancel := context.WithCancel(ctx)
 	p.ctx, p.cancel = pipeCtx, cancel
 	p.started = true
+
+	p.wg.Add(1)
 	p.mu.Unlock()
 
-	if p.role == "server" {
+	p.headMu.Lock()
+	p.lastKey = ""
+	p.historyHead = ""
+	p.initialized = false
+	p.headMu.Unlock()
+	p.sawTraffic.Store(false)
 
-		purgeCtx, cancelPurge := context.WithTimeout(pipeCtx, 5*time.Second)
-		if err := p.purgeWritePrefix(purgeCtx); err != nil && pipeCtx.Err() == nil {
-			p.logger.Debug("silo: purge stale ", p.writePrefix, ": ", err)
-		}
-		cancelPurge()
+	initCtx, cancelInit := context.WithTimeout(pipeCtx, s3RequestTimeout)
+	p.initializeReadCursor(initCtx)
+	cancelInit()
+
+	p.mu.Lock()
+	if pipeCtx.Err() != nil {
+		p.started = false
+		p.mu.Unlock()
+		p.wg.Done()
+		return nil
+	}
+	if p.role == "server" {
+		p.wg.Add(1)
+		go p.purgeStale(pipeCtx)
 	}
 
-	p.wg.Add(2)
+	p.wg.Add(3)
 	go p.receiveLoop(pipeCtx)
 	go p.sendLoop(pipeCtx)
+	go p.deleteLoop(pipeCtx)
+	p.wg.Done()
+	p.mu.Unlock()
 
 	p.logger.Info("silo: pipe started (write=", p.writePrefix, ", read=", p.readPrefix, ")")
 	return nil
 }
 
 func (p *Pipe) ResetReadHead() {
-	p.lastKeyMu.Lock()
-	p.lastKey = ""
-	p.lastKeyMu.Unlock()
+	p.rewindReadHead(true)
+}
+
+func (p *Pipe) rescanReadHead() {
+	p.rewindReadHead(false)
+}
+
+func (p *Pipe) rewindReadHead(_ bool) {
+	p.headMu.Lock()
+	p.lastKey = p.historyHead
+	p.headMu.Unlock()
 
 	p.deferMu.Lock()
 	p.deferred = make(map[string]*deferredBatch)
@@ -359,6 +399,63 @@ func (p *Pipe) purgeWritePrefix(ctx context.Context) error {
 	return nil
 }
 
+func (p *Pipe) purgeStale(ctx context.Context) {
+	defer p.wg.Done()
+	purgeCtx, cancel := context.WithTimeout(ctx, purgeTimeout)
+	defer cancel()
+	if err := p.purgeWritePrefix(purgeCtx); err != nil && ctx.Err() == nil {
+		p.logger.Debug("silo: background purge ", p.writePrefix, ": ", err)
+	}
+}
+
+func (p *Pipe) deleteLoop(ctx context.Context) {
+	defer p.wg.Done()
+
+	interval := pendingDeleteInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.deadCh:
+			return
+		case <-ticker.C:
+		}
+		p.retryPendingDeletes(ctx)
+	}
+}
+
+func (p *Pipe) flushDeletes(ctx context.Context) {
+	p.deferMu.Lock()
+	keys := make([]string, 0, len(p.pendingDelete))
+	for key := range p.pendingDelete {
+		keys = append(keys, key)
+	}
+	p.deferMu.Unlock()
+	if len(keys) == 0 {
+		return
+	}
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		keyCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
+		ok := p.removeObject(keyCtx, key)
+		cancel()
+		if !ok {
+			continue
+		}
+		p.deferMu.Lock()
+		delete(p.pendingDelete, key)
+		p.deferMu.Unlock()
+	}
+}
+
 func (p *Pipe) Stop(ctx context.Context) error {
 	p.mu.Lock()
 	if !p.started {
@@ -394,6 +491,7 @@ func (p *Pipe) SendMessage(ctx context.Context, data []byte, _ string) error {
 	msg := uploadMsg{data: cp, done: make(chan error, 1)}
 	select {
 	case p.sendCh <- msg:
+		p.lastWrite.Store(time.Now().UnixNano())
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-pipeCtx.Done():
@@ -499,7 +597,12 @@ func (p *Pipe) sendLoop(ctx context.Context) {
 					default:
 					}
 				}
-				timer.Reset(flushDur)
+				next := flushDur
+				if len(p.sendCh) == 0 {
+
+					next = 0
+				}
+				timer.Reset(next)
 			}
 
 			if len(buffer) >= targetSize {
@@ -510,6 +613,7 @@ func (p *Pipe) sendLoop(ctx context.Context) {
 					default:
 					}
 				}
+
 				timer.Reset(flushDur)
 			}
 		case <-timer.C:
@@ -535,10 +639,15 @@ func (p *Pipe) upload(ctx context.Context, buf []byte) error {
 
 	p.ctr.NetworkSent.Add(int64(len(buf)))
 	p.ctr.MessagesSent.Add(1)
+	p.lastWrite.Store(time.Now().UnixNano())
 	return nil
 }
 
-const maxPollBackoff = 500 * time.Millisecond
+const (
+	maxPollBackoff = 150 * time.Millisecond
+
+	maxIdlePollInterval = 150 * time.Millisecond
+)
 
 var idleRescanInterval = 2 * time.Second
 
@@ -566,22 +675,24 @@ func (p *Pipe) receiveLoop(ctx context.Context) {
 	if base < 10*time.Millisecond {
 		base = 10 * time.Millisecond
 	}
+	if base > maxIdlePollInterval {
+		base = maxIdlePollInterval
+	}
 	delay := base
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	lastProgress := time.Now()
-	sawTraffic := false
+	sawTraffic := p.sawTraffic.Load()
 
 	poll := func() bool {
 		if p.idleHead(lastProgress) {
-			p.ResetReadHead()
+			p.rescanReadHead()
 		}
-		pollCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
-		delivered := p.pollOnce(pollCtx)
-		cancel()
+		delivered := p.pollOnce(ctx)
 		if delivered > 0 {
 			sawTraffic = true
-			delay = base
+
+			delay = 0
 			lastProgress = time.Now()
 			return true
 		}
@@ -620,18 +731,37 @@ func (p *Pipe) receiveLoop(ctx context.Context) {
 }
 
 func (p *Pipe) idleHead(lastProgress time.Time) bool {
-	p.lastKeyMu.Lock()
+	p.headMu.Lock()
 	hasHead := p.lastKey != ""
-	p.lastKeyMu.Unlock()
-	return hasHead && time.Since(lastProgress) >= idleRescanInterval
+	p.headMu.Unlock()
+	if !hasHead || time.Since(lastProgress) < idleRescanInterval {
+		return false
+	}
+
+	if last := p.lastWrite.Load(); last != 0 {
+		if time.Since(time.Unix(0, last)) < idleRescanInterval {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Pipe) pollOnce(ctx context.Context) int {
-	p.retryPendingDeletes(ctx)
-
-	p.lastKeyMu.Lock()
+	p.headMu.Lock()
+	initialized := p.initialized
 	startAfter := p.lastKey
-	p.lastKeyMu.Unlock()
+	p.headMu.Unlock()
+
+	if !initialized {
+		p.initializeReadCursor(ctx)
+		p.headMu.Lock()
+		if !p.initialized {
+			p.headMu.Unlock()
+			return 0
+		}
+		startAfter = p.lastKey
+		p.headMu.Unlock()
+	}
 
 	opts := minio.ListObjectsOptions{
 		Prefix:    p.readPrefix,
@@ -642,11 +772,12 @@ func (p *Pipe) pollOnce(ctx context.Context) int {
 	}
 
 	var objects []listedObject
-	objectCh := p.store.ListObjects(ctx, p.cfg.Bucket, opts)
+	listCtx, cancelList := context.WithTimeout(ctx, s3RequestTimeout)
+	objectCh := p.store.ListObjects(listCtx, p.cfg.Bucket, opts)
 
 	for object := range objectCh {
 		if object.Err != nil {
-			if ctx.Err() == nil {
+			if listCtx.Err() == nil && ctx.Err() == nil {
 				p.logger.Warn("silo: list objects under ", p.readPrefix, ": ", object.Err)
 			}
 			continue
@@ -657,6 +788,7 @@ func (p *Pipe) pollOnce(ctx context.Context) int {
 			modified: object.LastModified,
 		})
 	}
+	cancelList()
 
 	if len(objects) == 0 {
 		return 0
@@ -685,14 +817,108 @@ func (p *Pipe) pollOnce(ctx context.Context) int {
 			break
 		}
 
-		p.lastKeyMu.Lock()
-		if obj.key > p.lastKey {
-			p.lastKey = obj.key
-		}
-		p.lastKeyMu.Unlock()
+		p.advanceReadHead(obj.key)
 		delivered++
 	}
 	return delivered
+}
+
+var existingHistorySkipThreshold = 16
+
+func (p *Pipe) initializeReadCursor(ctx context.Context) bool {
+	last, history, ok := p.initReadHead(ctx)
+	if !ok {
+		return false
+	}
+	p.headMu.Lock()
+	if p.initialized {
+		p.headMu.Unlock()
+		return true
+	}
+	p.initialized = true
+	p.headMu.Unlock()
+
+	skipHistory := len(history) > existingHistorySkipThreshold || p.role != "server"
+	if !skipHistory {
+
+		for _, obj := range history {
+			if ctx.Err() != nil {
+				break
+			}
+			if !p.processFile(ctx, obj) {
+				break
+			}
+			p.advanceReadHead(obj.key)
+		}
+		return true
+	}
+
+	p.headMu.Lock()
+	p.lastKey = last
+	p.historyHead = last
+	p.headMu.Unlock()
+
+	budget := time.Now().Add(staleInlineDeleteBudget)
+	for _, obj := range history {
+		key := obj.key
+		if time.Now().After(budget) || ctx.Err() != nil {
+			p.scheduleDelete(key)
+			continue
+		}
+		delCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
+		ok := p.removeObject(delCtx, key)
+		cancel()
+		if !ok {
+			p.scheduleDelete(key)
+		}
+	}
+	p.logger.Info("silo: skipped ", len(history), " existing objects up to ", last)
+	return true
+}
+
+func (p *Pipe) initReadHead(ctx context.Context) (string, []listedObject, bool) {
+	listCtx, cancel := context.WithTimeout(ctx, s3RequestTimeout)
+	defer cancel()
+
+	objectCh := p.store.ListObjects(listCtx, p.cfg.Bucket, minio.ListObjectsOptions{
+		Prefix:    p.readPrefix,
+		Recursive: true,
+	})
+	objects := make([]listedObject, 0, 16)
+	failed := false
+	for object := range objectCh {
+		if object.Err != nil {
+			failed = true
+			if listCtx.Err() == nil && ctx.Err() == nil {
+				p.logger.Warn("silo: list objects under ", p.readPrefix, ": ", object.Err)
+			}
+			continue
+		}
+		objects = append(objects, listedObject{
+			key:      object.Key,
+			size:     object.Size,
+			modified: object.LastModified,
+		})
+	}
+	if listCtx.Err() != nil && ctx.Err() == nil {
+		p.logger.Warn("silo: initial list under ", p.readPrefix, " timed out")
+	}
+	if failed {
+		return "", nil, false
+	}
+	if len(objects) == 0 {
+		return "", nil, true
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].key < objects[j].key })
+	return objects[len(objects)-1].key, objects, true
+}
+
+func (p *Pipe) advanceReadHead(key string) {
+	p.headMu.Lock()
+	if key > p.lastKey {
+		p.lastKey = key
+	}
+	p.headMu.Unlock()
 }
 
 func isMissingObject(err error) bool {
@@ -750,7 +976,7 @@ func (p *Pipe) deferOrDrop(obj listedObject, reason string) bool {
 	return false
 }
 
-const maxPendingDeletes = 256
+const maxPendingDeletes = 4096
 
 func (p *Pipe) removeObject(ctx context.Context, key string) bool {
 	for attempt := 0; attempt < 2; attempt++ {
@@ -789,30 +1015,21 @@ func (p *Pipe) isPendingDelete(key string) bool {
 }
 
 func (p *Pipe) retryPendingDeletes(ctx context.Context) {
-	p.deferMu.Lock()
-	keys := make([]string, 0, len(p.pendingDelete))
-	for key := range p.pendingDelete {
-		keys = append(keys, key)
-	}
-	p.deferMu.Unlock()
-	for _, key := range keys {
-		if !p.removeObject(ctx, key) {
-			continue
-		}
-		p.deferMu.Lock()
-		delete(p.pendingDelete, key)
-		p.deferMu.Unlock()
-	}
+	p.flushDeletes(ctx)
 }
 
 func (p *Pipe) processFile(ctx context.Context, obj listedObject) bool {
 	key := obj.key
-	objReader, err := p.store.GetObject(ctx, p.cfg.Bucket, key, minio.GetObjectOptions{})
+
+	readCtx, cancelRead := context.WithTimeout(ctx, s3RequestTimeout)
+	objReader, err := p.store.GetObject(readCtx, p.cfg.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
+		cancelRead()
 		return isMissingObject(err)
 	}
 	data, err := io.ReadAll(objReader)
 	_ = objReader.Close()
+	cancelRead()
 	if err != nil {
 		return isMissingObject(err)
 	}
@@ -833,6 +1050,9 @@ func (p *Pipe) processFile(ctx context.Context, obj listedObject) bool {
 	}
 
 	p.ctr.NetworkRecv.Add(int64(len(data)))
+	if len(messages) > 0 {
+		p.sawTraffic.Store(true)
+	}
 	for _, msg := range messages {
 		p.ctr.UsefulRecv.Add(int64(len(msg)))
 		p.ctr.MessagesRecv.Add(1)

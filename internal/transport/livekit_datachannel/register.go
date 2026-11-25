@@ -160,9 +160,8 @@ func build(
 		s.ExitNodeID = cfg.ExitNodeID
 	}
 	if role != "server" {
-		if strings.TrimSpace(cfg.Identity) == "" && strings.TrimSpace(cfg.UserID) != "" {
-			cfg.Identity = cfg.UserID
-		}
+
+		normalizeClientIdentity(&cfg)
 	}
 	if err := cfg.ValidateForRole(role); err != nil {
 		return nil, err
@@ -245,6 +244,24 @@ func bypassHosts(ctx context.Context, signalURL string) []string {
 	out := []string{host}
 	out = append(out, netdial.ResolveIPv4(ctx, host)...)
 	return out
+}
+
+func normalizeClientIdentity(cfg *lk.Config) {
+	if cfg == nil {
+		return
+	}
+	if strings.TrimSpace(cfg.Identity) == "" && strings.TrimSpace(cfg.UserID) != "" {
+		cfg.Identity = cfg.UserID
+	}
+	identity := strings.TrimSpace(cfg.Identity)
+	if identity == "" {
+		return
+	}
+	if normalized, err := auth.NormalizeUserID(identity); err == nil {
+		cfg.Identity = normalized
+		return
+	}
+	cfg.Identity = identity
 }
 
 func routeRoomPrefix(p app.RouteParams) string {

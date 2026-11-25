@@ -336,7 +336,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 		return fmt.Errorf("runtime start: %w", err)
 	}
 
-	handler := socks5.NewRemoteHandler(ctx, mux, logger, 8000, app.IPv4Only)
+	handler := socks5.NewRemoteHandler(ctx, mux, logger, 32768, app.IPv4Only)
 	handler.SetGeoFilter(m.filter, m.blockUnknown)
 	handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
 	go func() {
@@ -383,7 +383,7 @@ func (m *Manager) startSessionServer(
 		telemetry = tel
 	}
 	sessions.SetSessionHandler(func(sctx context.Context, mux multiplexing.StreamMultiplexer) error {
-		handler := socks5.NewRemoteHandler(sctx, mux, logger, 8000, app.IPv4Only)
+		handler := socks5.NewRemoteHandler(sctx, mux, logger, 32768, app.IPv4Only)
 		handler.SetGeoFilter(m.filter, m.blockUnknown)
 		handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
 		err := handler.Run()

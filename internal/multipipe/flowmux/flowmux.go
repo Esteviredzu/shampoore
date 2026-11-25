@@ -19,7 +19,7 @@ import (
 const (
 	coldStartFloor int64 = 1024
 
-	probeDuration = 30 * time.Second
+	probeDuration = 5 * time.Second
 
 	softProbeEvery = 30
 
@@ -30,14 +30,25 @@ const (
 
 	subflowFailCooldown = 5 * time.Second
 
-	rttMedianWindow    = 5
-	bwPeakTicks        = 3
-	scoreRefRTT        = 200 * time.Millisecond
-	maxLatencyPenalty  = 10.0
+	rttMedianWindow   = 5
+	bwPeakTicks       = 3
+	scoreRefRTT       = 200 * time.Millisecond
+	maxLatencyPenalty = 10.0
+
+	fastRTTCutoff      = 150 * time.Millisecond
+	slowRTTCutoff      = 250 * time.Millisecond
 	errDecayHalfLife   = 30 * time.Second
 	errPenaltyStrength = 0.7
 	minReliability     = 0.05
+
+	bwShareCapFactor = 1.5
+
+	maxTubeShare = 0.6
 )
+
+const defaultSubflowOpenTimeout = 5 * time.Second
+
+var subflowOpenTimeout = defaultSubflowOpenTimeout
 
 type Config struct {
 	FlushThreshold int
@@ -63,9 +74,11 @@ type subflow struct {
 	transport transport.Transport
 	mux       *tunnel.TunnelMultiplexer
 
-	throughput  atomic.Int64
-	recentRate  atomic.Int64
-	active      atomic.Int64
+	throughput atomic.Int64
+	recentRate atomic.Int64
+	active     atomic.Int64
+
+	inflight    atomic.Int64
 	totalOpened atomic.Uint64
 	failUntil   atomic.Int64
 
@@ -104,6 +117,10 @@ type FlowMux struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	doneMu     sync.Mutex
+	done       chan struct{}
+	doneClosed bool
+
 	stateMu sync.Mutex
 	started bool
 	wg      sync.WaitGroup
@@ -134,6 +151,7 @@ func New(
 		logger:   logger,
 		cfg:      cfg,
 		incoming: make(chan multiplexing.Stream, 64),
+		done:     make(chan struct{}),
 	}
 	for i := range transports {
 		tm := tunnel.New(transports[i], logger, tunnel.Config{
@@ -169,24 +187,49 @@ func (m *FlowMux) Start(ctx context.Context) error {
 	}
 	m.ctx, m.cancel = context.WithCancel(ctx)
 	m.drainIncomingStreams()
+	m.doneMu.Lock()
+	if m.done == nil || m.doneClosed {
+		m.done = make(chan struct{})
+		m.doneClosed = false
+	}
+	m.doneMu.Unlock()
+
+	live := make([]*subflow, 0, len(m.subflows))
+	var firstErr error
 	for _, sf := range m.subflows {
 		if err := sf.mux.Start(ctx); err != nil {
-			for _, s := range m.subflows {
-				_ = s.mux.Stop(context.Background())
+			if m.logger != nil {
+				m.logger.Warn("flowmux: subflow ", sf.name, " failed to start, dropping it: ", err)
 			}
-			m.cancel()
-			m.ctx = nil
-			m.cancel = nil
-			return fmt.Errorf("flowmux: start %s: %w", sf.name, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("flowmux: start %s: %w", sf.name, err)
+			}
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), subflowOpenTimeout)
+			_ = sf.mux.Stop(stopCtx)
+			cancelStop()
+			continue
 		}
 		m.logger.Info("flowmux: subflow ", sf.name, " started")
+		live = append(live, sf)
 	}
+	if len(live) == 0 {
+		m.cancel()
+		m.ctx = nil
+		m.cancel = nil
+		if firstErr == nil {
+			firstErr = fmt.Errorf("flowmux: no subflow could be started")
+		}
+		return firstErr
+	}
+	m.subflows = live
 	for _, sf := range m.subflows {
 		m.wg.Add(1)
 		go m.acceptLoop(sf)
 	}
 	m.wg.Add(1)
 	go m.sampleLoop()
+	m.wg.Add(1)
+	go m.watchSubflows()
 	m.started = true
 	return nil
 }
@@ -196,6 +239,7 @@ func (m *FlowMux) Stop(ctx context.Context) error {
 	defer m.stateMu.Unlock()
 
 	if !m.started {
+		m.closeDone()
 		return nil
 	}
 	m.started = false
@@ -210,7 +254,72 @@ func (m *FlowMux) Stop(ctx context.Context) error {
 			lastErr = err
 		}
 	}
+	m.closeDone()
 	return lastErr
+}
+
+func (m *FlowMux) Done() <-chan struct{} {
+	m.doneMu.Lock()
+	defer m.doneMu.Unlock()
+	return m.done
+}
+
+func (m *FlowMux) closeDone() {
+	m.doneMu.Lock()
+	if !m.doneClosed && m.done != nil {
+		m.doneClosed = true
+		close(m.done)
+	}
+	m.doneMu.Unlock()
+}
+
+func (m *FlowMux) watchSubflows() {
+	defer m.wg.Done()
+
+	deadCh := make(chan struct{}, len(m.subflows))
+	monitored := 0
+	for _, sf := range m.subflows {
+		if sf == nil || sf.mux == nil {
+			continue
+		}
+		done := sf.mux.Done()
+		if done == nil {
+			continue
+		}
+		monitored++
+		go func(done <-chan struct{}) {
+			select {
+			case <-done:
+				select {
+				case deadCh <- struct{}{}:
+				default:
+				}
+			case <-m.ctx.Done():
+			}
+		}(done)
+	}
+	if monitored == 0 {
+		return
+	}
+
+	remaining := monitored
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-deadCh:
+			remaining--
+			if remaining > 0 {
+				continue
+			}
+			if m.logger != nil {
+				m.logger.Warn("flowmux: every subflow terminated; failing the multiplexer")
+			}
+			m.closeDone()
+			m.cancel()
+			return
+		}
+	}
 }
 
 func (m *FlowMux) WalkLayers() []transport.Layer {
@@ -254,14 +363,26 @@ func (m *FlowMux) OpenStream(ctx context.Context, meta map[string]any) (multiple
 	if len(m.subflows) == 0 {
 		return nil, fmt.Errorf("flowmux: no subflow")
 	}
+
+	timeout := subflowOpenTimeout
+	if timeout <= 0 {
+		timeout = defaultSubflowOpenTimeout
+	}
+	tried := make(map[*subflow]struct{}, len(m.subflows))
 	var lastErr error
-	for attempt := 0; attempt < len(m.subflows); attempt++ {
-		sf := m.pickSubflow()
+	for {
+		sf := m.pickSubflowExcluding(tried)
 		if sf == nil {
 			break
 		}
-		s, err := sf.mux.OpenStream(ctx, meta)
+		tried[sf] = struct{}{}
+		sf.inflight.Add(1)
+
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		s, err := sf.mux.OpenStream(attemptCtx, meta)
+		cancel()
 		if err == nil {
+			sf.inflight.Add(-1)
 			sf.failUntil.Store(0)
 			sf.active.Add(1)
 			m.logger.Info("flowmux: new stream on ", sf.name,
@@ -270,6 +391,7 @@ func (m *FlowMux) OpenStream(ctx context.Context, meta map[string]any) (multiple
 			return &wrappedStream{Stream: s, sf: sf}, nil
 		}
 		lastErr = err
+		sf.inflight.Add(-1)
 		sf.recordError(1.0)
 		sf.failUntil.Store(time.Now().Add(subflowFailCooldown).UnixNano())
 		m.logger.Warn("flowmux: open on ", sf.name, " failed, trying another subflow: ", err)
@@ -281,6 +403,28 @@ func (m *FlowMux) OpenStream(ctx context.Context, meta map[string]any) (multiple
 		lastErr = fmt.Errorf("flowmux: no healthy subflow")
 	}
 	return nil, fmt.Errorf("flowmux: open failed on all subflows: %w", lastErr)
+}
+
+func (m *FlowMux) pickSubflowExcluding(tried map[*subflow]struct{}) *subflow {
+	sf := m.pickSubflow()
+	if sf == nil {
+		return nil
+	}
+	if _, dup := tried[sf]; !dup {
+		return sf
+	}
+	for _, cand := range m.latencyAwareCandidates(m.candidates(time.Now().UnixNano())) {
+		if _, dup := tried[cand]; dup {
+			continue
+		}
+		return cand
+	}
+	for _, cand := range m.subflows {
+		if _, dup := tried[cand]; !dup {
+			return cand
+		}
+	}
+	return nil
 }
 
 func (m *FlowMux) AcceptStream(ctx context.Context) (multiplexing.Stream, error) {
@@ -364,11 +508,15 @@ func (m *FlowMux) acceptLoop(sf *subflow) {
 
 func (m *FlowMux) pickSubflow() *subflow {
 	now := time.Now().UnixNano()
-	candidates := m.candidates(now)
+	candidates := m.latencyAwareCandidates(m.candidates(now))
 	n := len(candidates)
 	if n == 0 {
-		m.logger.Warn("flowmux: every subflow is in failure cooldown")
-		return nil
+		if len(m.subflows) == 0 {
+			m.logger.Warn("flowmux: no subflows configured")
+			return nil
+		}
+		candidates = append([]*subflow(nil), m.subflows...)
+		n = len(candidates)
 	}
 	if n == 1 {
 		candidates[0].totalOpened.Add(1)
@@ -382,7 +530,12 @@ func (m *FlowMux) pickSubflow() *subflow {
 
 	firstNs := m.firstOpenAt.Load()
 	if firstNs > 0 && time.Since(time.Unix(0, firstNs)) < probeDuration {
-		sf := candidates[(count-1)%uint32(n)]
+		pool := candidates
+
+		if primed := m.measuredFastCandidates(candidates); len(primed) > 0 {
+			pool = primed
+		}
+		sf := pool[(count-1)%uint32(len(pool))]
 		sf.totalOpened.Add(1)
 		return sf
 	}
@@ -395,64 +548,85 @@ func (m *FlowMux) pickSubflow() *subflow {
 		return sf
 	}
 
-	var totalActive int64
-	for _, sf := range candidates {
-		totalActive += sf.active.Load()
-	}
-	avgActive := float64(totalActive) / float64(len(candidates))
-	if avgActive < 1.0 {
-		avgActive = 1.0
-	}
+	return m.pickBalanced(candidates, count)
+}
 
-	scores := make([]float64, len(candidates))
-	var maxScore float64
-	for i, sf := range candidates {
-		sc := sf.compositeScore(avgActive)
-		scores[i] = sc
-		if sc > maxScore {
-			maxScore = sc
+func (m *FlowMux) pickBalanced(candidates []*subflow, count uint32) *subflow {
+	if len(candidates) == 1 {
+		candidates[0].totalOpened.Add(1)
+		return candidates[0]
+	}
+	if trimmed := m.trimOverloaded(candidates); len(trimmed) > 0 {
+		candidates = trimmed
+		if len(candidates) == 1 {
+			candidates[0].totalOpened.Add(1)
+			return candidates[0]
 		}
 	}
-	threshold := maxScore * float64(fastThresholdNum) / float64(fastThresholdDen)
-	if threshold < float64(coldStartFloor)*minReliability {
-		threshold = float64(coldStartFloor) * minReliability
+	n := len(candidates)
+
+	weights := make([]float64, n)
+	median := make([]float64, 0, n)
+	for i, sf := range candidates {
+		bw := float64(sf.throughput.Load())
+		if bw < float64(coldStartFloor) {
+			bw = float64(coldStartFloor)
+		}
+		weights[i] = bw
+		median = append(median, bw)
+	}
+	slices.Sort(median)
+	capacityCap := median[len(median)/2] * bwShareCapFactor
+	if capacityCap < float64(coldStartFloor) {
+		capacityCap = float64(coldStartFloor)
 	}
 
-	var pool []*subflow
-	var weights []float64
+	start := int(count-1) % n
+	best := start
+	bestScore := math.MaxFloat64
+	for off := 0; off < n; off++ {
+		i := (start + off) % n
+		weight := weights[i]
+		if weight > capacityCap {
+			weight = capacityCap
+		}
+		load := float64(candidates[i].active.Load()+candidates[i].inflight.Load()) + 1
+		score := load / weight
+		if score < bestScore-1e-9 {
+			bestScore = score
+			best = i
+		}
+	}
+	candidates[best].totalOpened.Add(1)
+	return candidates[best]
+}
+
+func (m *FlowMux) trimOverloaded(candidates []*subflow) []*subflow {
+	if len(candidates) <= 1 {
+		return nil
+	}
 	var total float64
-	for i, sf := range candidates {
-		if scores[i] >= threshold {
-			pool = append(pool, sf)
-			weights = append(weights, scores[i])
-			total += scores[i]
+	for _, sf := range candidates {
+		total += float64(sf.active.Load() + sf.inflight.Load())
+	}
+	if total < 3 {
+		return nil
+	}
+	out := make([]*subflow, 0, len(candidates))
+	idle := false
+	for _, sf := range candidates {
+		share := float64(sf.active.Load()+sf.inflight.Load()) / total
+		if share < maxTubeShare {
+			out = append(out, sf)
+			if share <= 1.0/float64(len(candidates)) {
+				idle = true
+			}
 		}
 	}
-	if len(pool) == 0 {
-		pool = candidates
-		weights = scores
-		for _, sc := range scores {
-			total += sc
-		}
+	if len(out) == 0 || len(out) == len(candidates) || !idle {
+		return nil
 	}
-	if total <= 0 {
-		sf := pool[rand.IntN(len(pool))]
-		sf.totalOpened.Add(1)
-		return sf
-	}
-
-	r := rand.Float64() * total
-	var cum float64
-	for i, w := range weights {
-		cum += w
-		if r < cum {
-			pool[i].totalOpened.Add(1)
-			return pool[i]
-		}
-	}
-	sf := pool[len(pool)-1]
-	sf.totalOpened.Add(1)
-	return sf
+	return out
 }
 
 func (m *FlowMux) candidates(now int64) []*subflow {
@@ -467,6 +641,53 @@ func (m *FlowMux) candidates(now int64) []*subflow {
 		return append([]*subflow(nil), m.subflows...)
 	}
 	return alive
+}
+
+func (m *FlowMux) latencyAwareCandidates(candidates []*subflow) []*subflow {
+	if len(candidates) == 0 {
+		if len(m.subflows) == 0 {
+			return nil
+		}
+		return append([]*subflow(nil), m.subflows...)
+	}
+	fast := false
+	for _, sf := range candidates {
+		if rtt := sf.rttSnapshot(); rtt > 0 && rtt < fastRTTCutoff {
+			fast = true
+			break
+		}
+	}
+	if !fast {
+		return candidates
+	}
+	filtered := make([]*subflow, 0, len(candidates))
+	for _, sf := range candidates {
+		if rtt := sf.rttSnapshot(); rtt > slowRTTCutoff {
+			continue
+		}
+		filtered = append(filtered, sf)
+	}
+	if len(filtered) == 0 {
+		return candidates
+	}
+	return filtered
+}
+
+func (m *FlowMux) measuredFastCandidates(candidates []*subflow) []*subflow {
+	var out []*subflow
+	for _, sf := range candidates {
+		rtt := sf.rttSnapshot()
+		if rtt > 0 && rtt <= slowRTTCutoff {
+			out = append(out, sf)
+		}
+	}
+	return out
+}
+
+func (sf *subflow) rttSnapshot() time.Duration {
+	sf.healthMu.Lock()
+	defer sf.healthMu.Unlock()
+	return sf.medianRTT
 }
 
 func (m *FlowMux) sampleLoop() {
@@ -709,8 +930,13 @@ func computeCompositeScore(
 
 	latencyPenalty := 1.0
 	if medianRTT > 0 {
-		effRTT := float64(medianRTT) + 0.5*float64(rttvar)
-		latencyPenalty = 1.0 + effRTT/float64(scoreRefRTT)
+		ratio := float64(medianRTT) / float64(scoreRefRTT)
+		if ratio > 1 {
+			latencyPenalty = 1.0 + ratio*ratio
+		} else {
+			latencyPenalty = 1.0 + ratio
+		}
+		latencyPenalty += 0.5 * float64(rttvar) / float64(scoreRefRTT)
 		if latencyPenalty > maxLatencyPenalty {
 			latencyPenalty = maxLatencyPenalty
 		}

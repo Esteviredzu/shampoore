@@ -199,6 +199,10 @@ func TestGapTimeoutUnblocksRead(t *testing.T) {
 }
 
 func TestSendChunkFailureResetsSession(t *testing.T) {
+	restore := noTubeGraceTimeout
+	noTubeGraceTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { noTubeGraceTimeout = restore })
+
 	errBoom := errors.New("boom")
 	pathA := newFakeTube()
 	pathA.sendErr = errBoom
@@ -311,7 +315,7 @@ func TestReadContextReturnsTerminalErrorAfterFail(t *testing.T) {
 	}
 }
 
-func TestAllSubflowsStoppedReceivingFailsRead(t *testing.T) {
+func TestAllSubflowsStoppedReceivingKeepsSessionAlive(t *testing.T) {
 	tube := newFakeTube()
 	bc := newBondConn(
 		context.Background(),
@@ -324,9 +328,37 @@ func TestAllSubflowsStoppedReceivingFailsRead(t *testing.T) {
 
 	tube.recvCh <- tubeItem{err: errors.New("transport gone")}
 
-	_, err := readWithTimeout(t, bc, 2*time.Second)
-	if !errors.Is(err, transport.ErrTransportReset) {
-		t.Fatalf("expected ErrTransportReset when all subflows stopped, got %v", err)
+	readDone := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, err := bc.Read(buf)
+		readDone <- struct {
+			data []byte
+			err  error
+		}{data: append([]byte(nil), buf[:n]...), err: err}
+	}()
+
+	select {
+	case res := <-readDone:
+		t.Fatalf("read returned (%q, %v): a stopped reader must not kill the session", res.data, res.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	tube.recvCh <- tubeItem{data: testBondFrame(0, "ok")}
+
+	select {
+	case res := <-readDone:
+		if res.err != nil {
+			t.Fatalf("read after the reader was revived: %v", res.err)
+		}
+		if string(res.data) != "ok" {
+			t.Fatalf("unexpected payload %q", res.data)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("read stayed blocked after the tube recovered")
 	}
 }
 
@@ -458,6 +490,8 @@ func TestFirstChunkFansOutAcrossAllSubflows(t *testing.T) {
 		defaultConnOptions(),
 	)
 	defer func() { _ = bc.Close() }()
+
+	bc.sendKeepaliveAll(false)
 
 	if _, err := bc.Write([]byte("first")); err != nil {
 		t.Fatalf("write first chunk: %v", err)

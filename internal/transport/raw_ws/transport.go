@@ -445,7 +445,6 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 			t.closeSession(cur)
 			return true, time.Since(started), err
 		case <-rotate.C:
-
 			forced := hardLimit > 0 && time.Since(sessionStart) >= hardLimit
 			if !forced && (!t.idle() || cur.queueLen() > 0) {
 				rotate.Reset(t.nextRotationDelay())
@@ -454,7 +453,6 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 			next, derr := t.dialSession(parent)
 			if derr != nil {
 				t.logger.Warn("raw_ws: rotate: ", derr)
-
 				rotate.Reset(t.rotationRetryDelay())
 				continue
 			}
@@ -466,10 +464,11 @@ func (t *wsTransport) connectAndServe(parent context.Context, reconnect bool) (b
 
 			old := cur
 			cur = next
-			t.attachSession(next)
 
-			t.closeSession(old)
+			t.attachSession(next)
 			t.runSession(next)
+
+			t.drainAndCloseSession(old, 500*time.Millisecond)
 			sessionStart = time.Now()
 			t.logger.Info("raw_ws: connection rotated")
 			rotate.Reset(t.nextRotationDelay())
@@ -502,8 +501,9 @@ func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
 	dialCtx, cancelDial := context.WithTimeout(parent, sessionDialTimeout)
 	defer cancelDial()
 
-	if !t.warmupDone.Swap(true) {
-		t.warmup(dialCtx, wsURL)
+	if t.warmupDone.CompareAndSwap(false, true) {
+
+		go t.warmup(t.transportCtx(), wsURL)
 	}
 
 	dialer := t.newDialer()
@@ -511,9 +511,15 @@ func (t *wsTransport) dialSession(parent context.Context) (*wsSession, error) {
 	conn, resp, err := dialer.DialContext(dialCtx, wsURL, nil)
 	if err != nil {
 		if resp != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
 			return nil, fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
 		}
 		return nil, fmt.Errorf("dial: %w", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
 	}
 
 	conn.SetReadLimit(int64(t.shape.Frame.MaxMessageBytes))
@@ -727,6 +733,31 @@ func (t *wsTransport) idle() bool {
 		window = rotateIdleWindow
 	}
 	return time.Since(time.Unix(0, last)) >= window
+}
+
+func (t *wsTransport) drainAndCloseSession(sess *wsSession, timeout time.Duration) {
+	if sess == nil {
+		return
+	}
+	if timeout <= 0 {
+		t.closeSession(sess)
+		return
+	}
+	go func() {
+		deadline := time.NewTimer(timeout)
+		defer deadline.Stop()
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for sess.queueLen() > 0 {
+			select {
+			case <-deadline.C:
+				t.closeSession(sess)
+				return
+			case <-tick.C:
+			}
+		}
+		t.closeSession(sess)
+	}()
 }
 
 func (t *wsTransport) closeSession(sess *wsSession) {
@@ -997,6 +1028,17 @@ func (t *wsTransport) sendLoop(ctx context.Context, sess *wsSession) {
 		case msg := <-queue:
 			batch = append(batch, msg)
 			batchBytes += len(msg.data)
+
+		drain:
+			for batchBytes < t.batchLimit() {
+				select {
+				case more := <-queue:
+					batch = append(batch, more)
+					batchBytes += len(more.data)
+				default:
+					break drain
+				}
+			}
 
 			if batchBytes >= t.batchLimit() || t.pendingSends.Load() > 0 {
 				if err := flush(); err != nil {

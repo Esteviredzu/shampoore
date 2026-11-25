@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,9 @@ func (m *memEnd) Stop(context.Context) error {
 	return nil
 }
 func (m *memEnd) Send(ctx context.Context, data []byte) error {
+	if m.stopped.Load() {
+		return io.ErrClosedPipe
+	}
 	cp := append([]byte(nil), data...)
 	select {
 	case m.send <- cp:
@@ -39,6 +43,9 @@ func (m *memEnd) Send(ctx context.Context, data []byte) error {
 	}
 }
 func (m *memEnd) Receive(ctx context.Context) ([]byte, error) {
+	if m.stopped.Load() {
+		return nil, io.ErrClosedPipe
+	}
 	select {
 	case data := <-m.recv:
 		return data, nil
@@ -65,9 +72,12 @@ func TestServerAggregatesTubesForOneUser(t *testing.T) {
 	cfg := tunnel.Config{FlushThreshold: 4096, FlushInterval: 2 * time.Millisecond}
 	srv := NewServer([]string{"0-a", "1-b"}, nil, testLogger{}, cfg, nil)
 
+	handlerStarted := make(chan struct{})
+	var handlerOnce sync.Once
 	handled := make(chan error, 1)
 	layersCh := make(chan []transport.Layer, 1)
 	srv.SetSessionHandler(func(hctx context.Context, mux multiplexing.StreamMultiplexer) error {
+		handlerOnce.Do(func() { close(handlerStarted) })
 		stream, err := mux.AcceptStream(hctx)
 		if err != nil {
 			handled <- err
@@ -102,9 +112,9 @@ func TestServerAggregatesTubesForOneUser(t *testing.T) {
 	defer releaseA()
 
 	select {
-	case err := <-handled:
-		t.Fatalf("session started with a single tube: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("aggregated session did not start with a single live tube")
 	}
 
 	releaseB, _ := srv.register("1-b", "alice", serverB)
@@ -168,32 +178,32 @@ func TestServerAggregatesTubesForOneUser(t *testing.T) {
 
 func TestServerRendezvousTimeoutReleasesTubes(t *testing.T) {
 	prev := aggregateRendezvousTimeout
-	aggregateRendezvousTimeout = 50 * time.Millisecond
+	aggregateRendezvousTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { aggregateRendezvousTimeout = prev })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	_, serverA := newMemPair()
+	blocked := newBarrierTransport(nil)
 	srv := NewServer([]string{"0-a", "1-b"}, nil, testLogger{}, tunnel.Config{}, nil)
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	defer func() { _ = srv.Stop(context.Background()) }()
+	defer func() {
+		blocked.unblock()
+		_ = srv.Stop(context.Background())
+	}()
 
-	_, doneA := srv.register("0-a", "alice", serverA)
+	_, doneA := srv.register("0-a", "alice", blocked)
 	select {
 	case <-doneA:
-	case <-time.After(2 * time.Second):
-		t.Fatal("partial aggregate was not released after the rendezvous timeout")
+	case <-time.After(3 * time.Second):
+		blocked.unblock()
+		t.Fatal("aggregate without a live tube was not released after the rendezvous timeout")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !serverA.stopped.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("tube transport was not stopped on rendezvous timeout")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 2*time.Second, "tube transport was stopped", func() bool {
+		return blocked.wasStopped()
+	})
 }
 
 func TestServerRejectsTubeWhenNotStarted(t *testing.T) {
@@ -206,5 +216,81 @@ func TestServerRejectsTubeWhenNotStarted(t *testing.T) {
 	}
 	if !serverA.stopped.Load() {
 		t.Fatal("rejected tube transport was not stopped")
+	}
+}
+
+func TestServerReplacesTubeWithoutTearingDownAggregate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	clientA, serverA := newMemPair()
+	clientB, serverB := newMemPair()
+	_, serverA2 := newMemPair()
+
+	cfg := tunnel.Config{FlushThreshold: 4096, FlushInterval: 2 * time.Millisecond}
+	srv := NewServer([]string{"0-a", "1-b"}, nil, testLogger{}, cfg, nil)
+	srv.SetSessionHandler(bottomlessEcho)
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = srv.Stop(context.Background()) }()
+
+	releaseA, doneA := srv.register("0-a", "alice", serverA)
+	releaseB, _ := srv.register("1-b", "alice", serverB)
+	if releaseA == nil || releaseB == nil || doneA == nil {
+		t.Fatal("tubes were not accepted")
+	}
+	defer releaseA()
+	defer releaseB()
+
+	clientConn := NewBondConn(ctx, []string{"0-a", "1-b"}, []tubeLike{clientA, clientB}, testLogger{})
+	defer func() { _ = clientConn.Close() }()
+	ct := &connTransport{c: clientConn, maxPayload: clientConn.MaxPayload(), numTubes: 2}
+	clientMux := tunnel.New(ct, testLogger{}, cfg)
+	if err := clientMux.Start(ctx); err != nil {
+		t.Fatalf("client mux start: %v", err)
+	}
+	defer func() { _ = clientMux.Stop(context.Background()) }()
+
+	stream, err := clientMux.OpenStream(ctx, map[string]any{"host": "example.com", "port": 443})
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer stream.Close()
+	if _, err := stream.Write([]byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(stream, got); err != nil || string(got) != "ping" {
+		t.Fatalf("echo before rotation = %q, %v", got, err)
+	}
+
+	_ = clientA.Stop(context.Background())
+	releaseA2, doneA2 := srv.register("0-a", "alice", serverA2)
+	if releaseA2 == nil {
+		t.Fatal("replacement tube was not accepted")
+	}
+	defer releaseA2()
+	if doneA2 != doneA {
+		t.Fatal("replacement changed the aggregate lifetime")
+	}
+	select {
+	case <-doneA:
+		t.Fatal("replacing one tube tore down the whole aggregate")
+	default:
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		if _, err := stream.Write([]byte("after")); err == nil {
+			reply := make([]byte, 5)
+			if _, rerr := io.ReadFull(stream, reply); rerr == nil && string(reply) == "after" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream did not survive a tube replacement")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

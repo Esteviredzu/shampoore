@@ -461,6 +461,8 @@ func (m *MultiServer) openSession(
 	}
 
 	pipe := newPipe(roomConn.LocalParticipant(), m.cfg.DataTopic, userID)
+
+	pipe.SetAdoptFirstPacket(true)
 	pipe.SetDeadHandler(func() {
 		session.closeKeepRoom("heartbeat timeout")
 	})
@@ -684,7 +686,8 @@ func (s *activeSession) setRemote(identity string) {
 	pipe := s.pipe
 	s.mu.Unlock()
 	if pipe != nil {
-		pipe.SetRemoteID(identity)
+
+		pipe.PeerJoined(identity)
 	}
 }
 

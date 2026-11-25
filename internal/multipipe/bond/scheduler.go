@@ -1,6 +1,7 @@
 package bond
 
 import (
+	"context"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,8 @@ const (
 	inflightBDPFactor = 1.35
 	minInflightChunks = 6
 	reorderGuardRatio = 0.55
+
+	slowArrivalSkew = 150 * time.Millisecond
 )
 
 type bwSample struct {
@@ -207,7 +210,14 @@ func (m *tubeMetrics) bandwidth(now time.Time) (float64, int) {
 
 type subflow struct {
 	name string
-	tube tubeLike
+
+	tubeMu   sync.Mutex
+	tube     tubeLike
+	tubeGen  uint32
+	readerOn atomic.Bool
+
+	readCtx    context.Context
+	readCancel context.CancelFunc
 
 	queue      chan queuedChunk
 	workerDone chan struct{}
@@ -220,14 +230,149 @@ type subflow struct {
 	inflightBytes atomic.Int64
 	probeSeq      atomic.Uint32
 
+	reviveAt      atomic.Int64
+	reviveBackoff atomic.Int64
+
+	workerOn atomic.Bool
+
 	confirmed atomic.Bool
+
+	lastProbe atomic.Int64
 
 	metrics tubeMetrics
 }
 
 type scheduler struct {
+	mu       sync.RWMutex
 	subflows []*subflow
 	cursor   atomic.Uint32
+}
+
+func (s *scheduler) list() []*subflow {
+	s.mu.RLock()
+	out := make([]*subflow, len(s.subflows))
+	copy(out, s.subflows)
+	s.mu.RUnlock()
+	return out
+}
+
+func (s *scheduler) addSubflow(name string, tube tubeLike) *subflow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sf := range s.subflows {
+		if sf.name == name {
+			if tube != nil {
+				sf.swapTube(tube)
+			}
+			return sf
+		}
+	}
+	sf := &subflow{
+		name:       name,
+		tube:       tube,
+		queue:      make(chan queuedChunk, queueCap),
+		workerDone: make(chan struct{}),
+	}
+	s.subflows = append(s.subflows, sf)
+	return sf
+}
+
+func (s *scheduler) hasSubflows() bool {
+	s.mu.RLock()
+	n := len(s.subflows)
+	s.mu.RUnlock()
+	return n > 0
+}
+
+func (s *scheduler) anyConfirmed() bool {
+	for _, sf := range s.list() {
+		if sf.confirmed.Load() && !s.isDead(sf) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *scheduler) anyAliveFits(chunkSize int) bool {
+	now := time.Now().UnixNano()
+	for _, sf := range s.list() {
+		if sf.deadUntil.Load() > now {
+			continue
+		}
+		if sf.fits(chunkSize) {
+			return true
+		}
+	}
+	return false
+}
+
+func (sf *subflow) bindRead(parent context.Context) (tubeLike, uint32, context.Context) {
+	sf.tubeMu.Lock()
+	if sf.readCancel != nil {
+		sf.readCancel()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	sf.readCtx, sf.readCancel = ctx, cancel
+	tube, gen := sf.tube, sf.tubeGen
+	sf.tubeMu.Unlock()
+	return tube, gen, ctx
+}
+
+func (sf *subflow) currentTube() (tubeLike, uint32) {
+	sf.tubeMu.Lock()
+	t, gen := sf.tube, sf.tubeGen
+	sf.tubeMu.Unlock()
+	return t, gen
+}
+
+func (sf *subflow) loadTube() tubeLike {
+	t, _ := sf.currentTube()
+	return t
+}
+
+func (sf *subflow) cancelRead() {
+	sf.tubeMu.Lock()
+	cancel := sf.readCancel
+	sf.tubeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (sf *subflow) swapTube(t tubeLike) {
+	sf.tubeMu.Lock()
+	sf.tube = t
+	sf.tubeGen++
+	cancel := sf.readCancel
+	sf.tubeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (sf *subflow) generation() uint32 {
+	sf.tubeMu.Lock()
+	defer sf.tubeMu.Unlock()
+	return sf.tubeGen
+}
+
+func (sf *subflow) maxMessageSize() int {
+	tube := sf.loadTube()
+	if tube == nil {
+		return 0
+	}
+	return tube.MaxMessageSize()
+}
+
+func (sf *subflow) fits(chunkSize int) bool {
+	if chunkSize <= 0 {
+		return true
+	}
+	max := sf.maxMessageSize()
+	if max <= 0 {
+		return true
+	}
+	return chunkSize+frameHeaderSize <= max
 }
 
 func newScheduler(names []string, tubes []tubeLike) *scheduler {
@@ -257,6 +402,13 @@ func (s *scheduler) MarkDead(sf *subflow, _ error) {
 	if backoff > 10*time.Second {
 		backoff = 10 * time.Second
 	}
+	if !sf.confirmed.Load() {
+
+		backoff = warmupRetryBackoff << shift
+		if backoff > maxWarmupRetryBackoff {
+			backoff = maxWarmupRetryBackoff
+		}
+	}
 	sf.deadUntil.Store(time.Now().Add(backoff).UnixNano())
 }
 
@@ -264,6 +416,16 @@ func (s *scheduler) MarkAlive(sf *subflow) {
 	sf.errorCount.Store(0)
 	sf.deadUntil.Store(0)
 	sf.confirmed.Store(true)
+	sf.reviveBackoff.Store(0)
+	sf.reviveAt.Store(0)
+}
+
+func (s *scheduler) MarkGone(sf *subflow) {
+	if sf == nil {
+		return
+	}
+	sf.deadUntil.Store(time.Now().Add(time.Hour).UnixNano())
+	sf.confirmed.Store(false)
 }
 
 func (s *scheduler) pickNonFull(exclude *subflow, preferConfirmed bool) *subflow {
@@ -275,16 +437,17 @@ func (s *scheduler) pickAlive(exclude map[*subflow]struct{}) *subflow {
 }
 
 func (s *scheduler) pick(skipOne *subflow, skipSet map[*subflow]struct{}, preferConfirmed bool) *subflow {
-	if len(s.subflows) == 0 {
+	subs := s.list()
+	if len(subs) == 0 {
 		return nil
 	}
 	start := int(s.cursor.Add(1) - 1)
 	if preferConfirmed {
-		if sf := s.scan(start, skipOne, skipSet, scanConfirmed); sf != nil {
+		if sf := s.scan(subs, start, skipOne, skipSet, scanConfirmed); sf != nil {
 			return sf
 		}
 	}
-	return s.scan(start, skipOne, skipSet, scanAny)
+	return s.scan(subs, start, skipOne, skipSet, scanAny)
 }
 
 type scanFilter uint8
@@ -292,12 +455,14 @@ type scanFilter uint8
 const (
 	scanAny scanFilter = iota
 	scanConfirmed
+	scanMeasured
 )
 
-func (s *scheduler) scan(start int, skipOne *subflow, skipSet map[*subflow]struct{}, filter scanFilter) *subflow {
-	now := time.Now().UnixNano()
-	for i := 0; i < len(s.subflows); i++ {
-		sf := s.subflows[(start+i)%len(s.subflows)]
+func (s *scheduler) scan(subs []*subflow, start int, skipOne *subflow, skipSet map[*subflow]struct{}, filter scanFilter) *subflow {
+	now := time.Now()
+	nowNs := now.UnixNano()
+	for i := 0; i < len(subs); i++ {
+		sf := subs[(start+i)%len(subs)]
 		if sf == skipOne {
 			continue
 		}
@@ -306,11 +471,16 @@ func (s *scheduler) scan(start int, skipOne *subflow, skipSet map[*subflow]struc
 				continue
 			}
 		}
-		if sf.deadUntil.Load() > now {
+		if sf.deadUntil.Load() > nowNs {
 			continue
 		}
 		if filter == scanConfirmed && !sf.confirmed.Load() {
 			continue
+		}
+		if filter == scanMeasured {
+			if _, _, _, samples := sf.metrics.rttStats(now); samples == 0 {
+				continue
+			}
 		}
 		if len(sf.queue) >= cap(sf.queue) {
 			continue
@@ -360,7 +530,7 @@ func (s *scheduler) expectedNackDelay(sf *subflow) (time.Duration, bool) {
 	}
 	fastSRTT := srtt
 	nowNs := now.UnixNano()
-	for _, cand := range s.subflows {
+	for _, cand := range s.list() {
 		if cand.deadUntil.Load() > nowNs {
 			continue
 		}
@@ -376,7 +546,7 @@ func (s *scheduler) totalBandwidthAndActiveMaxRTT() (totalBW float64, activeMaxR
 	now := time.Now()
 	nowNs := now.UnixNano()
 	var maxAllRTT time.Duration
-	for _, sf := range s.subflows {
+	for _, sf := range s.list() {
 		if sf.deadUntil.Load() > nowNs {
 			continue
 		}
@@ -408,38 +578,62 @@ func (s *scheduler) totalBandwidthAndActiveMaxRTT() (totalBW float64, activeMaxR
 }
 
 func (s *scheduler) pickDelayAware(chunkSize, maxReorder int, preferConfirmed bool) *subflow {
-	if len(s.subflows) == 0 {
+	subs := s.list()
+	if len(subs) == 0 {
 		return nil
 	}
 	now := time.Now()
 	nowNs := now.UnixNano()
 
+	measured := hasMeasuredSubflow(subs, now, nowNs)
+
 	if preferConfirmed {
-		if sf := s.pickDelayAwarePass(now, nowNs, chunkSize, maxReorder, scanConfirmed); sf != nil {
+
+		if sf := s.pickDelayAwarePass(subs, now, nowNs, chunkSize, maxReorder, scanConfirmed, measured); sf != nil {
+			return sf
+		}
+		if sf := s.pickDelayAwarePass(subs, now, nowNs, chunkSize, maxReorder, scanMeasured, measured); sf != nil {
 			return sf
 		}
 	}
-	return s.pickDelayAwarePass(now, nowNs, chunkSize, maxReorder, scanAny)
+	if sf := s.pickDelayAwarePass(subs, now, nowNs, chunkSize, maxReorder, scanAny, measured); sf != nil {
+		return sf
+	}
+
+	return nil
 }
 
-func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, maxReorder int, filter scanFilter) *subflow {
+func hasMeasuredSubflow(subs []*subflow, now time.Time, nowNs int64) bool {
+	for _, sf := range subs {
+		if sf.deadUntil.Load() > nowNs {
+			continue
+		}
+		if _, _, _, samples := sf.metrics.rttStats(now); samples > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *scheduler) pickDelayAwarePass(subs []*subflow, now time.Time, nowNs int64, chunkSize, maxReorder int, filter scanFilter, excludeUnmeasured bool) *subflow {
 	if chunkSize <= 0 {
 		chunkSize = 1024
 	}
 	type candInfo struct {
-		sf      *subflow
-		arrival float64
-		bw      float64
-		srtt    time.Duration
-		capped  bool
+		sf       *subflow
+		arrival  float64
+		bw       float64
+		srtt     time.Duration
+		capped   bool
+		measured bool
 	}
 
-	cands := make([]candInfo, 0, len(s.subflows))
+	cands := make([]candInfo, 0, len(subs))
 	var totalBW float64
 	minArrival := math.MaxFloat64
 
 	var fastSRTT time.Duration
-	for _, sf := range s.subflows {
+	for _, sf := range subs {
 		if sf.deadUntil.Load() > nowNs {
 			continue
 		}
@@ -449,7 +643,7 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 		}
 	}
 
-	for _, sf := range s.subflows {
+	for _, sf := range subs {
 		if sf.deadUntil.Load() > nowNs {
 			continue
 		}
@@ -459,8 +653,14 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 		if len(sf.queue) >= cap(sf.queue) {
 			continue
 		}
+		if !sf.fits(chunkSize) {
+			continue
+		}
 
 		srtt, rttvar, minRTT, rttSamples := sf.metrics.rttStats(now)
+		if (filter == scanMeasured || excludeUnmeasured) && rttSamples == 0 {
+			continue
+		}
 		bw, bwSamples := sf.metrics.bandwidth(now)
 		totalBW += bw
 
@@ -485,7 +685,7 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 			if float64(totalOutstanding) >= capBytes {
 				capped = true
 			}
-		} else if len(s.subflows) > 1 {
+		} else if len(subs) > 1 {
 
 			if float64(totalOutstanding) >= minCap {
 				capped = true
@@ -504,16 +704,25 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 		}
 
 		cands = append(cands, candInfo{
-			sf:      sf,
-			arrival: arrival,
-			bw:      bw,
-			srtt:    srtt,
-			capped:  capped,
+			sf:       sf,
+			arrival:  arrival,
+			bw:       bw,
+			srtt:     srtt,
+			capped:   capped,
+			measured: rttSamples > 0,
 		})
 	}
 
 	if len(cands) == 0 {
 		return nil
+	}
+
+	fastestOpen := false
+	for _, c := range cands {
+		if !c.capped && c.arrival <= minArrival+1e-6 {
+			fastestOpen = true
+			break
+		}
 	}
 
 	bestIdx := -1
@@ -525,13 +734,17 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 		if c.capped {
 			continue
 		}
+		deltaT := c.arrival - minArrival
+
+		if fastestOpen && deltaT > slowArrivalSkew.Seconds() {
+			continue
+		}
 		if maxReorder > 0 && len(cands) > 1 {
-			deltaT := c.arrival - minArrival
 			otherBW := totalBW - c.bw
 			if deltaT > 0 && otherBW > 0 {
 				estReorderChunks := (deltaT * otherBW) / float64(chunkSize)
 				if estReorderChunks > float64(maxReorder)*reorderGuardRatio {
-					if c.sf.inflightBytes.Load() > 0 || c.sf.queuedBytes.Load() > 0 {
+					if c.sf.inflightBytes.Load() > 0 || c.sf.queuedBytes.Load() > 0 || (deltaT > 0.25 && minArrival < 0.1) {
 						continue
 					}
 				}
@@ -547,29 +760,25 @@ func (s *scheduler) pickDelayAwarePass(now time.Time, nowNs int64, chunkSize, ma
 		return cands[bestIdx].sf
 	}
 
-	anyMeasured := false
-	for _, c := range cands {
-		_, _, _, rttN := c.sf.metrics.rttStats(now)
-		_, bwN := c.sf.metrics.bandwidth(now)
-		if rttN > 0 || bwN > 0 {
-			anyMeasured = true
-			break
+	var openBest *candInfo
+	for i := range cands {
+		c := &cands[i]
+		if c.capped {
+			continue
+		}
+		if openBest == nil || c.arrival < openBest.arrival {
+			openBest = c
 		}
 	}
-	if !anyMeasured {
-		return cands[start].sf
-	}
-	for offset := 0; offset < len(cands); offset++ {
-		idx := (start + offset) % len(cands)
-		if cands[idx].sf.inflightBytes.Load() == 0 && cands[idx].sf.queuedBytes.Load() == 0 {
-			return cands[idx].sf
-		}
+	if openBest != nil {
+		return openBest.sf
 	}
 	return nil
 }
 
 func (s *scheduler) pickFastest(exclude *subflow) *subflow {
-	if len(s.subflows) == 0 {
+	subs := s.list()
+	if len(subs) == 0 {
 		return nil
 	}
 	now := time.Now()
@@ -577,7 +786,7 @@ func (s *scheduler) pickFastest(exclude *subflow) *subflow {
 	for pass := 0; pass < 2; pass++ {
 		var best *subflow
 		var bestRTT time.Duration
-		for _, sf := range s.subflows {
+		for _, sf := range subs {
 			if sf == exclude {
 				continue
 			}
@@ -600,18 +809,55 @@ func (s *scheduler) pickFastest(exclude *subflow) *subflow {
 	return nil
 }
 
+func (s *scheduler) pickFastestFitting(chunkSize int) *subflow {
+	subs := s.list()
+	if len(subs) == 0 {
+		return nil
+	}
+	now := time.Now()
+	nowNs := now.UnixNano()
+	for pass := 0; pass < 2; pass++ {
+		var best *subflow
+		var bestRTT time.Duration
+		for _, sf := range subs {
+			if sf.deadUntil.Load() > nowNs {
+				continue
+			}
+			if pass == 0 && !sf.confirmed.Load() {
+				continue
+			}
+			if len(sf.queue) >= cap(sf.queue) {
+				continue
+			}
+			if !sf.fits(chunkSize) {
+				continue
+			}
+			srtt, _, _, _ := sf.metrics.rttStats(now)
+			if best == nil || srtt < bestRTT {
+				best = sf
+				bestRTT = srtt
+			}
+		}
+		if best != nil {
+			return best
+		}
+	}
+	return nil
+}
+
 func (s *scheduler) pickControl() *subflow {
 	if sf := s.pickFastest(nil); sf != nil {
 		return sf
 	}
-	if len(s.subflows) == 0 {
+	subs := s.list()
+	if len(subs) == 0 {
 		return nil
 	}
 	start := int(s.cursor.Add(1) - 1)
 	now := time.Now().UnixNano()
 	for pass := 0; pass < 2; pass++ {
-		for i := 0; i < len(s.subflows); i++ {
-			sf := s.subflows[(start+i)%len(s.subflows)]
+		for i := 0; i < len(subs); i++ {
+			sf := subs[(start+i)%len(subs)]
 			if sf.deadUntil.Load() > now {
 				continue
 			}
@@ -629,7 +875,7 @@ func (s *scheduler) isDead(sf *subflow) bool {
 }
 
 func (s *scheduler) empty() bool {
-	for _, sf := range s.subflows {
+	for _, sf := range s.list() {
 		if len(sf.queue) > 0 || sf.inflight.Load() > 0 {
 			return false
 		}
@@ -638,8 +884,12 @@ func (s *scheduler) empty() bool {
 }
 
 func (s *scheduler) allDead() bool {
+	subs := s.list()
+	if len(subs) == 0 {
+		return true
+	}
 	now := time.Now().UnixNano()
-	for _, sf := range s.subflows {
+	for _, sf := range subs {
 		if sf.deadUntil.Load() <= now {
 			return false
 		}
@@ -664,8 +914,9 @@ type SubflowSnapshot struct {
 func (s *scheduler) Snapshot() []SubflowSnapshot {
 	now := time.Now()
 	nowNs := now.UnixNano()
-	out := make([]SubflowSnapshot, 0, len(s.subflows))
-	for _, sf := range s.subflows {
+	subs := s.list()
+	out := make([]SubflowSnapshot, 0, len(subs))
+	for _, sf := range subs {
 		srtt, rttvar, _, samples := sf.metrics.rttStats(now)
 		if samples == 0 {
 			srtt = 0

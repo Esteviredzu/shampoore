@@ -37,6 +37,8 @@ func TestTransportRestartsWithSingleWarmup(t *testing.T) {
 
 	tr := newTestTransport(srv.URL, true)
 
+	tr.warmupPaths = []string{"/"}
+
 	waitActive := func(want int32) {
 		t.Helper()
 		deadline := time.Now().Add(3 * time.Second)
@@ -53,15 +55,24 @@ func TestTransportRestartsWithSingleWarmup(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
+	waitWarmup := func() int32 {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for warmupHits.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return warmupHits.Load()
+	}
 
 	cancel := startTransport(t, tr)
 	waitActive(1)
 	if err := tr.Send(context.Background(), []byte("first")); err != nil {
 		t.Fatalf("send on first run: %v", err)
 	}
-	firstWarmup := warmupHits.Load()
+
+	firstWarmup := waitWarmup()
 	if firstWarmup == 0 {
-		t.Fatal("pre-flight warmup did not run on the first dial")
+		t.Fatal("warmup did not run on the first dial")
 	}
 	cancel()
 	stopWithTimeout(t, tr)

@@ -367,7 +367,8 @@ func build(
 		if err != nil {
 			return nil, fmt.Errorf("jellyfin: wrap encryption: %w", err)
 		}
-		tr = notifyTransport{Transport: secured, notify: client.NotifyNetworkChanged}
+
+		tr = &notifyTransport{Transport: secured, notify: client.NotifyNetworkChanged}
 		logger.Info("jellyfin: XChaCha20-Poly1305 encryption enabled")
 	}
 	logger.Info("jellyfin: client ready (url=", cfg.URL, " user=", cfg.UserID,

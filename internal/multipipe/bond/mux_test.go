@@ -3,7 +3,6 @@ package bond
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -178,6 +177,13 @@ func TestMuxStartsSubflowsConcurrently(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Mux.Start did not return after every subflow was released")
 	}
+
+	waitFor(t, 3*time.Second, "all subflows joined the pool", func() bool {
+		mux.mu.Lock()
+		session := mux.session
+		mux.mu.Unlock()
+		return session != nil && session.tubeCount() == len(names)
+	})
 	for _, path := range paths {
 		if !path.wasStarted() {
 			t.Fatal("a subflow was not marked as started")
@@ -191,7 +197,7 @@ func TestMuxStartsSubflowsConcurrently(t *testing.T) {
 	}
 }
 
-func TestMuxStartFailureStopsStartedSubflows(t *testing.T) {
+func TestMuxStartFailureKeepsLiveSubflows(t *testing.T) {
 	ok := newBarrierTransport(nil)
 	bad := newBarrierTransport(errors.New("boom"))
 	mux, err := NewMux(
@@ -223,13 +229,65 @@ func TestMuxStartFailureStopsStartedSubflows(t *testing.T) {
 
 	select {
 	case err := <-started:
-		if err == nil || !strings.Contains(err.Error(), "start transport 1-b") {
-			t.Fatalf("start error = %v, want a start transport 1-b failure", err)
+		if err != nil {
+			t.Fatalf("one failed transport must not abort the bond: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Mux.Start did not return after a subflow failed")
+		t.Fatal("Mux.Start did not return")
+	}
+	waitFor(t, 2*time.Second, "the failed transport was stopped", func() bool { return bad.wasStopped() })
+	if !ok.wasStarted() {
+		t.Fatal("the live subflow was not started")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := mux.Stop(stopCtx); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 	if !ok.wasStopped() {
-		t.Fatal("an already started subflow was not stopped after a start failure")
+		t.Fatal("the live subflow was not stopped")
+	}
+}
+
+func TestMuxStartAllFailReturnsError(t *testing.T) {
+	a := newBarrierTransport(errors.New("a-broke"))
+	b := newBarrierTransport(errors.New("b-broke"))
+	mux, err := NewMux(
+		[]transport.Transport{a, b},
+		[]string{"0-a", "1-b"},
+		testLogger{},
+	)
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := make(chan error, 1)
+	go func() { started <- mux.Start(ctx) }()
+
+	for _, path := range []*barrierTransport{a, b} {
+		select {
+		case <-path.entered:
+		case <-time.After(2 * time.Second):
+			a.unblock()
+			b.unblock()
+			t.Fatal("a subflow did not enter Start")
+		}
+	}
+	a.unblock()
+	b.unblock()
+
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("Start returned nil when every subflow failed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Mux.Start did not return")
+	}
+	if !a.wasStopped() || !b.wasStopped() {
+		t.Fatal("failed transports were not stopped")
 	}
 }

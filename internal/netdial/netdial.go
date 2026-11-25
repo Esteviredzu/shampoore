@@ -16,6 +16,8 @@ const (
 	resolveTimeout   = 5 * time.Second
 	idleConnTimeout  = 90 * time.Second
 	tlsHandshakeTime = 10 * time.Second
+
+	happyEyeballsDelay = 250 * time.Millisecond
 )
 
 type Protector func(fd int) bool
@@ -53,8 +55,9 @@ func Control(_, _ string, c syscall.RawConn) error {
 
 func DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	d := net.Dialer{
-		Timeout: dialTimeout,
-		Control: Control,
+		Timeout:       dialTimeout,
+		FallbackDelay: happyEyeballsDelay,
+		Control:       Control,
 	}
 	return d.DialContext(ctx, network, address)
 }

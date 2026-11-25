@@ -121,12 +121,13 @@ func Default() Config {
 			WriteTimeoutMs: 10000,
 		},
 		Lifecycle: Lifecycle{
-			WarmupMinMs:     60,
-			WarmupMaxMs:     250,
-			RotationMinMs:   15 * 60 * 1000,
-			RotationMaxMs:   35 * 60 * 1000,
-			ReconnectBaseMs: 2000,
-			ReconnectMaxMs:  30000,
+			WarmupMinMs:   60,
+			WarmupMaxMs:   250,
+			RotationMinMs: 15 * 60 * 1000,
+			RotationMaxMs: 35 * 60 * 1000,
+
+			ReconnectBaseMs: 250,
+			ReconnectMaxMs:  700,
 			RotateIdleMs:    2000,
 		},
 		Decoy: Decoy{
