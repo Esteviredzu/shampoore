@@ -418,3 +418,35 @@ func TestMultiServerWaitingRoomSurvivesEmptyRoom(t *testing.T) {
 	default:
 	}
 }
+
+func TestMultiServerReplacesStaleSessionAndRebuilds(t *testing.T) {
+	registry := newSubscriptionRegistry(t, auth.UserSpec{UserID: "alice", Enabled: true})
+	server, dialer, _ := newTestMultiServer(t, Config{IdleTimeoutMs: 60_000}, registry)
+	server.syncInterval = 20 * time.Millisecond
+	startTestMultiServer(t, server)
+	waitForSessionCount(t, server, 1)
+
+	room := RoomForUser(server.cfg.RoomPrefix, "alice")
+
+	for cycle := 0; cycle < 3; cycle++ {
+		before := dialer.count()
+		session, err := server.openSession(context.Background(), room, "alice", "")
+		if err != nil {
+			t.Fatalf("cycle %d: open session over a live one: %v", cycle, err)
+		}
+		if session == nil {
+			t.Fatalf("cycle %d: nil session", cycle)
+		}
+		waitForCondition(t, 3*time.Second, "new room join", func() bool {
+			return dialer.count() > before
+		})
+		waitForSessionCount(t, server, 1)
+	}
+
+	joins := dialer.count()
+	dialer.last().events.OnDisconnected()
+	waitForCondition(t, 5*time.Second, "session rebuilt after the room disconnected", func() bool {
+		return dialer.count() > joins
+	})
+	waitForSessionCount(t, server, 1)
+}

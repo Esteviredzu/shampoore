@@ -3,6 +3,7 @@ package jellyfin
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -254,5 +255,50 @@ func TestBrokerListenAndFallback(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "upstream-ok") {
 		t.Fatalf("fallback response: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+func TestPairE2ERepeatedClientReconnects(t *testing.T) {
+	broker, front, httpClient := newRelayBrokerFront(t, "")
+	registry := testRegistry(t, "alice")
+	exitSrv := newExitServer(t, front.URL, registry, httpClient)
+	exitSrv.muxCfg.PingInterval = 25 * time.Millisecond
+	exitSrv.muxCfg.PingTimeout = 300 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	startExitServer(t, ctx, exitSrv, echoStreams)
+	waitForPair(t, broker, 1)
+
+	base := testConfig()
+	base.URL = front.URL
+	base.Role = "client"
+	base.UserID = "alice"
+
+	for cycle := 0; cycle < 3; cycle++ {
+		exitSrv.mu.Lock()
+		session := exitSrv.sessions["alice"]
+		exitSrv.mu.Unlock()
+		if session == nil {
+			t.Fatalf("cycle %d: exit session is missing", cycle)
+		}
+		before := session.currentMux()
+
+		raw, mux := startMux(t, base, testExitNodeID, httpClient, testPipeSecret)
+		waitForPair(t, broker, 2)
+		roundTrip(t, ctx, mux, []byte(fmt.Sprintf("jellyfin-cycle-%d", cycle)))
+
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := mux.Stop(stopCtx)
+		stopCancel()
+		if err != nil {
+			t.Fatalf("cycle %d: stop client mux: %v", cycle, err)
+		}
+		_ = raw.Stop(context.Background())
+
+		waitUntil(t, 20*time.Second, "exit session rebuilt after the client drop", func() bool {
+			now := session.currentMux()
+			return now != nil && now != before
+		})
 	}
 }

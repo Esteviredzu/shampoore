@@ -838,6 +838,11 @@ func isBenignFlushError(err error) bool {
 func (m *TunnelMultiplexer) AcceptStream(
 	ctx context.Context,
 ) (multiplexing.Stream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	done := m.Done()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -846,6 +851,20 @@ func (m *TunnelMultiplexer) AcceptStream(
 			return nil, io.EOF
 		}
 		return s, nil
+	case <-done:
+
+		select {
+		case s, ok := <-m.incoming:
+			if ok {
+				return s, nil
+			}
+			return nil, io.EOF
+		default:
+		}
+		if m.failed.Load() {
+			return nil, fmt.Errorf("%w: tunnel: session is dead", transport.ErrTransportReset)
+		}
+		return nil, io.EOF
 	}
 }
 

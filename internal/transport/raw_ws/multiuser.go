@@ -12,6 +12,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing/tunnel"
+	"github.com/Esteviredzu/shampoore/internal/transport"
 )
 
 const sessionRetryDelay = time.Second
@@ -214,16 +215,20 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 	session := &multiSession{userID: userID, cancel: cancel}
 
 	m.mu.Lock()
-	if !m.started || m.sessions[userID] != nil {
+	if !m.started {
 		m.mu.Unlock()
 		cancel()
 		return
 	}
-	handler := m.handler
-	exitNodeID := m.exitNodeID
+	stale := m.sessions[userID]
 	m.sessions[userID] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
+
+	if stale != nil && stale != session {
+		m.logger.Info("raw_ws: replacing stale user session ", userID)
+		stale.cancel()
+	}
 
 	m.logger.Info("raw_ws: starting user session ", userID, " (room=",
 		roomForUser(m.cfg.Room, userID), ")")
@@ -239,10 +244,24 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 			cancel()
 		}()
 
+		waitRetry := func() bool {
+			select {
+			case <-sessionCtx.Done():
+				return false
+			case <-time.After(sessionRetryDelay):
+				return true
+			}
+		}
+
 		for {
 			if sessionCtx.Err() != nil {
 				return
 			}
+
+			m.mu.Lock()
+			handler := m.handler
+			exitNodeID := m.exitNodeID
+			m.mu.Unlock()
 
 			cfg := m.cfg
 			cfg.UserID = userID
@@ -264,26 +283,25 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 					if sessionCtx.Err() != nil {
 						return
 					}
-
-					select {
-					case <-sessionCtx.Done():
+					if !waitRetry() {
 						return
-					case <-time.After(sessionRetryDelay):
 					}
 					continue
 				}
 			}
 
 			muxCfg := m.muxCfg
-
 			muxCfg.UserID = userID
 			muxCfg.ExitNodeID = exitNodeID
 			muxCfg.Registry = m.registry
 			mux := tunnel.New(tr, m.logger, muxCfg)
 
 			if handler == nil {
-				handler = func(ctx context.Context, _ multiplexing.StreamMultiplexer) error {
-					<-ctx.Done()
+				handler = func(ctx context.Context, mux multiplexing.StreamMultiplexer) error {
+					select {
+					case <-ctx.Done():
+					case <-multiplexerDone(mux):
+					}
 					return ctx.Err()
 				}
 			}
@@ -292,17 +310,49 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 				if sessionCtx.Err() == nil {
 					m.logger.Warn("raw_ws: user ", userID, " mux start: ", err)
 				}
-				return
+				stopTransport(tr, 5*time.Second)
+				if !waitRetry() {
+					return
+				}
+				continue
 			}
 			if err := handler(sessionCtx, mux); err != nil && sessionCtx.Err() == nil {
 				m.logger.Warn("raw_ws: user ", userID, " session: ", err)
 			}
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := mux.Stop(stopCtx); err != nil {
-				m.logger.Debug("raw_ws: user ", userID, " mux stop: ", err)
+			stopMultiplexer(mux, 5*time.Second, m.logger, "raw_ws: user "+userID)
+			if sessionCtx.Err() != nil {
+				return
 			}
-			stopCancel()
-			return
+			if !waitRetry() {
+				return
+			}
 		}
 	}()
+}
+
+func multiplexerDone(mux multiplexing.StreamMultiplexer) <-chan struct{} {
+	if m, ok := mux.(interface{ Done() <-chan struct{} }); ok {
+		return m.Done()
+	}
+	return nil
+}
+
+func stopTransport(tr transport.Transport, timeout time.Duration) {
+	if tr == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = tr.Stop(stopCtx)
+}
+
+func stopMultiplexer(mux multiplexing.StreamMultiplexer, timeout time.Duration, logger logging.ContextLogger, prefix string) {
+	if mux == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := mux.Stop(stopCtx); err != nil && logger != nil {
+		logger.Debug(prefix, " mux stop: ", err)
+	}
 }

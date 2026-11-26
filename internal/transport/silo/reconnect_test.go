@@ -3,6 +3,7 @@ package silo
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -199,6 +200,70 @@ func TestSiloReconnectAcceptsSecondClient(t *testing.T) {
 	waitUntil(t, 15*time.Second, "stale responses purged", func() bool {
 		return server.Count(cfg.Bucket, s2cPrefix(reconnectTunnelID, "alice")) == 0
 	})
+}
+
+func TestSiloReconnectSurvivesRepeatedClientDrops(t *testing.T) {
+	prevRescan := idleRescanInterval
+	idleRescanInterval = 200 * time.Millisecond
+	prevRetry := sessionRetryDelay
+	sessionRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() {
+		idleRescanInterval = prevRescan
+		sessionRetryDelay = prevRetry
+	})
+
+	server := s3test.New(t)
+	cfg := s3SiloConfig(server.Endpoint(), "")
+	cfg.Multiuser = true
+	store := newS3Store(t, cfg)
+
+	registry := e2eRegistry(t, "alice")
+	multi := newMultiServer(cfg, testLogger{}, registry, reconnectPassword, store, app.Values{
+		"mux_flush_ms":        5,
+		"mux_flush_threshold": 12000,
+	})
+	multi.SetExitNodeID("42")
+	multi.SetSessionHandler(echoAllStreams)
+
+	multi.muxCfg.PingInterval = 25 * time.Millisecond
+	multi.muxCfg.PingTimeout = 300 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := multi.Start(ctx); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = multi.Stop(stopCtx)
+	})
+	waitUntil(t, 10*time.Second, "server session", func() bool { return multi.sessionCount() == 1 })
+
+	for cycle := 0; cycle < 3; cycle++ {
+		multi.mu.Lock()
+		session := multi.sessions["alice"]
+		multi.mu.Unlock()
+		if session == nil {
+			t.Fatalf("cycle %d: alice session is missing", cycle)
+		}
+		before := session.currentMux()
+
+		client := newSiloClientMux(t, server, "alice")
+		roundTripStream(t, client, []byte(fmt.Sprintf("cycle-%d-payload", cycle)), 30*time.Second)
+
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Stop(stopCtx)
+		stopCancel()
+		if err != nil {
+			t.Fatalf("cycle %d: client stop: %v", cycle, err)
+		}
+
+		waitUntil(t, 15*time.Second, "exit session rebuilt after the drop", func() bool {
+			now := session.currentMux()
+			return now != nil && now != before
+		})
+	}
 }
 
 func TestSiloSmallReplyIsNotHeldForMinBatch(t *testing.T) {

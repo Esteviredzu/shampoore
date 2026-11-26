@@ -282,6 +282,38 @@ func TestPairBrokerResumesAfterExitReconnect(t *testing.T) {
 		t.Fatalf("client saw %d server session restarts after the exit reconnected", got)
 	}
 }
+func TestPairBrokerRepeatedClientReconnectsKeepExitAlive(t *testing.T) {
+	broker, srv, httpClient := newPairHarness(t, nil)
+	exitLog := &restartCountingLogger{}
+	exit := newPairPeerWithLogger(t, srv, httpClient, RoleExit, "alice", exitLog)
+	waitPairReady(t, broker, 1, 1)
+
+	for cycle := 0; cycle < 3; cycle++ {
+		client := newPairPeer(t, srv, httpClient, RoleClient, "alice")
+		waitPairReady(t, broker, 1, 2)
+
+		payload := []byte(fmt.Sprintf("cycle-%d-client", cycle))
+		sendEventually(t, client, payload, 10*time.Second)
+		receiveEventually(t, exit, payload, 10*time.Second)
+
+		reply := []byte(fmt.Sprintf("cycle-%d-exit", cycle))
+		sendEventually(t, exit, reply, 10*time.Second)
+		receiveEventually(t, client, reply, 10*time.Second)
+
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Stop(stopCtx)
+		stopCancel()
+		if err != nil {
+			t.Fatalf("cycle %d: stop client: %v", cycle, err)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got := exitLog.restartCount(); got != 0 {
+		t.Fatalf("exit saw %d server session restarts across reconnects", got)
+	}
+}
 
 func TestSessionTokenRoleRoundTrip(t *testing.T) {
 	sid, _, err := newSessionID()

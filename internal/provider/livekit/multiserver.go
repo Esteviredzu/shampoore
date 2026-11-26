@@ -542,20 +542,17 @@ func (m *MultiServer) openSession(
 		session.close("server stopped")
 		return nil, errors.New("livekit: session server is not running")
 	}
-	if _, exists := m.sessions[room]; exists {
-		m.mu.Unlock()
-		session.mu.Unlock()
-		stopOwned()
-		_ = pipe.Stop(context.Background())
-		roomConn.Disconnect()
-		cancel()
-		return nil, fmt.Errorf("livekit: room %q is already active", room)
-	}
+	stale := m.sessions[room]
 	handler := m.handler
 	m.sessions[room] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
 	session.mu.Unlock()
+
+	if stale != nil && stale != session {
+		m.logger.Info("livekit: replacing stale session ", room)
+		stale.closeKeepRoom("replaced by a new session")
+	}
 
 	go m.runSessionHandler(session, handler)
 

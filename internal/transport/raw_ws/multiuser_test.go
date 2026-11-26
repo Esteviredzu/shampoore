@@ -3,6 +3,7 @@ package raw_ws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -378,5 +379,116 @@ func TestRawWSConfigUserRoomJSON(t *testing.T) {
 	}
 	if roomForUser(cfg.Room, cfg.UserID) != "base-alice" {
 		t.Fatalf("unexpected room: %q", roomForUser(cfg.Room, cfg.UserID))
+	}
+}
+func drainRelayAccepts(relay *testRelay) {
+	for {
+		select {
+		case <-relay.accept:
+		default:
+			return
+		}
+	}
+}
+
+func waitRelayAccept(t *testing.T, relay *testRelay, room string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case got := <-relay.accept:
+			if got == room {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for the relay to accept room %q", room)
+		}
+	}
+}
+
+func echoRoundTrip(t *testing.T, ctx context.Context, mux *tunnel.TunnelMultiplexer, payload []byte) {
+	t.Helper()
+	stream, err := mux.OpenStream(ctx, map[string]any{"host": "echo", "port": float64(80)})
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer stream.Close()
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("echo mismatch: got %q, want %q", buf, payload)
+	}
+}
+
+func TestMultiServerRestartsUserSessionAfterClientDisconnects(t *testing.T) {
+	relay := newTestRelay()
+	srv := httptest.NewServer(relay)
+	defer srv.Close()
+
+	registry := testUserRegistry(t, "alice")
+	cfg := Config{
+		ServerURL:       srv.URL,
+		Room:            "base",
+		Password:        "secret",
+		AllowInsecureWS: true,
+		Multiuser:       true,
+	}
+	server := newMultiServer(cfg, testLogger{}, registry, app.Values{
+		"mux_flush_ms":        5,
+		"mux_flush_threshold": 12000,
+	})
+	server.muxCfg.PingInterval = 25 * time.Millisecond
+	server.muxCfg.PingTimeout = 400 * time.Millisecond
+	server.SetSessionHandler(echoHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := server.Stop(stopCtx); err != nil {
+			t.Errorf("server stop: %v", err)
+		}
+	}()
+
+	waitUntil(t, 5*time.Second, "initial exit join", func() bool {
+		return relay.roomSize("base-alice") == 1
+	})
+
+	for cycle := 0; cycle < 3; cycle++ {
+		client := multiuserClient(t, srv.URL, "base", "alice")
+		if err := client.Start(ctx); err != nil {
+			t.Fatalf("cycle %d: client start: %v", cycle, err)
+		}
+		waitUntil(t, 5*time.Second, "client join", func() bool {
+			return relay.roomSize("base-alice") >= 2
+		})
+
+		echoRoundTrip(t, ctx, client, []byte(fmt.Sprintf("cycle-%d-payload", cycle)))
+
+		drainRelayAccepts(relay)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Stop(stopCtx)
+		stopCancel()
+		if err != nil {
+			t.Fatalf("cycle %d: client stop: %v", cycle, err)
+		}
+		waitUntil(t, 5*time.Second, "client leave", func() bool {
+			return relay.roomSize("base-alice") == 1
+		})
+
+		waitRelayAccept(t, relay, "base-alice", 10*time.Second)
+		waitUntil(t, 5*time.Second, "restarted exit join", func() bool {
+			return relay.roomSize("base-alice") == 1
+		})
+		time.Sleep(50 * time.Millisecond)
 	}
 }

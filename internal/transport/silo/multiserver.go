@@ -219,14 +219,20 @@ func (m *MultiServer) startSession(ctx context.Context, userID string) {
 	session := &multiSession{userID: userID, cancel: cancel}
 
 	m.mu.Lock()
-	if !m.started || m.sessions[userID] != nil {
+	if !m.started {
 		m.mu.Unlock()
 		cancel()
 		return
 	}
+	stale := m.sessions[userID]
 	m.sessions[userID] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
+
+	if stale != nil && stale != session {
+		m.logger.Info("silo: replacing stale user session ", userID)
+		stale.cancel()
+	}
 
 	m.logger.Info("silo: starting user session ", userID, " (prefix=", UserPrefix(m.cfg.TunnelID, userID), ")")
 

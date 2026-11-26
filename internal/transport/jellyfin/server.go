@@ -99,13 +99,14 @@ func (s *Server) ensureEngine() (*httpstream.Handler, error) {
 	}
 	profile := profileFor(s.cfg.UTLSProfile)
 	cfg := httpstream.ServerConfig{
-		Secret:           s.cfg.Secret,
-		Namespace:        s.cfg.Namespace,
-		PinnedUserID:     s.cfg.UserID,
-		PinnedExitNodeID: s.exitNodeID,
-		RequireUser:      s.cfg.Multiuser,
-		FallbackHandler:  newFallbackHandler(s.cfg.UpstreamURL, s.logger),
-		Logger:           s.logger,
+		Secret:            s.cfg.Secret,
+		Namespace:         s.cfg.Namespace,
+		PinnedUserID:      s.cfg.UserID,
+		PinnedExitNodeID:  s.exitNodeID,
+		RequireUser:       s.cfg.Multiuser,
+		ReapStaleSessions: true,
+		FallbackHandler:   newFallbackHandler(s.cfg.UpstreamURL, s.logger),
+		Logger:            s.logger,
 
 		DownlinkReplayBytes: profile.DownlinkReplayBytes,
 	}
