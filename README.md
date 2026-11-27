@@ -145,7 +145,7 @@ sudo shampoore-client -c shampoore://... -m tun
 
 ## Android-клиент
 
-[shampoore-android)](https://github.com/Esteviredzu/shampoore-android). Использует `shampoore.aar` из этого репо, работает как VPN-клиент, импортирует конфиги `shampoore://`, поддерживает GeoIP-фильтрацию по списку IP и фильтрацию по приложениям.
+[shampoore-android](https://github.com/Esteviredzu/shampoore-android). Использует `shampoore.aar` из этого репо, работает как VPN-клиент, импортирует конфиги `shampoore://`, поддерживает GeoIP-фильтрацию по списку IP и фильтрацию по приложениям.
 
 ### Android SDK
 
