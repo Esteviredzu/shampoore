@@ -15,7 +15,8 @@ import (
 )
 
 const userColumns = `id, name, sub_token, enabled, expires_at, traffic_limit_bytes,
-	used_upload_bytes, used_download_bytes, allowed_route_ids_json, updated_at`
+	used_upload_bytes, used_download_bytes, allowed_route_ids_json, max_speed_kbps,
+	last_seen_at, last_seen_node, updated_at`
 
 func scanUser(scanner interface{ Scan(...any) error }) (User, error) {
 	var (
@@ -23,15 +24,18 @@ func scanUser(scanner interface{ Scan(...any) error }) (User, error) {
 		enabled    int
 		expires    int64
 		allowedRaw string
+		lastSeen   string
 		updatedRaw string
 	)
 	err := scanner.Scan(&u.ID, &u.Name, &u.SubToken, &enabled, &expires,
-		&u.TrafficLimitBytes, &u.UsedUploadBytes, &u.UsedDownloadBytes, &allowedRaw, &updatedRaw)
+		&u.TrafficLimitBytes, &u.UsedUploadBytes, &u.UsedDownloadBytes, &allowedRaw,
+		&u.MaxSpeedKBps, &lastSeen, &u.LastSeenNode, &updatedRaw)
 	if err != nil {
 		return User{}, err
 	}
 	u.Enabled = enabled != 0
 	u.ExpiresAt = unixExpires(expires)
+	u.LastSeenAt = parseTime(lastSeen)
 	if err := json.Unmarshal([]byte(allowedRaw), &u.AllowedRouteIDs); err != nil {
 		return User{}, fmt.Errorf("panelstore: decode allowed routes: %w", err)
 	}
@@ -74,6 +78,9 @@ func normalizeUser(u *User) error {
 	if u.TrafficLimitBytes < 0 {
 		return invalidf("user %q: traffic limit must not be negative", u.ID)
 	}
+	if u.MaxSpeedKBps < 0 {
+		return invalidf("user %q: speed limit must not be negative", u.ID)
+	}
 	u.AllowedRouteIDs = normalizeAllowedRoutes(u.AllowedRouteIDs)
 	return nil
 }
@@ -94,11 +101,12 @@ func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 	defer s.writeMu.Unlock()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO users
 		(id, name, sub_token, enabled, expires_at, traffic_limit_bytes,
-		 used_upload_bytes, used_download_bytes, allowed_route_ids_json, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 used_upload_bytes, used_download_bytes, allowed_route_ids_json,
+		 max_speed_kbps, last_seen_at, last_seen_node, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?)`,
 		u.ID, u.Name, u.SubToken, boolInt(u.Enabled), expiresUnix(u.ExpiresAt),
 		u.TrafficLimitBytes, u.UsedUploadBytes, u.UsedDownloadBytes,
-		string(allowedRaw), formatTime(now))
+		string(allowedRaw), u.MaxSpeedKBps, formatTime(now))
 	if err != nil {
 		return User{}, wrapDBErr(err, "create user")
 	}
@@ -175,8 +183,13 @@ func (s *Store) UpdateUser(ctx context.Context, u User) (User, error) {
 	}
 	u.UsedUploadBytes = existing.UsedUploadBytes
 	u.UsedDownloadBytes = existing.UsedDownloadBytes
+	u.LastSeenAt = existing.LastSeenAt
+	u.LastSeenNode = existing.LastSeenNode
 	if u.TrafficLimitBytes < 0 {
 		u.TrafficLimitBytes = existing.TrafficLimitBytes
+	}
+	if u.MaxSpeedKBps < 0 {
+		u.MaxSpeedKBps = existing.MaxSpeedKBps
 	}
 	if err := normalizeUser(&u); err != nil {
 		return User{}, err
@@ -192,10 +205,10 @@ func (s *Store) UpdateUser(ctx context.Context, u User) (User, error) {
 	defer s.writeMu.Unlock()
 	res, err := s.db.ExecContext(ctx, `UPDATE users SET
 		name = ?, sub_token = ?, enabled = ?, expires_at = ?, traffic_limit_bytes = ?,
-		allowed_route_ids_json = ?, updated_at = ?
+		max_speed_kbps = ?, allowed_route_ids_json = ?, updated_at = ?
 		WHERE id = ?`,
 		u.Name, u.SubToken, boolInt(u.Enabled), expiresUnix(u.ExpiresAt),
-		u.TrafficLimitBytes, string(allowedRaw), formatTime(time.Now()), u.ID)
+		u.TrafficLimitBytes, u.MaxSpeedKBps, string(allowedRaw), formatTime(time.Now()), u.ID)
 	if err != nil {
 		return User{}, wrapDBErr(err, "update user")
 	}
@@ -291,6 +304,39 @@ func (s *Store) ResetUserTraffic(ctx context.Context, id string) error {
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("%w: user %s", ErrNotFound, normalized)
+	}
+	return nil
+}
+
+func (s *Store) MarkUsersSeen(ctx context.Context, nodeID int64, ids []string, now time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, raw := range ids {
+		id, err := auth.NormalizeUserID(raw)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+	stamp := formatTime(now)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, id := range unique {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE users SET last_seen_at = ?, last_seen_node = ? WHERE id = ?`,
+			stamp, nodeID, id); err != nil {
+			return wrapDBErr(err, "mark user seen")
+		}
 	}
 	return nil
 }

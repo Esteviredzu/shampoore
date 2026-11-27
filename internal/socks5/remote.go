@@ -14,6 +14,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/geofilter"
 	"github.com/Esteviredzu/shampoore/internal/logging"
 	"github.com/Esteviredzu/shampoore/internal/multiplexing"
+	"github.com/Esteviredzu/shampoore/internal/userlimit"
 )
 
 const (
@@ -78,6 +79,9 @@ type RemoteHandler struct {
 	mu      sync.Mutex
 	streams map[multiplexing.Stream]struct{}
 
+	limitMu sync.RWMutex
+	limits  *userlimit.Registry
+
 	probeMu       sync.Mutex
 	lastExitProbe time.Time
 	lastNetProbe  time.Time
@@ -120,6 +124,42 @@ func (s *RemoteHandler) ExitUpstreams() map[string]string {
 		out[id] = raw
 	}
 	return out
+}
+
+func (s *RemoteHandler) SetUserLimiter(reg *userlimit.Registry) {
+	s.limitMu.Lock()
+	s.limits = reg
+	s.limitMu.Unlock()
+}
+
+func (s *RemoteHandler) userLimiter() *userlimit.Registry {
+	s.limitMu.RLock()
+	reg := s.limits
+	s.limitMu.RUnlock()
+	return reg
+}
+
+func (s *RemoteHandler) touchUser(userID string) {
+	if userID == "" {
+		return
+	}
+	if reg := s.userLimiter(); reg != nil {
+		reg.Touch(userID)
+	}
+}
+
+func (s *RemoteHandler) waitUser(ctx context.Context, userID string, n int) bool {
+	if userID == "" || n <= 0 {
+		return true
+	}
+	reg := s.userLimiter()
+	if reg == nil {
+		return true
+	}
+	if err := reg.Wait(ctx, userID, n); err != nil {
+		return false
+	}
+	return true
 }
 
 func (s *RemoteHandler) upstreamFor(exitNodeID string) string {
@@ -332,6 +372,9 @@ func (s *RemoteHandler) handleProbe(stream multiplexing.Stream, probe string) {
 		return
 	}
 
+	userID, _ := s.sessionIdentity()
+	s.touchUser(userID)
+
 	s.probeMu.Lock()
 	now := time.Now()
 	if probe == remoteProbeNet {
@@ -354,12 +397,18 @@ func (s *RemoteHandler) handleProbe(stream multiplexing.Stream, probe string) {
 
 	if probe == remoteProbeNet {
 		reply := s.probeInternet()
+		if !s.waitUser(s.ctx, userID, len(reply)) {
+			return
+		}
 		if _, err := stream.Write([]byte(reply)); err != nil {
 			s.logger.Warn("remote: ", stream.ID(), " net probe write: ", err)
 		}
 		return
 	}
 
+	if !s.waitUser(s.ctx, userID, len(remoteProbeReply)) {
+		return
+	}
 	if _, err := stream.Write([]byte(remoteProbeReply)); err != nil {
 		s.logger.Warn("remote: ", stream.ID(), " probe write: ", err)
 	}
@@ -388,6 +437,9 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		s.handleProbe(stream, probe)
 		return
 	}
+
+	userID, exitNodeID := s.sessionIdentity()
+	s.touchUser(userID)
 
 	host, _ := meta["host"].(string)
 
@@ -427,17 +479,15 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 	}
 
 	if isUDP, _ := meta["udp"].(bool); isUDP {
-		_, exitNodeID := s.sessionIdentity()
 		upstream := s.upstreamFor(exitNodeID)
 		if upstream != "" {
 			s.logger.Info("remote udp: ", streamID, " exit=", exitNodeID, " via ", upstream)
 		}
-		s.handleUDPStream(stream, host, port, upstream)
+		s.handleUDPStream(stream, userID, host, port, upstream)
 		return
 	}
 
 	target := net.JoinHostPort(host, strconv.Itoa(port))
-	_, exitNodeID := s.sessionIdentity()
 	upstream := s.upstreamFor(exitNodeID)
 	if upstream != "" {
 		s.logger.Info("remote: ", streamID, " -> ", target, " exit=", exitNodeID, " via ", upstream)
@@ -503,6 +553,10 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
+				s.touchUser(userID)
+				if !s.waitUser(s.ctx, userID, n) {
+					return
+				}
 				if _, werr := stream.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -520,6 +574,10 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 		for {
 			n, err := stream.Read(buf)
 			if n > 0 {
+				s.touchUser(userID)
+				if !s.waitUser(s.ctx, userID, n) {
+					return
+				}
 				if _, werr := conn.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -535,7 +593,7 @@ func (s *RemoteHandler) handleStream(stream multiplexing.Stream) {
 	<-done
 }
 
-func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string, port int, upstream string) {
+func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, userID, host string, port int, upstream string) {
 	streamID := stream.ID()
 
 	target := net.JoinHostPort(host, strconv.Itoa(port))
@@ -609,6 +667,10 @@ func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string,
 			if _, err := io.ReadFull(stream, buf[:n]); err != nil {
 				return
 			}
+			s.touchUser(userID)
+			if !s.waitUser(s.ctx, userID, n) {
+				return
+			}
 			if _, err := conn.Write(buf[:n]); err != nil {
 				return
 			}
@@ -626,6 +688,10 @@ func (s *RemoteHandler) handleUDPStream(stream multiplexing.Stream, host string,
 			}
 			if n == 0 {
 				continue
+			}
+			s.touchUser(userID)
+			if !s.waitUser(s.ctx, userID, 2+n) {
+				return
 			}
 			binary.BigEndian.PutUint16(out[:2], uint16(n))
 			copy(out[2:], buf[:n])

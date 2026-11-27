@@ -86,6 +86,36 @@ func (c *Client) Usage() ([]manager.UsageEntry, error) {
 	return out, nil
 }
 
+func (c *Client) ActiveUserIDs() ([]string, error) {
+	r, err := c.call(Request{Cmd: "active"})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	if len(r.Data) > 0 {
+		if err := json.Unmarshal(r.Data, &out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) SyncUsers(name string, entry manager.ConfigEntry) (bool, error) {
+	r, err := c.call(Request{Cmd: "sync-users", Name: name, Entry: &entry})
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		Restarted bool `json:"restarted"`
+	}
+	if len(r.Data) > 0 {
+		if err := json.Unmarshal(r.Data, &out); err != nil {
+			return false, err
+		}
+	}
+	return out.Restarted, nil
+}
+
 func (c *Client) Get(name string) (manager.EntryView, error) {
 	r, err := c.call(Request{Cmd: "get", Name: name})
 	if err != nil {

@@ -359,12 +359,15 @@ func (a *API) deleteRoute(w http.ResponseWriter, r *http.Request) {
 
 type userView struct {
 	panelstore.User
+	Online          bool   `json:"online"`
+	CurrentSpeedBPS int64  `json:"current_speed_bps"`
 	SubscriptionURL string `json:"subscription_url,omitempty"`
 	BundleURL       string `json:"bundle_url,omitempty"`
 }
 
 func (a *API) userView(u panelstore.User) userView {
-	view := userView{User: u}
+	now := time.Now()
+	view := userView{User: u, Online: u.Online(now), CurrentSpeedBPS: a.speed.Speed(u.ID, now)}
 	if url := a.currentPublicURL(); url != "" {
 		view.SubscriptionURL = strings.TrimRight(url, "/") + "/sub/" + u.SubToken
 	}
@@ -437,6 +440,7 @@ type userUpdateRequest struct {
 	Enabled           *bool           `json:"enabled"`
 	ExpiresAt         json.RawMessage `json:"expires_at"`
 	TrafficLimitBytes *int64          `json:"traffic_limit_bytes"`
+	MaxSpeedKBps      *int64          `json:"max_speed_kbps"`
 	AllowedRouteIDs   *[]int64        `json:"allowed_route_ids"`
 	RouteIDs          *[]int64        `json:"route_ids"`
 }
@@ -463,6 +467,13 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TrafficLimitBytes != nil {
 		user.TrafficLimitBytes = *req.TrafficLimitBytes
+	}
+	if req.MaxSpeedKBps != nil {
+		if *req.MaxSpeedKBps < 0 {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("max_speed_kbps must not be negative"))
+			return
+		}
+		user.MaxSpeedKBps = *req.MaxSpeedKBps
 	}
 	if len(req.ExpiresAt) > 0 {
 		raw := strings.TrimSpace(string(req.ExpiresAt))

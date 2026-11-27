@@ -29,6 +29,7 @@ func BuildRuntime(
 	rt.StreamMux = res.StreamMux
 	rt.ConnectedIPs = res.ConnectedIPs
 	rt.UserRegistry = res.UserRegistry
+	rt.UserRegistries = res.UserRegistries
 	rt.SessionServer = res.SessionServer
 	rt.MuxConfig = MuxConfig{
 		FlushMs:        eff.Int("mux_flush_ms", 20),

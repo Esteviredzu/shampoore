@@ -149,7 +149,7 @@ func agentEnvFile(node panelstore.Node, panelURL string) File {
 	data := fmt.Sprintf("PANEL_URL=%s\nNODE_ID=%d\nNODE_SECRET=%s\n"+
 		"CONTROL_SOCKET=/run/shampoore/shampoore.sock\n"+
 		"CONFIGS_DIR=/opt/shampoore/configs\n"+
-		"STATE_FILE=/opt/shampoore/state/agent-state.json\nINTERVAL=5s\n",
+		"STATE_FILE=/opt/shampoore/state/agent-state.json\nINTERVAL=2s\n",
 		panelURL, node.ID, node.NodeSecret)
 	return File{Name: "agent.env", Mode: 0o600, Data: []byte(data)}
 }

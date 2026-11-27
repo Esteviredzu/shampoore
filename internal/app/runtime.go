@@ -26,6 +26,8 @@ type Runtime struct {
 
 	UserRegistry *auth.UserRegistry
 
+	UserRegistries []*auth.UserRegistry
+
 	SessionServer SessionServer
 
 	mu      sync.Mutex
@@ -44,6 +46,29 @@ func NewRuntime(
 		BypassHosts:  bypass,
 		sideServices: side,
 	}
+}
+
+func (r *Runtime) Registries() []*auth.UserRegistry {
+	if r == nil {
+		return nil
+	}
+	out := make([]*auth.UserRegistry, 0, len(r.UserRegistries)+1)
+	seen := make(map[*auth.UserRegistry]struct{}, len(r.UserRegistries)+1)
+	add := func(reg *auth.UserRegistry) {
+		if reg == nil {
+			return
+		}
+		if _, ok := seen[reg]; ok {
+			return
+		}
+		seen[reg] = struct{}{}
+		out = append(out, reg)
+	}
+	add(r.UserRegistry)
+	for _, reg := range r.UserRegistries {
+		add(reg)
+	}
+	return out
 }
 
 func (r *Runtime) Start(ctx context.Context) error {

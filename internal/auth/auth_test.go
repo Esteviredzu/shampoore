@@ -147,6 +147,51 @@ func TestAddTrafficConcurrent(t *testing.T) {
 	}
 }
 
+func TestRegistryReplaceAppliesFullUserList(t *testing.T) {
+	r := mustRegistry(t,
+		UserSpec{UserID: "alice", Enabled: true, MaxSpeedKBps: 128},
+		UserSpec{UserID: "bob", Enabled: true},
+	)
+
+	notifications := make(chan struct{}, 8)
+	unsub := r.Subscribe(func() { notifications <- struct{}{} })
+	defer unsub()
+
+	if err := r.Replace([]UserSpec{
+		{UserID: "alice", Enabled: true, MaxSpeedKBps: 2048, AllowedExits: []string{"exit-1"}},
+		{UserID: "carol", Enabled: true},
+	}); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	alice, ok := r.Get("alice")
+	if !ok {
+		t.Fatal("alice missing after replace")
+	}
+	if alice.MaxSpeedKBps != 2048 {
+		t.Fatalf("alice max speed = %d, want 2048", alice.MaxSpeedKBps)
+	}
+	if len(alice.AllowedExits) != 1 || alice.AllowedExits[0] != "exit-1" {
+		t.Fatalf("alice allowed exits = %v", alice.AllowedExits)
+	}
+	if _, ok := r.Get("bob"); ok {
+		t.Fatal("bob was not removed by replace")
+	}
+	if _, ok := r.Get("carol"); !ok {
+		t.Fatal("carol was not added by replace")
+	}
+
+	select {
+	case <-notifications:
+	case <-time.After(time.Second):
+		t.Fatal("replace did not notify subscribers")
+	}
+
+	if err := r.Replace([]UserSpec{{UserID: "bad\x00id", Enabled: true}}); err == nil {
+		t.Fatal("invalid user id was accepted")
+	}
+}
+
 func TestNormalizeUserID(t *testing.T) {
 	if _, err := NormalizeUserID("   "); !errors.Is(err, ErrUserIDRequired) {
 		t.Fatalf("expected empty id error, got %v", err)

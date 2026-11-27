@@ -132,6 +132,28 @@ function formatBytes(bytes) {
   return (val >= 10 ? Math.round(val) : parseFloat(val.toFixed(1))) + sizes[i];
 }
 
+/* Human readable throughput for the live "Online • 1.2 MB/s" badge and the
+   users summary. Zero is rendered as "0 KB/s" on purpose: a connected user
+   with no traffic should still show a unit instead of an empty label. */
+function formatSpeed(bps) {
+  const n = Math.max(0, Number(bps) || 0);
+  if (n === 0) return t('users.speedKBps').replace('{value}', '0');
+  if (n < 1024) return t('users.speedBps').replace('{value}', String(Math.round(n)));
+  const k = 1024;
+  const units = [
+    { div: k, key: 'users.speedKBps' },
+    { div: k * k, key: 'users.speedMBps' },
+    { div: k * k * k, key: 'users.speedGBps' }
+  ];
+  let unit = units[0];
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    if (n >= units[i].div) { unit = units[i]; break; }
+  }
+  const value = n / unit.div;
+  const formatted = value >= 10 ? String(Math.round(value)) : String(parseFloat(value.toFixed(1)));
+  return t(unit.key).replace('{value}', formatted);
+}
+
 async function loadPanelVersion() {
   try {
     const info = await api('/api/system/version');
@@ -143,12 +165,30 @@ async function loadPanelVersion() {
   }
 }
 
+function updateCandidates(info) {
+  return {
+    stable: info && info.latest_stable ? info.latest_stable : null,
+    beta: info && info.latest_beta ? info.latest_beta : null
+  };
+}
+
+function primaryUpdateTag(info) {
+  const { stable, beta } = updateCandidates(info);
+  return (stable && stable.tag_name) || (beta && beta.tag_name) || (info && info.latest_version) || '';
+}
+
+function hasUpdateCandidates(info) {
+  const { stable, beta } = updateCandidates(info);
+  return !!(stable || beta);
+}
+
 function setUpdateBadge(info) {
   const badge = document.getElementById('update-badge');
   const button = document.getElementById('btn-check-updates');
   if (!badge) return;
-  if (info && info.update_available) {
-    badge.textContent = info.latest_version || '';
+  const tag = primaryUpdateTag(info);
+  if (tag && hasUpdateCandidates(info)) {
+    badge.textContent = tag;
     badge.classList.remove('hidden');
     if (button) button.title = t('update.available');
   } else {
@@ -168,7 +208,9 @@ async function checkForUpdates({ silent = false, notifyError = false } = {}) {
     fleet.update = info || null;
     setUpdateBadge(fleet.update);
     if (!silent) {
-      if (info && info.update_available) toast(`${t('update.available')}: ${info.latest_version}`, 'success');
+      const { stable, beta } = updateCandidates(info);
+      if (stable) toast(`${t('update.available')}: ${stable.tag_name}`, 'success');
+      else if (beta) toast(t('update.betaAvailable').replace('{version}', beta.tag_name), 'warning');
       else toast(t('update.upToDate'));
     }
     return fleet.update;
@@ -185,57 +227,142 @@ async function onUpdateButton() {
   if (fleet.updating) return;
   const info = await checkForUpdates({ silent: true, notifyError: true });
   if (!info) return;
-  if (info.update_available) openUpdateDialog(info);
+  if (hasUpdateCandidates(info)) openUpdateDialog(info);
   else toast(t('update.upToDate'));
 }
 
+/* Full SemVer comparison (including prerelease identifiers), so the panel does
+   not reload before a beta restart actually finished: beta.1 < beta.2 < final. */
 function compareSemver(a, b) {
-  const parse = (value) => String(value || '').trim().replace(/^v+/i, '').split(/[+-]/)[0]
-    .split('.').map(part => parseInt(part, 10) || 0);
+  const parse = (value) => {
+    let rest = String(value || '').trim().replace(/^v+/i, '');
+    if (!rest) return null;
+    const plus = rest.indexOf('+');
+    if (plus >= 0) rest = rest.slice(0, plus);
+    let pre = [];
+    const dash = rest.indexOf('-');
+    if (dash >= 0) {
+      pre = rest.slice(dash + 1).split('.').filter(Boolean);
+      rest = rest.slice(0, dash);
+    }
+    const core = rest.split('.').map(part => parseInt(part, 10));
+    if (!core.length || core.some(n => !Number.isFinite(n))) return null;
+    return { core, pre };
+  };
   const left = parse(a);
   const right = parse(b);
-  const length = Math.max(left.length, right.length);
+  if (!left && !right) return 0;
+  if (!left) return -1;
+  if (!right) return 1;
+  const length = Math.max(left.core.length, right.core.length);
   for (let i = 0; i < length; i++) {
-    const l = left[i] || 0;
-    const r = right[i] || 0;
+    const l = left.core[i] || 0;
+    const r = right.core[i] || 0;
     if (l !== r) return l < r ? -1 : 1;
+  }
+  if (!left.pre.length && !right.pre.length) return 0;
+  if (!left.pre.length) return 1;
+  if (!right.pre.length) return -1;
+  const preLength = Math.max(left.pre.length, right.pre.length);
+  for (let i = 0; i < preLength; i++) {
+    const l = left.pre[i];
+    const r = right.pre[i];
+    if (l === undefined) return -1;
+    if (r === undefined) return 1;
+    const lNum = /^\d+$/.test(l) ? parseInt(l, 10) : null;
+    const rNum = /^\d+$/.test(r) ? parseInt(r, 10) : null;
+    if (lNum !== null && rNum !== null) {
+      if (lNum !== rNum) return lNum < rNum ? -1 : 1;
+    } else if (lNum !== null) {
+      return -1;
+    } else if (rNum !== null) {
+      return 1;
+    } else if (l !== r) {
+      return l < r ? -1 : 1;
+    }
   }
   return 0;
 }
 
-function openUpdateDialog(info) {
-  const notes = (info.release_notes || '').trim();
-  const published = info.published_at
-    ? `<div class="update-meta">${esc(t('update.published'))}: ${esc(new Date(info.published_at).toLocaleString())}</div>`
+function updateCandidateSection(candidate, { beta = false } = {}) {
+  const tag = candidate.tag_name || '';
+  const notes = (candidate.release_notes || '').trim();
+  const published = candidate.published_at
+    ? `<div class="update-meta">${esc(t('update.published'))}: ${esc(new Date(candidate.published_at).toLocaleString())}</div>`
     : '';
+  const title = beta ? t('update.betaTitle') : t('update.stableTitle');
+  const warning = beta
+    ? `<div class="update-warning"><span class="material-symbols-rounded">warning</span><span>${esc(t('update.betaWarning'))}</span></div>`
+    : '';
+  const label = beta
+    ? t('update.acceptBetaRisk').replace('{version}', tag)
+    : t('update.updateTo').replace('{version}', tag);
+  const buttonClass = beta ? 'btn--danger' : 'btn--filled';
+  return `
+    <section class="update-option${beta ? ' update-option--beta' : ''}">
+      <div class="update-option__head">
+        <div>
+          <h3 class="update-notes-title">${esc(title)}</h3>
+          <span class="update-version update-version--new">${esc(tag)}</span>
+        </div>
+        <button class="btn ${buttonClass} btn--compact" type="button" data-update-tag="${escAttr(tag)}">
+          <span class="material-symbols-rounded">system_update</span>${esc(label)}
+        </button>
+      </div>
+      ${warning}
+      ${published}
+      <details class="update-notes-wrap"${beta ? '' : ' open'}>
+        <summary>${esc(t('update.notes'))}</summary>
+        <div class="update-notes">${notes ? esc(notes) : esc(t('update.noNotes'))}</div>
+      </details>
+    </section>`;
+}
+
+function openUpdateDialog(info) {
+  const { stable, beta } = updateCandidates(info);
+  const current = info.current_version || fleet.version || '';
+  let body = `
+    <div class="update-summary-line">
+      <span>${esc(t('update.current'))}:</span>
+      <span class="update-version">${esc(current)}</span>
+    </div>`;
+  if (stable) body += updateCandidateSection(stable);
+  if (beta && !stable) body += `<div class="hint">${esc(t('update.stableUpToDate'))}</div>`;
+  if (beta) body += updateCandidateSection(beta, { beta: true });
+  if (!stable && !beta) {
+    body += `<div class="update-up-to-date"><span class="material-symbols-rounded">verified</span><span>${esc(t('update.upToDate'))}</span></div>`;
+  }
+  body += `<div class="hint">${esc(t('update.preserveHint'))}</div>`;
+
   const dialog = openModal({
     title: t('update.title'),
-    body: `
-      <div class="update-summary-line">
-        <span class="update-version">${esc(info.current_version)}</span>
-        <span class="material-symbols-rounded">arrow_forward</span>
-        <span class="update-version update-version--new">${esc(info.latest_version)}</span>
-      </div>
-      ${published}
-      <h3 class="update-notes-title">${esc(t('update.notes'))}</h3>
-      <div class="update-notes">${notes ? esc(notes) : esc(t('update.noNotes'))}</div>
-      <div class="hint">${esc(t('update.preserveHint'))}</div>`,
-    actions: [
-      { kind: 'tonal', label: t('actions.close'), onClick: closeModal },
-      { kind: 'filled', label: t('update.installNow'), onClick: () => runUpdate(dialog, info) }
-    ]
+    body,
+    actions: [{ kind: 'tonal', label: t('actions.close'), onClick: closeModal }]
+  });
+  document.getElementById('modal-root').querySelectorAll('[data-update-tag]').forEach(el => {
+    el.addEventListener('click', () => {
+      const tag = el.dataset.updateTag;
+      const candidate = [stable, beta].find(item => item && item.tag_name === tag);
+      if (candidate) runUpdate(dialog, candidate);
+    });
   });
   return dialog;
 }
 
-async function runUpdate(dialog, info) {
+async function runUpdate(dialog, candidate) {
   if (fleet.updating) return;
   fleet.updating = true;
   const modal = dialog || openModal({ title: t('update.title'), body: '' });
+  const target = (candidate && candidate.tag_name) || '';
   modal.setBody(`<div class="update-progress"><span class="update-spinner"></span><span>${esc(t('update.installing'))}</span></div>`);
   try {
-    const result = await api('/api/system/update', { method: 'POST' });
-    const latest = (result && result.latest_version) || (info && info.latest_version) || '';
+    const opts = { method: 'POST' };
+    if (target) {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify({ tag: target });
+    }
+    const result = await api('/api/system/update', opts);
+    const latest = (result && result.latest_version) || target;
     modal.setBody(`
       <div class="deploy-summary is-ok"><span class="material-symbols-rounded">check_circle</span>${esc(t('update.restarting'))}</div>
       <div class="update-progress"><span class="update-spinner"></span><span>${esc(t('update.waiting'))}</span></div>`);
@@ -1670,6 +1797,8 @@ function applyUserLiveStatus(users) {
   document.querySelectorAll('[data-user-traffic]').forEach(el => trafficEls.set(el.dataset.userTraffic, el));
   const expiryEls = new Map();
   document.querySelectorAll('[data-user-expiry]').forEach(el => expiryEls.set(el.dataset.userExpiry, el));
+  const onlineEls = new Map();
+  document.querySelectorAll('[data-user-online]').forEach(el => onlineEls.set(el.dataset.userOnline, el));
 
   fleet.users.forEach(user => {
     const id = String(user.id);
@@ -1681,6 +1810,9 @@ function applyUserLiveStatus(users) {
       statusEl.textContent = active ? t('users.active') : t('users.inactive');
     }
 
+    const onlineEl = onlineEls.get(id);
+    if (onlineEl) onlineEl.innerHTML = userOnlineBadge(user);
+
     const expiryEl = expiryEls.get(id);
     if (expiryEl) expiryEl.textContent = formatExpiry(user.expires_at);
 
@@ -1688,6 +1820,7 @@ function applyUserLiveStatus(users) {
     if (trafficEl) trafficEl.innerHTML = userTrafficHTML(user);
   });
 
+  renderUsersSummary();
   if (fleet.active === 'dashboard') applyDashboardStats();
 }
 
@@ -2847,9 +2980,44 @@ function routeNames(ids) {
   }).join(', ');
 }
 
+function userOnlineBadge(user) {
+  if (!user || !user.online) return '';
+  const speed = formatSpeed(user.current_speed_bps);
+  return `<span class="status-chip status-chip--online user-online"><span class="material-symbols-rounded">check_circle</span>${esc(t('users.online'))}<span class="user-online__speed">• ${esc(speed)}</span></span>`;
+}
+
+/* Compact material summary above the users table: online users, the summed
+   live throughput and the summed traffic counter. Rebuilt on every first
+   render and on every live poll so the numbers stay in sync with the rows. */
+function renderUsersSummary() {
+  const root = document.getElementById('users-summary');
+  if (!root) return;
+  const users = fleet.users || [];
+  if (!users.length) {
+    root.innerHTML = '';
+    return;
+  }
+  const online = users.filter(user => !!user.online).length;
+  const speed = users.reduce((sum, user) => sum + (Number(user.current_speed_bps) || 0), 0);
+  const traffic = users.reduce((sum, user) => sum + userUsedBytes(user), 0);
+  const item = (icon, label, value) => `<div class="users-summary__item">
+      <span class="material-symbols-rounded">${icon}</span>
+      <span class="users-summary__label">${esc(label)}</span>
+      <strong class="users-summary__value">${esc(value)}</strong>
+    </div>`;
+  root.innerHTML = item('group', t('users.summaryOnline'), `${online} / ${users.length}`) +
+    item('speed', t('users.summarySpeed'), formatSpeed(speed)) +
+    item('data_usage', t('users.summaryTraffic'), formatBytes(traffic));
+}
+
+function userSpeedLimitText(kbps) {
+  return t('users.speedLimitValue').replace('{value}', kbps);
+}
+
 function renderUsers() {
   const root = document.getElementById('users-list');
   if (!root) return;
+  renderUsersSummary();
   if (!fleet.users.length) {
     root.innerHTML = emptyState('group', t('users.empty'), t('users.add'), 'openUserModal(null)');
     return;
@@ -2868,7 +3036,11 @@ function renderUsers() {
         }).join('')
       : `<span class="chip chip--stopped">${esc(t('users.allRoutes'))}</span>`;
     return `<tr data-user-id="${escAttr(user.id)}">
-      <td><strong>${esc(user.name || user.id)}</strong><div class="table-sub">${esc(user.id)}</div></td>
+      <td>
+        <div class="user-name-row"><strong>${esc(user.name || user.id)}</strong><span data-user-online="${escAttr(user.id)}">${userOnlineBadge(user)}</span></div>
+        <div class="table-sub">${esc(user.id)}</div>
+        ${user.max_speed_kbps > 0 ? `<div class="table-sub" data-user-speed="${escAttr(user.id)}">${esc(userSpeedLimitText(user.max_speed_kbps))}</div>` : ''}
+      </td>
       <td>
         <span class="status-chip ${active ? 'status-chip--online' : 'status-chip--error'}" data-user-status="${escAttr(user.id)}">${esc(active ? t('users.active') : t('users.inactive'))}</span>
         <div class="table-sub" data-user-expiry="${escAttr(user.id)}">${esc(formatExpiry(user.expires_at))}${expiryLeft(user.expires_at)}</div>
@@ -3093,6 +3265,7 @@ function openUserModal(userId = null) {
     expiryDate: expires ? new Date(expires).toISOString().slice(0, 10) : '',
     trafficMode: limitGB > 0 ? 'limited' : 'unlimited',
     gb: limitGB || 100,
+    speedKbps: editing.max_speed_kbps || 0,
     routeIDs: Array.isArray(editing.allowed_route_ids) ? editing.allowed_route_ids.slice() : []
   } : {
     id: '',
@@ -3102,6 +3275,7 @@ function openUserModal(userId = null) {
     expiryDate: '',
     trafficMode: 'unlimited',
     gb: 100,
+    speedKbps: 0,
     routeIDs: []
   };
   fleet.userDraft = draft;
@@ -3144,6 +3318,11 @@ function openUserModal(userId = null) {
             <input type="number" id="u-gb" value="${escAttr(draft.gb)}" min="1" ${draft.trafficMode === 'limited' ? '' : 'disabled'}></div>
         </div>
         <div class="field">
+          <label>${esc(t('users.speedLimit'))}</label>
+          <input type="number" id="u-speed" value="${escAttr(draft.speedKbps)}" min="0" step="1" placeholder="0">
+          <span class="hint">${esc(t('users.speedHint'))}</span>
+        </div>
+        <div class="field">
           <label>${esc(t('users.routesOrder'))}</label>
           <div id="u-routes"></div>
           <span class="hint">${esc(t('users.orderHint'))}</span>
@@ -3174,6 +3353,7 @@ function openUserModal(userId = null) {
     const dateEl = document.getElementById('u-expiry-date');
     const trafficEl = document.getElementById('u-traffic-mode');
     const gbEl = document.getElementById('u-gb');
+    const speedEl = document.getElementById('u-speed');
     if (nameEl) nameEl.addEventListener('input', e => { draft.name = e.target.value; });
     if (enabledEl) enabledEl.addEventListener('change', e => { draft.enabled = e.target.checked; });
     if (expiryEl) expiryEl.addEventListener('change', e => {
@@ -3186,12 +3366,14 @@ function openUserModal(userId = null) {
       if (gbEl) gbEl.disabled = draft.trafficMode !== 'limited';
     });
     if (gbEl) gbEl.addEventListener('input', e => { draft.gb = Number(e.target.value) || 0; });
+    if (speedEl) speedEl.addEventListener('input', e => { draft.speedKbps = Number(e.target.value) || 0; });
   }
 
   async function submitUser() {
     if (!draft.name.trim()) return toast(t('users.nameRequired'), 'error');
     if (draft.expiryMode === 'date' && !draft.expiryDate) return toast(t('users.dateRequired'), 'error');
     if (draft.trafficMode === 'limited' && !(draft.gb > 0)) return toast(t('users.limitRequired'), 'error');
+    if (!(draft.speedKbps >= 0)) return toast(t('users.speedInvalid'), 'error');
     const payload = {
       name: draft.name.trim(),
       enabled: draft.enabled,
@@ -3202,6 +3384,7 @@ function openUserModal(userId = null) {
       : null;
     payload.traffic_limit_bytes = draft.trafficMode === 'limited'
       ? Math.round(draft.gb * 1024 * 1024 * 1024) : 0;
+    payload.max_speed_kbps = Math.max(0, Math.round(draft.speedKbps || 0));
     try {
       if (editing) {
         await api(`/api/users/${encodeURIComponent(editing.id)}`, {

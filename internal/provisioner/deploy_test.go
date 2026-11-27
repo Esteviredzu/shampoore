@@ -432,7 +432,7 @@ func TestDeployRelayUploadsAgentAndStartsHeartbeat(t *testing.T) {
 	if got := uploads["bin/shampoore-node-agent"]; got != "binary-shampoore-node-agent" {
 		t.Fatalf("uploaded agent binary = %q", got)
 	}
-	if !strings.Contains(uploads["agent.env"], "INTERVAL=5s") {
+	if !strings.Contains(uploads["agent.env"], "INTERVAL=2s") {
 		t.Fatalf("agent.env = %q", uploads["agent.env"])
 	}
 	compose := uploads["docker-compose.yml"]

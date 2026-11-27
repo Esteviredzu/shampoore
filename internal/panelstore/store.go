@@ -251,6 +251,10 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.ensureUserColumns(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	if path != ":memory:" {
 		if err := os.Chmod(path, 0o600); err != nil {
@@ -335,6 +339,48 @@ func (s *Store) ensureNodeTelemetryColumns(ctx context.Context) error {
 		}
 		if _, err := s.db.ExecContext(ctx, column.ddl); err != nil {
 			return fmt.Errorf("panelstore: add nodes.%s: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureUserColumns(ctx context.Context) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"max_speed_kbps", "ALTER TABLE users ADD COLUMN max_speed_kbps INTEGER NOT NULL DEFAULT 0"},
+		{"last_seen_at", "ALTER TABLE users ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT ''"},
+		{"last_seen_node", "ALTER TABLE users ADD COLUMN last_seen_node INTEGER NOT NULL DEFAULT 0"},
+	}
+	existing := make(map[string]struct{}, len(columns))
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('users')`)
+	if err != nil {
+		return fmt.Errorf("panelstore: read users schema: %w", err)
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("panelstore: scan users schema: %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("panelstore: read users schema: %w", err)
+	}
+	rows.Close()
+
+	if len(existing) == 0 {
+		return nil
+	}
+	for _, column := range columns {
+		if _, ok := existing[column.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, column.ddl); err != nil {
+			return fmt.Errorf("panelstore: add users.%s: %w", column.name, err)
 		}
 	}
 	return nil

@@ -132,6 +132,7 @@ func build(
 		connected  []func() []string
 		sessions   []app.SessionServer
 		registry   *auth.UserRegistry
+		registries []*auth.UserRegistry
 	)
 
 	for _, o := range outcomes {
@@ -153,12 +154,17 @@ func build(
 		if registry == nil && o.res.UserRegistry != nil {
 			registry = o.res.UserRegistry
 		}
+		if o.res.UserRegistry != nil {
+			registries = append(registries, o.res.UserRegistry)
+		}
+		registries = append(registries, o.res.UserRegistries...)
 	}
 
 	result := &app.BuildResult{
-		BypassHosts:  bypass,
-		Side:         sides,
-		UserRegistry: registry,
+		BypassHosts:    bypass,
+		Side:           sides,
+		UserRegistry:   registry,
+		UserRegistries: registries,
 	}
 	if len(providers) > 0 {
 		result.Provider = &multiProvider{providers: providers}

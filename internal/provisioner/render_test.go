@@ -997,7 +997,7 @@ func TestRenderRelayIncludesNodeAgentHeartbeat(t *testing.T) {
 		"PANEL_URL=https://panel.example.com",
 		"NODE_ID=11",
 		"NODE_SECRET=relay-secret",
-		"INTERVAL=5s",
+		"INTERVAL=2s",
 	} {
 		if !strings.Contains(string(env.Data), want) {
 			t.Fatalf("agent.env missing %q:\n%s", want, env.Data)

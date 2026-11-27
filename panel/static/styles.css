@@ -498,6 +498,18 @@ select:disabled,
 .update-meta { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
 .update-notes-title { margin: 0 0 6px; font-size: 14px; }
 .update-notes { white-space: pre-wrap; word-break: break-word; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; font-family: "JetBrains Mono", monospace; font-size: 12px; max-height: 320px; overflow: auto; margin-bottom: 12px; }
+.update-option { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); padding: 14px; margin-bottom: 12px; }
+.update-option--beta { border-color: color-mix(in srgb, var(--warning) 45%, var(--line)); }
+.update-option__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.update-option__head .btn { display: inline-flex; align-items: center; gap: 6px; }
+.update-option__head .material-symbols-rounded { font-size: 18px; }
+.update-warning { display: flex; gap: 8px; align-items: flex-start; background: var(--warning-soft); color: var(--warning); border-radius: var(--radius-sm); padding: 10px 12px; font-size: 12px; margin: 8px 0 12px; }
+.update-warning .material-symbols-rounded { font-size: 18px; flex: 0 0 auto; }
+.update-notes-wrap { margin: 8px 0 0; }
+.update-notes-wrap summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+.update-up-to-date { display: flex; gap: 8px; align-items: center; color: var(--success); font-size: 13px; margin-bottom: 12px; }
+.update-up-to-date .material-symbols-rounded { font-size: 18px; }
+.toast.warning { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 40%, var(--line)); }
 
 @media (max-width: 980px) {
   .sidebar { position: fixed; transform: translateX(-100%); transition: transform .2s ease; }
@@ -575,6 +587,19 @@ select:disabled,
 .user-quota { display: flex; flex-direction: column; gap: 6px; min-width: 130px; }
 .user-quota__line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .user-quota__line span:last-child { color: var(--muted); }
+.user-name-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.user-online { padding: 3px 8px; font-size: 10.5px; }
+.user-online .material-symbols-rounded { font-size: 14px; }
+.user-online__speed { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* Live summary strip above the users table (online / total, summed speed and
+   summed traffic). Flat material surface, no shadows, tabular numbers. */
+.users-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 14px 0; padding: 12px 18px; border-radius: var(--radius); background: var(--md-surface); border: 1px solid var(--line); }
+.users-summary:empty { display: none; }
+.users-summary__item { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); min-width: 0; }
+.users-summary__item .material-symbols-rounded { font-size: 18px; color: var(--brand); }
+.users-summary__label { font-weight: 600; letter-spacing: .01em; }
+.users-summary__value { color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .route-editor { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 6px; }
 .route-editor__col { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: var(--radius-sm); background: var(--surface-2); min-width: 0; }

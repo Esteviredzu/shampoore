@@ -32,6 +32,7 @@ const (
 	updateDownloadTimeout   = 10 * time.Minute
 	updateCacheTTL          = 5 * time.Minute
 	updateRestartDelay      = time.Second
+	updateReleasesPerPage   = 25
 	maxUpdateArchiveBytes   = int64(512 << 20)
 	maxUpdateChecksumsBytes = int64(1 << 20)
 	maxUpdateBinaryBytes    = int64(256 << 20)
@@ -48,16 +49,34 @@ var updateBinaryNames = []string{
 
 var errUpdateNotAvailable = errors.New("no update is available")
 
+var errUpdateReleaseNotFound = errors.New("release not found")
+
+type UpdateCandidate struct {
+	TagName      string `json:"tag_name"`
+	Prerelease   bool   `json:"prerelease"`
+	ReleaseNotes string `json:"release_notes"`
+	PublishedAt  string `json:"published_at"`
+	AssetURL     string `json:"asset_url"`
+	AssetName    string `json:"asset_name,omitempty"`
+	ChecksumURL  string `json:"checksum_url,omitempty"`
+	HTMLURL      string `json:"html_url,omitempty"`
+}
+
 type UpdateInfo struct {
 	CurrentVersion  string `json:"current_version"`
 	LatestVersion   string `json:"latest_version"`
 	UpdateAvailable bool   `json:"update_available"`
+	Prerelease      bool   `json:"prerelease"`
 	ReleaseNotes    string `json:"release_notes"`
 	PublishedAt     string `json:"published_at"`
 	AssetURL        string `json:"asset_url"`
 	AssetName       string `json:"asset_name,omitempty"`
 	ChecksumURL     string `json:"checksum_url,omitempty"`
 	HTMLURL         string `json:"html_url,omitempty"`
+
+	LatestStable *UpdateCandidate `json:"latest_stable"`
+
+	LatestBeta *UpdateCandidate `json:"latest_beta"`
 }
 
 type installResult struct {
@@ -93,6 +112,7 @@ type releaseAsset struct {
 
 type releaseInfo struct {
 	TagName     string
+	Prerelease  bool
 	Notes       string
 	PublishedAt time.Time
 	HTMLURL     string
@@ -103,8 +123,14 @@ type releaseInfo struct {
 func CompareVersions(current, latest string) int {
 	a, okA := parseSemver(current)
 	b, okB := parseSemver(latest)
-	if !okA || !okB {
+	switch {
+	case !okA && !okB:
 		return sign(strings.Compare(normalizeVersion(current), normalizeVersion(latest)))
+	case !okA:
+
+		return -1
+	case !okB:
+		return 1
 	}
 	segments := len(a.core)
 	if len(b.core) > segments {
@@ -219,18 +245,125 @@ func parseGitHubRelease(data []byte, goos, goarch string) (*releaseInfo, error) 
 	if err := json.Unmarshal(data, &release); err != nil {
 		return nil, fmt.Errorf("decode GitHub release: %w", err)
 	}
+	info, ok := releaseInfoFromGitHub(release, goos, goarch)
+	if !ok {
+		return nil, errors.New("GitHub release has no tag_name")
+	}
+	return info, nil
+}
+
+func parseGitHubReleases(data []byte, goos, goarch string) ([]releaseInfo, error) {
+	var releases []githubRelease
+	if err := json.Unmarshal(data, &releases); err != nil {
+		return nil, fmt.Errorf("decode GitHub releases: %w", err)
+	}
+	out := make([]releaseInfo, 0, len(releases))
+	for _, release := range releases {
+		if release.Draft {
+			continue
+		}
+		info, ok := releaseInfoFromGitHub(release, goos, goarch)
+		if !ok {
+			continue
+		}
+		out = append(out, *info)
+	}
+	return out, nil
+}
+
+func releaseInfoFromGitHub(release githubRelease, goos, goarch string) (*releaseInfo, bool) {
 	tag := strings.TrimSpace(release.TagName)
 	if tag == "" {
-		return nil, errors.New("GitHub release has no tag_name")
+		return nil, false
 	}
 	return &releaseInfo{
 		TagName:     tag,
+		Prerelease:  release.Prerelease || isPrereleaseTag(tag),
 		Notes:       strings.TrimSpace(release.Body),
 		PublishedAt: release.PublishedAt,
 		HTMLURL:     strings.TrimSpace(release.HTMLURL),
 		Asset:       selectReleaseAsset(release.Assets, goos, goarch),
 		Checksums:   selectChecksumAsset(release.Assets),
-	}, nil
+	}, true
+}
+
+func isPrereleaseTag(tag string) bool {
+	parsed, ok := parseSemver(tag)
+	return ok && len(parsed.pre) > 0
+}
+
+func selectUpdateCandidates(current string, releases []releaseInfo) (stable, beta *releaseInfo) {
+	for i := range releases {
+		release := releases[i]
+		if CompareVersions(current, release.TagName) >= 0 {
+			continue
+		}
+		if release.Prerelease {
+			if beta == nil || CompareVersions(beta.TagName, release.TagName) < 0 {
+				candidate := release
+				beta = &candidate
+			}
+			continue
+		}
+		if stable == nil || CompareVersions(stable.TagName, release.TagName) < 0 {
+			candidate := release
+			stable = &candidate
+		}
+	}
+	if stable != nil && beta != nil && CompareVersions(stable.TagName, beta.TagName) >= 0 {
+		beta = nil
+	}
+	return stable, beta
+}
+
+func candidateFromRelease(release *releaseInfo) *UpdateCandidate {
+	if release == nil {
+		return nil
+	}
+	return &UpdateCandidate{
+		TagName:      release.TagName,
+		Prerelease:   release.Prerelease,
+		ReleaseNotes: release.Notes,
+		PublishedAt:  formatUpdateTime(release.PublishedAt),
+		AssetURL:     release.Asset.URL,
+		AssetName:    release.Asset.Name,
+		ChecksumURL:  release.Checksums.URL,
+		HTMLURL:      release.HTMLURL,
+	}
+}
+
+func buildUpdateInfo(current string, stable, beta *releaseInfo) *UpdateInfo {
+	info := &UpdateInfo{
+		CurrentVersion: current,
+		LatestStable:   candidateFromRelease(stable),
+		LatestBeta:     candidateFromRelease(beta),
+	}
+
+	preferred := stable
+	if preferred == nil {
+		preferred = beta
+	}
+	if preferred == nil {
+		return info
+	}
+	info.LatestVersion = preferred.TagName
+	info.UpdateAvailable = true
+	info.Prerelease = preferred.Prerelease
+	info.ReleaseNotes = preferred.Notes
+	info.PublishedAt = formatUpdateTime(preferred.PublishedAt)
+	info.AssetURL = preferred.Asset.URL
+	info.AssetName = preferred.Asset.Name
+	info.ChecksumURL = preferred.Checksums.URL
+	info.HTMLURL = preferred.HTMLURL
+	return info
+}
+
+func sameReleaseTag(left, right string) bool {
+	normalize := func(value string) string {
+		value = strings.TrimSpace(value)
+		return strings.TrimPrefix(strings.TrimPrefix(value, "v"), "V")
+	}
+	return strings.EqualFold(normalize(left), normalize(right))
 }
 
 func selectReleaseAsset(assets []githubAsset, goos, goarch string) releaseAsset {
@@ -400,11 +533,21 @@ func (u *updater) storeCache(info *UpdateInfo) {
 	u.cachedAt = u.now()
 }
 
+func copyCandidate(candidate *UpdateCandidate) *UpdateCandidate {
+	if candidate == nil {
+		return nil
+	}
+	clone := *candidate
+	return &clone
+}
+
 func copyUpdateInfo(info *UpdateInfo) *UpdateInfo {
 	if info == nil {
 		return nil
 	}
 	clone := *info
+	clone.LatestStable = copyCandidate(info.LatestStable)
+	clone.LatestBeta = copyCandidate(info.LatestBeta)
 	return &clone
 }
 
@@ -424,11 +567,12 @@ func (u *updater) check(ctx context.Context, useCache bool) (*UpdateInfo, error)
 	return copyUpdateInfo(info), nil
 }
 
-func (u *updater) fetch(ctx context.Context) (*UpdateInfo, error) {
+func (u *updater) fetchReleases(ctx context.Context) ([]releaseInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, updateCheckTimeout)
 	defer cancel()
-	url := strings.TrimRight(u.apiBase, "/") + "/repos/" + strings.Trim(u.repo, "/") + "/releases/latest"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := strings.TrimRight(u.apiBase, "/") + "/repos/" + strings.Trim(u.repo, "/") +
+		"/releases?per_page=" + strconv.Itoa(updateReleasesPerPage)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build GitHub request: %w", err)
 	}
@@ -453,26 +597,36 @@ func (u *updater) fetch(ctx context.Context) (*UpdateInfo, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdateAPIResponse))
 	if err != nil {
-		return nil, fmt.Errorf("read GitHub release: %w", err)
+		return nil, fmt.Errorf("read GitHub releases: %w", err)
 	}
-	release, err := parseGitHubRelease(data, u.goos, u.goarch)
+	return parseGitHubReleases(data, u.goos, u.goarch)
+}
+
+func (u *updater) fetch(ctx context.Context) (*UpdateInfo, error) {
+	releases, err := u.fetchReleases(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if CompareVersions(u.current, release.TagName) < 0 && release.Asset.URL == "" {
-		u.logger.Warn("panel: release ", release.TagName, " has no archive for ", u.goos, "/", u.goarch)
+	stable, beta := selectUpdateCandidates(u.current, releases)
+	for _, candidate := range []*releaseInfo{stable, beta} {
+		if candidate != nil && candidate.Asset.URL == "" {
+			u.logger.Warn("panel: release ", candidate.TagName, " has no archive for ", u.goos, "/", u.goarch)
+		}
 	}
-	return &UpdateInfo{
-		CurrentVersion:  u.current,
-		LatestVersion:   release.TagName,
-		UpdateAvailable: CompareVersions(u.current, release.TagName) < 0 && release.Asset.URL != "",
-		ReleaseNotes:    release.Notes,
-		PublishedAt:     formatUpdateTime(release.PublishedAt),
-		AssetURL:        release.Asset.URL,
-		AssetName:       release.Asset.Name,
-		ChecksumURL:     release.Checksums.URL,
-		HTMLURL:         release.HTMLURL,
-	}, nil
+	return buildUpdateInfo(u.current, stable, beta), nil
+}
+
+func (u *updater) findRelease(ctx context.Context, tag string) (*releaseInfo, error) {
+	releases, err := u.fetchReleases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range releases {
+		if sameReleaseTag(releases[i].TagName, tag) {
+			return &releases[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", errUpdateReleaseNotFound, tag)
 }
 
 func (u *updater) scheduleRestart() {
@@ -560,16 +714,38 @@ func (u *updater) downloadBytes(ctx context.Context, rawURL string, limit int64)
 	return data, nil
 }
 
-func (u *updater) install(ctx context.Context) (*installResult, error) {
-	info, err := u.check(ctx, true)
-	if err != nil {
-		return nil, err
-	}
-	if !info.UpdateAvailable || strings.TrimSpace(info.AssetURL) == "" {
-		if CompareVersions(info.CurrentVersion, info.LatestVersion) >= 0 {
-			return nil, fmt.Errorf("%w: current version %s, latest %s", errUpdateNotAvailable, info.CurrentVersion, info.LatestVersion)
+func (u *updater) install(ctx context.Context, target string) (*installResult, error) {
+	target = strings.TrimSpace(target)
+	var candidate *UpdateCandidate
+	if target != "" {
+
+		release, err := u.findRelease(ctx, target)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("release %s has no archive for %s/%s", info.LatestVersion, u.goos, u.goarch)
+		candidate = candidateFromRelease(release)
+	} else {
+		info, err := u.check(ctx, true)
+		if err != nil {
+			return nil, err
+		}
+		if info.LatestStable == nil {
+			detail := ""
+			if strings.TrimSpace(info.LatestVersion) != "" {
+				detail = fmt.Sprintf(" (pass the %s tag explicitly to install a beta)", info.LatestVersion)
+			}
+			return nil, fmt.Errorf("%w: no stable release is newer than %s%s", errUpdateNotAvailable, info.CurrentVersion, detail)
+		}
+		candidate = info.LatestStable
+	}
+	if candidate == nil {
+		return nil, errUpdateNotAvailable
+	}
+	if CompareVersions(u.current, candidate.TagName) >= 0 {
+		return nil, fmt.Errorf("%w: current version %s, requested %s", errUpdateNotAvailable, u.current, candidate.TagName)
+	}
+	if strings.TrimSpace(candidate.AssetURL) == "" {
+		return nil, fmt.Errorf("release %s has no archive for %s/%s", candidate.TagName, u.goos, u.goarch)
 	}
 	dir, err := os.MkdirTemp("", "shampoore-update-*")
 	if err != nil {
@@ -578,7 +754,7 @@ func (u *updater) install(ctx context.Context) (*installResult, error) {
 	defer os.RemoveAll(dir)
 
 	archivePath := filepath.Join(dir, "release.tar.gz")
-	if err := u.downloadArchive(ctx, info, archivePath); err != nil {
+	if err := u.downloadArchive(ctx, candidate, archivePath); err != nil {
 		return nil, err
 	}
 	binaries, err := extractUpdateBinariesFromFile(archivePath)
@@ -591,24 +767,24 @@ func (u *updater) install(ctx context.Context) (*installResult, error) {
 	}
 	return &installResult{
 		OK:             true,
-		CurrentVersion: info.CurrentVersion,
-		LatestVersion:  info.LatestVersion,
+		CurrentVersion: u.current,
+		LatestVersion:  candidate.TagName,
 		Updated:        updated,
 		Restarting:     true,
 	}, nil
 }
 
-func (u *updater) downloadArchive(ctx context.Context, info *UpdateInfo, dst string) error {
+func (u *updater) downloadArchive(ctx context.Context, candidate *UpdateCandidate, dst string) error {
 	ctx, cancel := context.WithTimeout(ctx, updateDownloadTimeout)
 	defer cancel()
-	sum, err := u.downloadFile(ctx, info.AssetURL, dst)
+	sum, err := u.downloadFile(ctx, candidate.AssetURL, dst)
 	if err != nil {
 		return fmt.Errorf("download release: %w", err)
 	}
-	if strings.TrimSpace(info.ChecksumURL) == "" {
+	if strings.TrimSpace(candidate.ChecksumURL) == "" {
 		return nil
 	}
-	data, err := u.downloadBytes(ctx, info.ChecksumURL, maxUpdateChecksumsBytes)
+	data, err := u.downloadBytes(ctx, candidate.ChecksumURL, maxUpdateChecksumsBytes)
 	if err != nil {
 		return fmt.Errorf("download SHA256SUMS: %w", err)
 	}
@@ -616,9 +792,9 @@ func (u *updater) downloadArchive(ctx context.Context, info *UpdateInfo, dst str
 	if err != nil {
 		return err
 	}
-	name := filepath.Base(strings.TrimSpace(info.AssetName))
+	name := filepath.Base(strings.TrimSpace(candidate.AssetName))
 	if name == "" || name == "." {
-		name = filepath.Base(info.AssetURL)
+		name = filepath.Base(candidate.AssetURL)
 	}
 	want, ok := sums[name]
 	if !ok {
@@ -857,17 +1033,40 @@ func (a *API) installSystemUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer a.updater.installMu.Unlock()
 
-	result, err := a.updater.install(r.Context())
-	if err != nil {
-		if errors.Is(err, errUpdateNotAvailable) {
-			writeErr(w, http.StatusConflict, err)
+	var req struct {
+		Tag     string `json:"tag"`
+		Version string `json:"version"`
+	}
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid update request: %w", err))
 			return
 		}
-		a.logger.Warn("panel: update install: ", err)
-		writeErr(w, http.StatusBadGateway, err)
+	}
+	target := strings.TrimSpace(req.Tag)
+	if target == "" {
+		target = strings.TrimSpace(req.Version)
+	}
+	if target != "" && strings.ContainsAny(target, " \t\r\n") {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid release tag"))
 		return
 	}
-	a.logger.Info("panel: updated binaries: ", strings.Join(result.Updated, ", "))
+
+	result, err := a.updater.install(r.Context(), target)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUpdateNotAvailable):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, errUpdateReleaseNotFound):
+			writeErr(w, http.StatusNotFound, err)
+		default:
+			a.logger.Warn("panel: update install: ", err)
+			writeErr(w, http.StatusBadGateway, err)
+		}
+		return
+	}
+	a.logger.Info("panel: updated binaries to ", result.LatestVersion, ": ", strings.Join(result.Updated, ", "))
 	writeJSON(w, http.StatusOK, result)
 
 	if a.sup != nil && a.sup.IsRunning() {

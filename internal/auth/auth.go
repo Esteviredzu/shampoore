@@ -26,7 +26,9 @@ type UserSpec struct {
 	Enabled           bool      `json:"enabled"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
-	AllowedExits      []string  `json:"allowed_exits,omitempty"`
+
+	MaxSpeedKBps int64    `json:"max_speed_kbps,omitempty"`
+	AllowedExits []string `json:"allowed_exits,omitempty"`
 }
 
 type Usage struct {
@@ -107,6 +109,40 @@ func (r *UserRegistry) Upsert(spec UserSpec) error {
 		state.spec = spec
 	} else {
 		r.users[id] = &userState{spec: spec}
+	}
+	r.mu.Unlock()
+
+	r.notify()
+	return nil
+}
+
+func (r *UserRegistry) Replace(specs []UserSpec) error {
+	if r == nil {
+		return nil
+	}
+	next := make(map[string]UserSpec, len(specs))
+	for _, spec := range specs {
+		id, err := NormalizeUserID(spec.UserID)
+		if err != nil {
+			return err
+		}
+		spec.UserID = id
+		spec.AllowedExits = append([]string(nil), spec.AllowedExits...)
+		next[id] = spec
+	}
+
+	r.mu.Lock()
+	for id, spec := range next {
+		if state, ok := r.users[id]; ok {
+			state.spec = spec
+			continue
+		}
+		r.users[id] = &userState{spec: spec}
+	}
+	for id := range r.users {
+		if _, ok := next[id]; !ok {
+			delete(r.users, id)
+		}
 	}
 	r.mu.Unlock()
 

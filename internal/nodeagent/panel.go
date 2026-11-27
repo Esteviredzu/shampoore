@@ -33,7 +33,7 @@ type syncResponse struct {
 	Users  []auth.UserSpec `json:"users"`
 }
 
-func (p *HTTPPanel) Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error) {
+func (p *HTTPPanel) Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics, activeUserIDs []string) ([]auth.UserSpec, error) {
 	if p == nil || p.BaseURL == "" {
 		return nil, fmt.Errorf("nodeagent: panel url is empty")
 	}
@@ -46,6 +46,9 @@ func (p *HTTPPanel) Sync(ctx context.Context, nodeID int64, traffic []panelstore
 	}
 	if metrics != nil {
 		payload["metrics"] = metrics
+	}
+	if len(activeUserIDs) > 0 {
+		payload["active_user_ids"] = activeUserIDs
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

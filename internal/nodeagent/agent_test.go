@@ -19,18 +19,25 @@ type fakePanel struct {
 	users   []auth.UserSpec
 	traffic [][]panelstore.TrafficDelta
 	metrics []*panelstore.NodeMetrics
+	active  [][]string
 }
 
-func (f *fakePanel) Sync(_ context.Context, _ int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error) {
+func (f *fakePanel) Sync(_ context.Context, _ int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics, activeUserIDs []string) ([]auth.UserSpec, error) {
 	f.traffic = append(f.traffic, append([]panelstore.TrafficDelta(nil), traffic...))
 	f.metrics = append(f.metrics, metrics)
+	f.active = append(f.active, append([]string(nil), activeUserIDs...))
 	return f.users, nil
 }
 
 type fakeControl struct {
 	usage   []manager.UsageEntry
 	entries []manager.EntryView
-	updates []manager.ConfigEntry
+	active  []string
+
+	updates     []manager.ConfigEntry
+	syncs       []manager.ConfigEntry
+	syncRestart bool
+	syncErr     error
 }
 
 func (f *fakeControl) Usage() ([]manager.UsageEntry, error) { return f.usage, nil }
@@ -38,6 +45,15 @@ func (f *fakeControl) List() ([]manager.EntryView, error)   { return f.entries, 
 func (f *fakeControl) Update(_ string, entry manager.ConfigEntry) error {
 	f.updates = append(f.updates, entry)
 	return nil
+}
+
+func (f *fakeControl) SyncUsers(_ string, entry manager.ConfigEntry) (bool, error) {
+	f.syncs = append(f.syncs, entry)
+	return f.syncRestart, f.syncErr
+}
+
+func (f *fakeControl) ActiveUserIDs() ([]string, error) {
+	return append([]string(nil), f.active...), nil
 }
 
 func multiuserSettings(t *testing.T, multiuser bool) *app.Settings {
@@ -81,11 +97,14 @@ func TestSyncOnceReportsDeltasAndUpdatesUsers(t *testing.T) {
 	if got := panel.traffic[0][0]; got.UploadBytes != 150 || got.DownloadBytes != 250 {
 		t.Fatalf("delta = %+v", got)
 	}
-	if len(ctrl.updates) != 1 || ctrl.updates[0].Name != "route-1" {
-		t.Fatalf("updates = %+v", ctrl.updates)
+	if len(ctrl.syncs) != 1 || ctrl.syncs[0].Name != "route-1" {
+		t.Fatalf("syncs = %+v", ctrl.syncs)
+	}
+	if len(ctrl.updates) != 0 {
+		t.Fatalf("users-only change restarted the config: %+v", ctrl.updates)
 	}
 	var tr map[string]any
-	if err := json.Unmarshal(ctrl.updates[0].Settings.Transport, &tr); err != nil {
+	if err := json.Unmarshal(ctrl.syncs[0].Settings.Transport, &tr); err != nil {
 		t.Fatal(err)
 	}
 	users, _ := tr["users"].([]any)
@@ -103,8 +122,11 @@ func TestSyncOnceReportsDeltasAndUpdatesUsers(t *testing.T) {
 	if len(panel.traffic) != 2 || len(panel.traffic[1]) != 0 {
 		t.Fatalf("second traffic = %+v", panel.traffic)
 	}
-	if len(ctrl.updates) != 1 {
+	if len(ctrl.updates) != 0 {
 		t.Fatalf("unexpected update: %+v", ctrl.updates)
+	}
+	if len(ctrl.syncs) != 1 {
+		t.Fatalf("unexpected soft sync: %+v", ctrl.syncs)
 	}
 
 	ctrl.usage = []manager.UsageEntry{{Config: "route-1", UserID: "alice", UploadBytes: 10, DownloadBytes: 20}}
@@ -253,6 +275,12 @@ func (failingControl) List() ([]manager.EntryView, error) {
 func (failingControl) Update(string, manager.ConfigEntry) error {
 	return errors.New("control socket is unavailable")
 }
+func (failingControl) SyncUsers(string, manager.ConfigEntry) (bool, error) {
+	return false, errors.New("control socket is unavailable")
+}
+func (failingControl) ActiveUserIDs() ([]string, error) {
+	return nil, errors.New("control socket is unavailable")
+}
 
 func TestSyncOnceWithoutControlStillReportsMetrics(t *testing.T) {
 	panel := &fakePanel{}
@@ -296,7 +324,7 @@ func TestHTTPPanelSendsMetrics(t *testing.T) {
 	defer server.Close()
 	panel := NewHTTPPanel(server.URL, "secret")
 	metrics := &panelstore.NodeMetrics{CPUPercent: 12.5, MemUsedBytes: 100, MemTotalBytes: 200}
-	if _, err := panel.Sync(context.Background(), 3, nil, metrics); err != nil {
+	if _, err := panel.Sync(context.Background(), 3, nil, metrics, []string{"alice"}); err != nil {
 		t.Fatal(err)
 	}
 	raw, ok := got["metrics"].(map[string]any)
@@ -305,5 +333,79 @@ func TestHTTPPanelSendsMetrics(t *testing.T) {
 	}
 	if raw["cpu_percent"] != 12.5 || raw["mem_used_bytes"] != float64(100) {
 		t.Fatalf("payload metrics = %+v", raw)
+	}
+	active, ok := got["active_user_ids"].([]any)
+	if !ok || len(active) != 1 || active[0] != "alice" {
+		t.Fatalf("payload active_user_ids = %+v", got["active_user_ids"])
+	}
+}
+
+func TestSyncOnceSendsActiveUserIDs(t *testing.T) {
+	panel := &fakePanel{}
+	ctrl := &fakeControl{active: []string{"alice", "bob"}}
+	agent := NewWithClients(Config{NodeID: 2, StateFile: t.TempDir() + "/state.json"}, panel, ctrl)
+	if err := agent.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(panel.active) != 1 || len(panel.active[0]) != 2 || panel.active[0][0] != "alice" || panel.active[0][1] != "bob" {
+		t.Fatalf("active_user_ids sent = %+v", panel.active)
+	}
+}
+
+func TestApplyUsersFallsBackWhenSyncUsersRestarts(t *testing.T) {
+	ctrl := &fakeControl{
+		entries: []manager.EntryView{
+			{Name: "route-1", Enabled: true, Settings: multiuserSettings(t, true)},
+		},
+		syncRestart: true,
+	}
+	agent := NewWithClients(Config{NodeID: 2, StateFile: t.TempDir() + "/state.json"}, &fakePanel{}, ctrl)
+	restarted, err := agent.applyUsers([]auth.UserSpec{{UserID: "alice", Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ctrl.syncs) != 1 {
+		t.Fatalf("sync-users calls = %+v", ctrl.syncs)
+	}
+	if len(ctrl.updates) != 0 {
+		t.Fatalf("a restarted soft sync must not be repeated via Update: %+v", ctrl.updates)
+	}
+	if len(restarted) != 1 || restarted[0] != "route-1" {
+		t.Fatalf("restarted = %v, want [route-1]", restarted)
+	}
+}
+
+func TestApplyUsersFallsBackWhenSyncUsersFails(t *testing.T) {
+	ctrl := &fakeControl{
+		entries: []manager.EntryView{
+			{Name: "route-1", Enabled: true, Settings: multiuserSettings(t, true)},
+		},
+		syncErr: errors.New("old server"),
+	}
+	agent := NewWithClients(Config{NodeID: 2, StateFile: t.TempDir() + "/state.json"}, &fakePanel{}, ctrl)
+	restarted, err := agent.applyUsers([]auth.UserSpec{{UserID: "alice", Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ctrl.syncs) != 1 || len(ctrl.updates) != 1 {
+		t.Fatalf("calls: syncs=%+v updates=%+v", ctrl.syncs, ctrl.updates)
+	}
+	if len(restarted) != 1 || restarted[0] != "route-1" {
+		t.Fatalf("restarted = %v, want [route-1]", restarted)
+	}
+}
+
+func TestUsersOnlyChangeDetectsNonUserEdits(t *testing.T) {
+	before := json.RawMessage(`{"multiuser":true,"room":"r","users":[{"user_id":"alice"}]}`)
+	sameUsers := json.RawMessage(`{"multiuser":true,"room":"r","users":[{"user_id":"bob","max_speed_kbps":64}]}`)
+	if !usersOnlyChange(before, sameUsers) {
+		t.Fatal("users-only change was not detected")
+	}
+	roomChanged := json.RawMessage(`{"multiuser":true,"room":"other","users":[{"user_id":"alice"}]}`)
+	if usersOnlyChange(before, roomChanged) {
+		t.Fatal("room change was treated as users-only")
+	}
+	if usersOnlyChange(before, json.RawMessage(`{`)) {
+		t.Fatal("invalid JSON was treated as users-only")
 	}
 }

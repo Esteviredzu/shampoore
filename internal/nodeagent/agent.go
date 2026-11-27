@@ -19,13 +19,15 @@ import (
 )
 
 type PanelClient interface {
-	Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics) ([]auth.UserSpec, error)
+	Sync(ctx context.Context, nodeID int64, traffic []panelstore.TrafficDelta, metrics *panelstore.NodeMetrics, activeUserIDs []string) ([]auth.UserSpec, error)
 }
 
 type ControlClient interface {
 	Usage() ([]manager.UsageEntry, error)
 	List() ([]manager.EntryView, error)
 	Update(name string, entry manager.ConfigEntry) error
+	SyncUsers(name string, entry manager.ConfigEntry) (bool, error)
+	ActiveUserIDs() ([]string, error)
 }
 
 type Config struct {
@@ -60,12 +62,11 @@ type stateFile struct {
 	Entries map[string]baseline `json:"entries"`
 }
 
+const defaultSyncInterval = 2 * time.Second
+
 func New(cfg Config) *Agent {
-	if cfg.Interval <= 0 {
-		cfg.Interval = 5 * time.Second
-	}
-	if cfg.Interval < 2*time.Second {
-		cfg.Interval = 2 * time.Second
+	if cfg.Interval < defaultSyncInterval {
+		cfg.Interval = defaultSyncInterval
 	}
 	if cfg.StateFile == "" {
 		cfg.StateFile = "/opt/shampoore/agent-state.json"
@@ -121,12 +122,13 @@ func (a *Agent) SyncOnce(ctx context.Context) error {
 	usage, usageOK := a.collectUsage()
 	next, traffic := a.trafficDeltas(usage, usageOK)
 	metrics := a.sampleMetrics()
-	users, err := a.panel.Sync(ctx, a.cfg.NodeID, traffic, metrics)
+	active := a.activeUserIDs()
+	users, err := a.panel.Sync(ctx, a.cfg.NodeID, traffic, metrics, active)
 	if err != nil {
 		return fmt.Errorf("nodeagent: panel sync: %w", err)
 	}
 
-	updated, applyErr := a.applyUsers(users)
+	restarted, applyErr := a.applyUsers(users)
 	if applyErr != nil {
 		a.logControlFailure("apply users", applyErr)
 	}
@@ -138,7 +140,7 @@ func (a *Agent) SyncOnce(ctx context.Context) error {
 
 	a.mu.Lock()
 	a.state.Entries = next
-	for _, config := range updated {
+	for _, config := range restarted {
 		prefix := config + "\x00"
 		for key := range a.state.Entries {
 			if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
@@ -218,34 +220,69 @@ func (a *Agent) trafficDeltas(usage []manager.UsageEntry, usageOK bool) (map[str
 	return next, traffic
 }
 
+func (a *Agent) activeUserIDs() []string {
+	if a.control == nil {
+		return nil
+	}
+	ids, err := a.control.ActiveUserIDs()
+	if err != nil {
+		a.logControlFailure("active users", err)
+		return nil
+	}
+	return ids
+}
+
 func (a *Agent) applyUsers(users []auth.UserSpec) ([]string, error) {
 	entries, err := a.control.List()
 	if err != nil {
 		return nil, err
 	}
-	var updated []string
+	var restarted []string
 	for _, entry := range entries {
 		if entry.Settings == nil {
 			continue
 		}
+		before := append(json.RawMessage(nil), entry.Settings.Transport...)
 		changed, err := patchUsers(entry.Settings, users)
 		if err != nil {
-			return updated, fmt.Errorf("config %q: %w", entry.Name, err)
+			return restarted, fmt.Errorf("config %q: %w", entry.Name, err)
 		}
 		if !changed {
 			continue
 		}
-		if err := a.control.Update(entry.Name, manager.ConfigEntry{
+		cfgEntry := manager.ConfigEntry{
 			Name:     entry.Name,
 			Enabled:  entry.Enabled,
 			Template: entry.Template,
 			Settings: entry.Settings,
-		}); err != nil {
-			return updated, fmt.Errorf("config %q: %w", entry.Name, err)
 		}
-		updated = append(updated, entry.Name)
+		if usersOnlyChange(before, entry.Settings.Transport) {
+			didRestart, syncErr := a.control.SyncUsers(entry.Name, cfgEntry)
+			if syncErr == nil {
+				if didRestart {
+					restarted = append(restarted, entry.Name)
+				}
+				continue
+			}
+		}
+		if err := a.control.Update(entry.Name, cfgEntry); err != nil {
+			return restarted, fmt.Errorf("config %q: %w", entry.Name, err)
+		}
+		restarted = append(restarted, entry.Name)
 	}
-	return updated, nil
+	return restarted, nil
+}
+
+func usersOnlyChange(before, after json.RawMessage) bool {
+	a, err := app.TransportWithoutUsers(before)
+	if err != nil {
+		return false
+	}
+	b, err := app.TransportWithoutUsers(after)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(a, b)
 }
 
 func patchUsers(settings *app.Settings, users []auth.UserSpec) (bool, error) {

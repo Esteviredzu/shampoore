@@ -253,6 +253,10 @@ func findBinary(name, explicitDir string) (string, error) {
 		dirs = append(dirs, explicitDir)
 	}
 	if exe, err := os.Executable(); err == nil {
+
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
 		dirs = append(dirs, filepath.Dir(exe))
 	}
 	dirs = append(dirs, ".", "bin", "..")

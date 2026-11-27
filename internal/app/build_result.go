@@ -17,6 +17,8 @@ type BuildResult struct {
 
 	ConnectedIPs func() []string
 
-	UserRegistry  *auth.UserRegistry
-	SessionServer SessionServer
+	UserRegistry *auth.UserRegistry
+
+	UserRegistries []*auth.UserRegistry
+	SessionServer  SessionServer
 }

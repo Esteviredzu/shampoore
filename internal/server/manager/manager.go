@@ -21,6 +21,7 @@ import (
 	"github.com/Esteviredzu/shampoore/internal/server/logbuf"
 	"github.com/Esteviredzu/shampoore/internal/socks5"
 	"github.com/Esteviredzu/shampoore/internal/transport"
+	"github.com/Esteviredzu/shampoore/internal/userlimit"
 )
 
 type Manager struct {
@@ -37,6 +38,8 @@ type Manager struct {
 
 	mu      sync.Mutex
 	entries map[string]*ManagedEntry
+
+	limits *userlimit.Registry
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -78,6 +81,7 @@ func New(dir string, logger *logging.Logger, filter *geofilter.Filter, blockUnkn
 		blockUnknown: blockUnknown,
 		entries:      map[string]*ManagedEntry{},
 		state:        &State{data: map[string]bool{}},
+		limits:       userlimit.New(),
 	}
 }
 
@@ -339,6 +343,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	handler := socks5.NewRemoteHandler(ctx, mux, logger, 32768, app.IPv4Only)
 	handler.SetGeoFilter(m.filter, m.blockUnknown)
 	handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
+	handler.SetUserLimiter(m.limits)
 	go func() {
 		if err := handler.Run(); err != nil {
 			logger.Warn("remote handler stopped: ", err)
@@ -366,6 +371,7 @@ func (m *Manager) startEntrySync(me *ManagedEntry, gen uint64) error {
 	me.cancel = cancel
 	me.statsAgg = transport.NewStatsAggregator()
 	me.mu.Unlock()
+	m.syncUserLimits()
 	return nil
 }
 
@@ -386,6 +392,7 @@ func (m *Manager) startSessionServer(
 		handler := socks5.NewRemoteHandler(sctx, mux, logger, 32768, app.IPv4Only)
 		handler.SetGeoFilter(m.filter, m.blockUnknown)
 		handler.SetExitUpstreams(m.exitUpstreamsSnapshot())
+		handler.SetUserLimiter(m.limits)
 		err := handler.Run()
 		handler.Stop()
 		return err
@@ -428,6 +435,7 @@ func (m *Manager) startSessionServer(
 	me.mu.Unlock()
 
 	logger.Info("manager: ", me.Name, " multiuser session server running")
+	m.syncUserLimits()
 	return nil
 }
 
@@ -609,6 +617,7 @@ func (m *Manager) statsLoop() {
 			return
 		case <-ticker.C:
 			m.logStats()
+			m.syncUserLimits()
 		}
 	}
 }
@@ -774,6 +783,7 @@ func (m *Manager) Update(name string, entry ConfigEntry) error {
 	if m.state.IsEnabled(newName) || m.startAll {
 		m.startEntry(me)
 	}
+	m.syncUserLimits()
 	return nil
 }
 
@@ -796,6 +806,7 @@ func (m *Manager) Remove(name string) error {
 	if err := m.state.Remove(name); err != nil {
 		return fmt.Errorf("remove %q: state: %w", name, err)
 	}
+	m.syncUserLimits()
 	return nil
 }
 

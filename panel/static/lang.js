@@ -7,7 +7,7 @@ const LANGS = {
 async function loadLang(lang) {
   if (LANGS.data[lang] && Object.keys(LANGS.data[lang]).length) return;
   try {
-    const res = await fetch(`locales/${lang}.json?v=4`, { cache: 'no-store' });
+    const res = await fetch(`locales/${lang}.json?v=7`, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     LANGS.data[lang] = await res.json();
   } catch (e) {

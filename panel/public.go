@@ -72,9 +72,10 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		NodeID  int64                     `json:"node_id"`
-		Traffic []panelstore.TrafficDelta `json:"traffic"`
-		Metrics *panelstore.NodeMetrics   `json:"metrics"`
+		NodeID        int64                     `json:"node_id"`
+		Traffic       []panelstore.TrafficDelta `json:"traffic"`
+		Metrics       *panelstore.NodeMetrics   `json:"metrics"`
+		ActiveUserIDs []string                  `json:"active_user_ids"`
 	}
 	if err := decodeBody(w, r, &req, 4<<20); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -88,6 +89,11 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("too many traffic entries"))
 		return
 	}
+	if len(req.ActiveUserIDs) > 10000 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("too many active user ids"))
+		return
+	}
+	now := time.Now()
 	if err := a.store.AddTraffic(r.Context(), req.Traffic); err != nil {
 		switch {
 		case errors.Is(err, panelstore.ErrInvalid), errors.Is(err, panelstore.ErrNotFound):
@@ -97,6 +103,8 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	a.speed.Observe(node.ID, req.Traffic, now)
 
 	if req.Metrics != nil {
 		if err := a.store.RecordNodeMetrics(r.Context(), node.ID, *req.Metrics); err != nil {
@@ -111,7 +119,10 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 		_ = a.store.TouchNode(r.Context(), node.ID)
 	}
 
-	now := time.Now()
+	if err := a.store.MarkUsersSeen(r.Context(), node.ID, req.ActiveUserIDs, now); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	users, err := a.store.ActiveUsersForExit(r.Context(), node.ID, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -125,6 +136,7 @@ func (a *API) nodeSync(w http.ResponseWriter, r *http.Request) {
 			Enabled:           true,
 			ExpiresAt:         u.ExpiresAt,
 			TrafficLimitBytes: u.TrafficLimitBytes,
+			MaxSpeedKBps:      u.MaxSpeedKBps,
 			AllowedExits:      []string{exitID},
 		})
 	}

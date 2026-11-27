@@ -112,6 +112,8 @@ type Route struct {
 	Enabled       bool    `json:"enabled"`
 }
 
+const UserOnlineWindow = 45 * time.Second
+
 type User struct {
 	ID                string    `json:"id"`
 	Name              string    `json:"name"`
@@ -122,9 +124,20 @@ type User struct {
 	UsedUploadBytes   int64     `json:"used_upload_bytes"`
 	UsedDownloadBytes int64     `json:"used_download_bytes"`
 	AllowedRouteIDs   []int64   `json:"allowed_route_ids"`
+
+	MaxSpeedKBps int64     `json:"max_speed_kbps"`
+	LastSeenAt   time.Time `json:"last_seen_at,omitempty"`
+	LastSeenNode int64     `json:"last_seen_node,omitempty"`
 }
 
 func (u User) UsedBytes() int64 { return u.UsedUploadBytes + u.UsedDownloadBytes }
+
+func (u User) Online(now time.Time) bool {
+	if u.LastSeenAt.IsZero() {
+		return false
+	}
+	return now.Sub(u.LastSeenAt) <= UserOnlineWindow
+}
 
 func (u User) Active(now time.Time) bool {
 	if !u.Enabled {

@@ -41,6 +41,7 @@ type API struct {
 
 	store       *panelstore.Store
 	provisioner NodeDeployer
+	speed       *userSpeedTracker
 	publicURL   string
 	deployMu    sync.Mutex
 	deploys     map[int64]*deployJob
@@ -79,6 +80,7 @@ func New(client *control.Client, sup ServerManager, logger *logging.Logger, toke
 		pending:        make(map[int64]string),
 		deploySem:      make(chan struct{}, 2),
 		nodeLocks:      make(map[int64]*sync.Mutex),
+		speed:          newUserSpeedTracker(),
 		settings:       panelstore.DefaultSettings(),
 		geoClient:      &http.Client{Timeout: geoDownloadTimeout},
 		geoUpdateEvery: time.Minute,

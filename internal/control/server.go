@@ -104,6 +104,17 @@ func (s *Server) dispatch(req Request) Response {
 		return ok(s.mgr.Stats())
 	case "usage":
 		return ok(s.mgr.Usage())
+	case "active":
+		return ok(s.mgr.ActiveUserIDs())
+	case "sync-users":
+		if req.Entry == nil {
+			return errResp("entry required")
+		}
+		restarted, err := s.mgr.SyncUsers(req.Name, *req.Entry)
+		if err != nil {
+			return errResp(err.Error())
+		}
+		return ok(map[string]bool{"restarted": restarted})
 	case "get":
 		v, found := s.mgr.Get(req.Name)
 		if !found {
